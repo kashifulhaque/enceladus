@@ -12,6 +12,7 @@ import numpy as np
 
 import tegula
 import tegula.language as tl
+from tegula.configs import matmul_configs
 
 
 @tegula.jit
@@ -67,6 +68,22 @@ def matmul_desc(a, b, c=None, bm: int = 64, bn: int = 64, bk: int = 32, num_warp
     grid = (tegula.cdiv(n, bn), tegula.cdiv(m, bm))
     matmul_desc_kernel[grid](a, b, c, m, n, k, k, n, n, BM=bm, BN=bn, BK=bk,
                              num_warps=num_warps)  # fmt: skip
+    return c
+
+
+matmul_desc_tuned = tegula.autotune(configs=matmul_configs(), key=["M", "N", "K"])(
+    matmul_desc_kernel
+)
+
+
+def matmul_tuned(a, b, c=None):
+    """Returns `a @ b` using the fastest configuration for this shape and dtype."""
+    (m, k), (_, n) = a.shape, b.shape
+    if c is None:
+        c = np.empty((m, n), a.dtype) if isinstance(a, np.ndarray) else tegula.empty((m, n),
+                                                                                   a.dtype)
+    grid = lambda meta: (tegula.cdiv(n, meta["BN"]), tegula.cdiv(m, meta["BM"]))  # noqa: E731
+    matmul_desc_tuned[grid](a, b, c, m, n, k, k, n, n)
     return c
 
 

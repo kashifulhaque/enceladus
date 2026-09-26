@@ -45,6 +45,7 @@ class LayoutPlan:
 
     num_warps: int
     axis: AxisAnalysis
+    dot_warps: tuple[int, int] | None = None
     kind: dict[int, str] = field(default_factory=dict)
     fixed: dict[int, L.BitLayout] = field(default_factory=dict)
     defining: dict[int, ir.Op] = field(default_factory=dict)
@@ -126,8 +127,8 @@ def view_source_layout(op: ir.Op, dst: L.BitLayout) -> L.BitLayout:
 
 
 class _Assigner:
-    def __init__(self, module: ir.Module, num_warps: int) -> None:
-        self.plan = LayoutPlan(num_warps, AxisAnalysis(module))
+    def __init__(self, module: ir.Module, num_warps: int, dot_warps=None) -> None:
+        self.plan = LayoutPlan(num_warps, AxisAnalysis(module), dot_warps)
         self.in_progress: set[int] = set()
         self.module = module
 
@@ -251,7 +252,7 @@ class _Assigner:
         if op.name == "dot":
             bm, bn = t.shape
             bk = op.operands[0].type.shape[1]
-            wm, wn = dot_warps(bm, bn, p.num_warps, op.loc)
+            wm, wn = dot_warps(bm, bn, p.num_warps, op.loc, p.dot_warps)
             if bk % 8:
                 raise CompilationError(f"tl.dot needs a K block that's a multiple of 8, got {bk}",
                                        op.loc)  # fmt: skip
@@ -259,14 +260,22 @@ class _Assigner:
         return None
 
 
-def dot_warps(bm: int, bn: int, num_warps: int, loc=None) -> tuple[int, int]:
+def dot_warps(bm: int, bn: int, num_warps: int, loc=None,
+              override: tuple[int, int] | None = None) -> tuple[int, int]:  # fmt: skip
     """Returns the SIMD-group grid (WM, WN) for a BM x BN `dot`.
 
     The default stacks every SIMD group along M (WN = 1), the measured best
-    configuration. Small BM spreads the remaining SIMD groups along N.
+    configuration. Small BM spreads the remaining SIMD groups along N. `override`
+    comes from `dot_warps=(WM, WN)` at launch or in a `tegula.Config`.
     """
-    wm = max(1, min(num_warps, bm // 8))
-    wn = num_warps // wm
+    if override is not None:
+        wm, wn = override
+        if wm * wn != num_warps:
+            raise CompilationError(f"dot_warps={override} doesn't multiply to num_warps="
+                                   f"{num_warps}", loc)  # fmt: skip
+    else:
+        wm = max(1, min(num_warps, bm // 8))
+        wn = num_warps // wm
     if bm % (8 * wm) or bn % (8 * wn):
         raise CompilationError(
             f"tl.dot can't split a {bm}x{bn} tile over {num_warps} SIMD groups; each needs "
@@ -277,9 +286,9 @@ def dot_warps(bm: int, bn: int, num_warps: int, loc=None) -> tuple[int, int]:
     return wm, wn
 
 
-def assign_layouts(module: ir.Module, num_warps: int) -> LayoutPlan:
+def assign_layouts(module: ir.Module, num_warps: int, dot_warps=None) -> LayoutPlan:
     """Assigns layouts to every anchored tile value and returns the plan."""
-    return _Assigner(module, num_warps).run()
+    return _Assigner(module, num_warps, dot_warps).run()
 
 
 def store_layout(plan: LayoutPlan, op: ir.Op) -> L.BitLayout:

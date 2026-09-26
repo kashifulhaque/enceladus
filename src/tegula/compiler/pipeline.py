@@ -22,5 +22,5 @@ def compile_module(module: ir.Module, max_threadgroup_memory: int = 32768) -> Ge
     if ir.verify_enabled():
         ir.verify(module)
     num_warps = int(module.attrs.get("num_warps", 4))
-    plan = assign_layouts(module, num_warps)
+    plan = assign_layouts(module, num_warps, module.attrs.get("dot_warps"))
     return generate(module, plan, max_threadgroup_memory)

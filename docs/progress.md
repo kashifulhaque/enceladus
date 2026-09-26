@@ -313,3 +313,54 @@ matmul uses no threadgroup memory while the pointer variant does.
 
 - Integer `dot` raises an error (the MPP path in M8 covers it).
 - `dot_warps` from `tegula.Config` arrives with the autotuner in M5.
+
+## M5: Autotuning and benchmarking
+
+### What was built
+
+- `runtime/autotuner.py`: `tegula.Config`, `@tegula.autotune`, and `@tegula.heuristics`.
+  - Candidates compile in parallel on up to `min(8, maximumConcurrentCompilationTaskCount)`
+    threads. A config that fails to compile is skipped with a warning; if every config
+    fails, the error names the first failure.
+  - Each config is timed with `do_bench` (GPU timestamps, warm-up, median). NumPy
+    arguments are wrapped as `tegula.Tensor` views for timing so launches don't
+    synchronize.
+  - Configs slower than 3x the median are rejected as probable spill cliffs (logged at
+    debug level).
+  - `reset_to_zero`, `restore_value`, `pre_hook`, `prune_configs_by` (`early_config_prune`,
+    `perf_model` with `top_k`), `TEGULA_PRINT_AUTOTUNING=1`, and `config_for()`.
+  - Results persist in `~/.cache/tegula/autotune/<kernel-hash>/<architecture>.json`,
+    keyed by the key-argument values and the argument dtypes.
+- `dot_warps=(WM, WN)` is a launch option and a `Config` field, and it's part of the
+  specialization key.
+- `tegula/configs.py`: `matmul_configs(dtype)`, the pre-validated list from the research
+  sweep (6 configs for FP32, 8 for FP16 and BF16).
+- `examples/04_matmul.py` gained `matmul_tuned`; `benchmarks/run_all.py` writes
+  `benchmarks/results/<date>-<arch>.md`.
+
+### Benchmarks
+
+The autotuned matmul matches the fixed 64x64x32 configuration at 4096³ (FP32 4.77
+against 4.76, FP16 5.59 against 5.59) and at 1024x4096x1024 (5.34 against 5.33 FP32, 5.74
+against 5.75 FP16). It's 22-30% faster at 513³ (2.26-2.45 TFLOPS against 1.75-1.93). The
+full report is in `benchmarks/results/2026-09-26-applegpu_g16s.md`.
+
+### Tests
+
+`tests/test_autotune.py` covers skipping a config that fails to compile (and the error
+when all fail), `reset_to_zero` around benchmark runs of an in-place kernel, reuse of a
+persisted result by a fresh autotuner with benchmarking disabled, and `@heuristics`.
+The whole suite runs 390 tests, with 18 skipped, in 1.3 s.
+
+### Deviations from the plan
+
+- `dot_backend` accepts only "auto" and "simdgroup" until M8 adds "mpp".
+- Autotuning compiles don't count toward the recompilation warning.
+
+### Known gaps
+
+- FP32 matmul at 4096³ measured 4.76-5.04 TFLOPS across runs in this session, around
+  the 4.9 target. MLX measured 5.23-5.26 in the same runs, so Tegula is at 91-96% of MLX.
+  The reference kernel measured 4.95-5.09 in the same harness.
+- The recompilation warning can name a misleading argument when many launch
+  configurations are in play; its hint is only a heuristic.

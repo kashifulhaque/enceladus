@@ -84,6 +84,15 @@ def main() -> None:
                 ms = do_bench(run, rep=10, return_mode="min")
                 cfg = f"{bm}x{bn}x{bk} w{nw}"
                 print(f"{f'{m}x{n}x{k}':<18}{dtype:<10}{cfg:<22}{tflops(m, n, k, ms):8.2f}{ref}")
+            ex.matmul_tuned(a, b, c)  # tunes on first use
+
+            def run_tuned():
+                ex.matmul_tuned(a, b, c)
+
+            tms = do_bench(run_tuned, rep=10, return_mode="min")
+            best = ex.matmul_desc_tuned.config_for(a, b, c, m, n, k, k, n, n)
+            tcfg = f"tuned {best.kwargs['BM']}x{best.kwargs['BN']} w{best.dot_warps}"
+            print(f"{'':<18}{dtype:<10}{tcfg:<22}{tflops(m, n, k, tms):8.2f}")
             if (m, n, k) == SHAPES[0] and dtype != "bfloat16":
                 bias = tegula.randn(n, dtype=dtype)
 

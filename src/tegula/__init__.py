@@ -4,6 +4,7 @@ __version__ = "0.1.0.dev0"
 
 # --- runtime (M0) ---
 from tegula._C import MetalError
+from tegula.runtime.autotuner import Config, autotune, heuristics
 from tegula.runtime.device import Capabilities, get_device
 from tegula.runtime.interop import async_numpy
 from tegula.runtime.raw import metal_kernel

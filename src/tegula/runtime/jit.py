@@ -293,12 +293,15 @@ class JITFunction:
                         self.math_mode)  # fmt: skip
 
     def run(self, *args: Any, grid: Any, num_warps: int = 4, num_stages: int | None = None,
-            **kwargs: Any) -> None:  # fmt: skip
-        """Launches the kernel. `num_stages` is accepted for Triton compatibility and has no
-        effect."""
+            dot_warps: tuple[int, int] | None = None, **kwargs: Any) -> None:  # fmt: skip
+        """Launches the kernel.
+
+        `dot_warps=(WM, WN)` arranges the SIMD groups of every `tl.dot` as a WM x WN grid.
+        `num_stages` is accepted for Triton compatibility and has no effect.
+        """
         interpret = self.interpret if self.interpret is not None else _env_flag("TEGULA_INTERPRET")
         if not interpret:
-            self._run_compiled(args, kwargs, grid, num_warps)
+            self._run_compiled(args, kwargs, grid, num_warps, dot_warps)
             return
         if num_warps not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
@@ -337,17 +340,18 @@ class JITFunction:
             self._spec_history: list[tuple] = []
         return b
 
-    def _run_compiled(self, args: tuple, kwargs: dict, grid: Any, num_warps: int) -> None:
+    def _run_compiled(self, args: tuple, kwargs: dict, grid: Any, num_warps: int,
+                      dot_warps: tuple[int, int] | None = None) -> None:  # fmt: skip
         binder = self._binder()
         try:
             runtime, consts = binder(*args, **kwargs)
         except TypeError as e:
             raise TypeError(f"{self.__name__}: {e}") from None
         key = (tuple(_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)),
-               tuple(core.unwrap(c) for c in consts), num_warps)  # fmt: skip
+               tuple(core.unwrap(c) for c in consts), num_warps, dot_warps)  # fmt: skip
         ck = self._compiled.get(key)
         if ck is None:
-            ck = self._compile_for(runtime, consts, num_warps, key)
+            ck = self._compile_for(runtime, consts, num_warps, key, dot_warps)
         if callable(grid):
             meta = dict(zip(self._rt_names, runtime, strict=True))
             meta.update(zip(self._ce_names, (core.unwrap(c) for c in consts), strict=True))
@@ -356,7 +360,8 @@ class JITFunction:
             grid = _normalize_grid(grid)
         ck.launch(grid, runtime)
 
-    def _compile_for(self, runtime: tuple, consts: tuple, num_warps: int, key: tuple):
+    def _compile_for(self, runtime: tuple, consts: tuple, num_warps: int, key: tuple,
+                     dot_warps: tuple[int, int] | None = None, record: bool = True):  # fmt: skip
         if num_warps not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
         from tegula.runtime.compile import compile_specialization
@@ -364,14 +369,18 @@ class JITFunction:
         bound = dict(zip(self._rt_names, runtime, strict=True))
         bound.update(zip(self._ce_names, consts, strict=True))
         spec = self.specialize(bound)
-        ck = compile_specialization(self, spec, num_warps)
+        ck = compile_specialization(self, spec, num_warps, dot_warps)
         self._compiled[key] = ck
+        if not record:  # autotuning compiles many configs on purpose
+            return ck
         self._spec_history.append(key)
         if len(self._spec_history) == RECOMPILE_WARNING + 1:
             _warn_recompiles(self)
         return ck
 
-    def warmup(self, *args: Any, grid: Any = None, num_warps: int = 4, **kwargs: Any):
+    def warmup(self, *args: Any, grid: Any = None, num_warps: int = 4,
+               dot_warps: tuple[int, int] | None = None, _record: bool = True,
+               **kwargs: Any):  # fmt: skip
         """Compiles the kernel for these arguments without launching it.
 
         Returns:
@@ -380,8 +389,9 @@ class JITFunction:
         binder = self._binder()
         runtime, consts = binder(*args, **kwargs)
         key = (tuple(_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)),
-               tuple(core.unwrap(c) for c in consts), num_warps)  # fmt: skip
-        return self._compiled.get(key) or self._compile_for(runtime, consts, num_warps, key)
+               tuple(core.unwrap(c) for c in consts), num_warps, dot_warps)  # fmt: skip
+        return self._compiled.get(key) or self._compile_for(runtime, consts, num_warps, key,
+                                                            dot_warps, _record)  # fmt: skip
 
     def _interp_ir(self, bound: Mapping[str, Any], num_warps: int) -> ir.Module:
         """Builds and verifies the IR once per specialization, printing it for TEGULA_DUMP."""
