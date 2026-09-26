@@ -6,7 +6,7 @@ build-backend = "scikit_build_core.build"
 name = "enceladus"
 version = "0.1.0.dev0"
 description = "A Triton-like tile language for Apple GPUs that compiles Python kernels to Metal"
-readme = "PLAN.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = ["numpy>=1.26", "ml_dtypes>=0.4"]
@@ -39,6 +39,8 @@ addopts = "-m 'not slow'"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# The research prototypes are read-only reference code.
+extend-exclude = ["docs/research"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

@@ -186,7 +186,11 @@ def _i_full(shape, value, dtype):
 
 @builtin(interp=_i_full)
 def full(ctx, shape, value, dtype):
-    """Returns a tile of `shape` and `dtype` filled with the scalar `value`."""
+    """Returns a tile of `shape` and `dtype` filled with the scalar `value`.
+
+    `shape` holds compile-time powers of two. `value` can be a literal or a runtime
+    scalar.
+    """
     shape = semantic.check_shape(shape, "tl.full")
     dt = _dtype(dtype)
     v = core.unwrap(value)
@@ -280,9 +284,11 @@ def load(ctx, pointer, mask=None, other=None, boundary_check=(), padding_option=
          cache_modifier="", eviction_policy="", volatile=False):  # fmt: skip
     """Loads from a pointer or a tile of pointers.
 
-    Where `mask` is false, the result is `other`, or 0 when `other` isn't given, and no
-    memory is read. `cache_modifier`, `eviction_policy`, and `volatile` are accepted for
-    Triton compatibility and have no effect.
+    `mask` and `other` broadcast to the pointer's shape. Where `mask` is false, the result
+    is `other`, or 0 when `other` isn't given, and no memory is read. `cache_modifier`,
+    `eviction_policy`, and `volatile` are accepted for Triton compatibility and have no
+    effect. `boundary_check` and `padding_option` apply to block pointers, which Enceladus
+    doesn't support; use `tl.make_tensor_descriptor` instead.
     """
     b = ctx.b
     p = core.unwrap(pointer)
@@ -402,9 +408,14 @@ def _i_make_tensor_descriptor(base, shape, strides, block_shape, padding_option=
 def make_tensor_descriptor(ctx, base, shape, strides, block_shape, padding_option="zero"):
     """Creates a tensor descriptor over `base` with the given shape and strides.
 
+    `base` is a scalar pointer. `shape` and `strides` are integer scalars, in elements,
+    and the last stride must be 1, so the innermost dimension is contiguous.
+    `block_shape` holds compile-time powers of two.
+
     `desc.load(offsets)` returns the `block_shape` block at element offsets `offsets` and
     fills out-of-bounds elements with zero. `desc.store(offsets, value)` skips
-    out-of-bounds elements. The last stride must be 1.
+    out-of-bounds elements. `desc.dtype` is the element type, and `desc.block_shape` is
+    the block shape. Only zero padding (`padding_option="zero"`) is supported.
     """
     b = ctx.b
     shape, strides, block = _desc_parts(base, shape, strides, block_shape)
@@ -505,7 +516,11 @@ def _i_where(condition, x, y):
 
 @builtin(interp=_i_where)
 def where(ctx, condition, x, y):
-    """Returns `x` where `condition` is true and `y` elsewhere, elementwise."""
+    """Returns `x` where `condition` is true and `y` elsewhere, elementwise.
+
+    The three arguments broadcast to one shape. With a compile-time `condition`, the
+    result is `x` or `y` itself.
+    """
     c = core.unwrap(condition)
     if not isinstance(c, ir.Value):
         return x if c else y
@@ -608,7 +623,9 @@ def _i_to(x, dtype, bitcast=False, fp_downcast_rounding=None):
 def _to(ctx, x, dtype, bitcast=False, fp_downcast_rounding=None):
     """Converts `x` to `dtype`, or reinterprets its bits when `bitcast=True`.
 
-    Float-to-integer conversion truncates toward zero. Conversion to `int1` is `x != 0`.
+    The tile method `x.to(dtype)` does the same. Float-to-integer conversion truncates
+    toward zero. Conversion to `int1` is `x != 0`. A bitcast needs types of the same
+    width. `fp_downcast_rounding` accepts only `None` and `"rtne"`.
     """
     if fp_downcast_rounding not in (None, "rtne"):
         raise CompilationError("only round-to-nearest-even float conversion is supported")
@@ -682,7 +699,11 @@ def _i_reshape(input, *shape, can_reorder=False):
 
 @builtin(interp=_i_reshape)
 def reshape(ctx, input, *shape, can_reorder=False):
-    """Reshapes `input` to `shape`, keeping the row-major element order."""
+    """Reshapes `input` to `shape`, keeping the row-major element order.
+
+    Every dimension of `shape` must be a power of two, and the element count must not
+    change. `can_reorder` is accepted for Triton compatibility; the order is always kept.
+    """
     v = _value(ctx, input)
     shape = _reshape_shape(ir.shape_of(v.type), shape)
     if ir.shape_of(v.type) == shape:
@@ -833,8 +854,11 @@ def _minmax_frontend(ctx, kind, input, axis, return_indices, tie_left, keep_dims
 @builtin(interp=_minmax_interp("max"), name="max")
 def max_(ctx, input, axis=None, return_indices=False, return_indices_tie_break_left=True,
          keep_dims=False):  # fmt: skip
-    """Returns the maximum along `axis`, and the index of the first maximum with
-    `return_indices=True`. NaNs are ignored unless every element is NaN."""
+    """Returns the maximum along `axis`, or over all elements when `axis` is `None`.
+
+    With `return_indices=True`, also returns the `int32` index of the first maximum. NaNs
+    are ignored unless every element is NaN.
+    """
     return _minmax_frontend(ctx, "max", input, axis, return_indices,
                             return_indices_tie_break_left, keep_dims)  # fmt: skip
 
@@ -842,8 +866,11 @@ def max_(ctx, input, axis=None, return_indices=False, return_indices_tie_break_l
 @builtin(interp=_minmax_interp("min"), name="min")
 def min_(ctx, input, axis=None, return_indices=False, return_indices_tie_break_left=True,
          keep_dims=False):  # fmt: skip
-    """Returns the minimum along `axis`, and the index of the first minimum with
-    `return_indices=True`. NaNs are ignored unless every element is NaN."""
+    """Returns the minimum along `axis`, or over all elements when `axis` is `None`.
+
+    With `return_indices=True`, also returns the `int32` index of the first minimum. NaNs
+    are ignored unless every element is NaN.
+    """
     return _minmax_frontend(ctx, "min", input, axis, return_indices,
                             return_indices_tie_break_left, keep_dims)  # fmt: skip
 
@@ -859,7 +886,11 @@ def _argminmax(kind):
             raise CompilationError("only `tie_break_left=True` is supported")
         return _reduce_frontend(ctx, input, axis, kind, keep_dims, kind)
 
-    frontend.__doc__ = f"Returns the `int32` index of the first {kind[3:]}imum along `axis`."
+    frontend.__doc__ = (
+        f"Returns the `int32` index of the first {kind[3:]}imum along `axis`.\n\n"
+        "Only `tie_break_left=True` is supported. With `keep_dims=True`, the reduced axis "
+        "stays as a dimension of size 1.\n"
+    )
     return builtin(interp=interp, name=kind)(frontend)
 
 
@@ -1000,12 +1031,18 @@ def _i_dot(input, other, acc=None, input_precision=None, allow_tf32=None,
 @builtin(interp=_i_dot)
 def dot(ctx, input, other, acc=None, input_precision=None, allow_tf32=None,
         max_num_imprecise_acc=None, out_dtype=core.float32):  # fmt: skip
-    """Returns `input @ other + acc`.
+    """Returns `input @ other + acc` for 2D tiles.
 
     Operands are `float16`, `bfloat16`, or `float32` tiles of the same dtype. The result
-    accumulates in `out_dtype` (`float32` by default) or in the dtype of `acc`. `float32`
-    operands compute in full `float32`; Apple GPUs have no TF32, so `input_precision` has
-    no effect.
+    accumulates in `out_dtype` (`float32` by default) or in the dtype of `acc`, which must
+    be `float32` or `float16`. `float32` operands compute in full `float32`; Apple GPUs
+    have no TF32, so `input_precision`, `allow_tf32`, and `max_num_imprecise_acc` have no
+    effect. Integer operands aren't supported.
+
+    The K dimension must be a multiple of 8. The launch option `dot_warps=(WM, WN)`
+    splits the M x N result over the kernel's SIMD groups, and each SIMD group's strip
+    must be a multiple of 8 in both dimensions. The launch option `dot_backend` selects
+    the lowering: `simdgroup_matrix` code, or Metal 4 `matmul2d` for eligible loops.
     """
     b = ctx.b
     av, bv = _value(ctx, input), _value(ctx, other)
@@ -1056,13 +1093,22 @@ def _i_static_range(arg1, arg2=None, step=None):
 
 
 static_range = builtin(interp=_i_static_range, name="static_range")(_loop_only("static_range"))
-static_range.__doc__ = "Like `range`, but the frontend unrolls the loop at compile time."
+static_range.__doc__ = """Returns a loop range that the compiler unrolls, for use in a `for` loop.
+
+The bounds and step must be compile-time integers. Each iteration compiles separately,
+so the loop variable is a compile-time integer inside the body.
+"""
 
 range_ = builtin(
     interp=lambda *a, **k: builtins.range(*[int(x) for x in range_bounds(*a, **k)]),
     name="range",
 )(_loop_only("range"))
-range_.__doc__ = "Like `range`. Pipelining hints such as `num_stages` have no effect."
+range_.__doc__ = """Returns a runtime loop range, like Python's `range`, for use in a `for` loop.
+
+`for i in tl.range(start, end, step)` compiles to the same loop as `range(...)`. The
+Triton hints `num_stages`, `loop_unroll_factor`, `disallow_acc_multi_buffer`, `flatten`,
+and `warp_specialize` are accepted and have no effect.
+"""
 
 
 def _static_assert_msg(msg: str) -> str:
@@ -1404,12 +1450,26 @@ def _make_atomic(kind: str) -> core.Builtin:
             "and": "stores the bitwise AND of `val` and",
             "or": "stores the bitwise OR of `val` and",
             "xor": "stores the bitwise XOR of `val` and"}[kind]  # fmt: skip
+    notes = {
+        "add": "`float16` and `bfloat16` addition isn't supported; accumulate in a `float32` "
+               "buffer instead.",
+        "max": "For floats, a NaN operand is ignored, as in `tl.maximum`. `uint64` is "
+               "supported only when you don't use the result.",
+        "min": "For floats, a NaN operand is ignored, as in `tl.minimum`. `uint64` is "
+               "supported only when you don't use the result.",
+        "xchg": "",
+        "and": "The elements must be integers.",
+        "or": "The elements must be integers.",
+        "xor": "The elements must be integers.",
+    }[kind]  # fmt: skip
     frontend.__doc__ = (
         f"Atomically {what} each element that `pointer` points to, where `mask` is true.\n\n"
+        "`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. "
         "Returns the values that memory held before the operation, or 0 where `mask` is "
-        "false. Memory ordering is relaxed. Float `max` and `min` ignore NaN operands, like "
-        "tl.maximum and tl.minimum.\n"
-    )
+        "false. Memory ordering is relaxed: `sem` accepts only `None` and `\"relaxed\"`, "
+        "and `scope` accepts `None`, `\"gpu\"`, and `\"cta\"`. 64-bit elements other "
+        f"than `uint64` `max` and `min` aren't supported. {notes}"
+    ).rstrip() + "\n"
     return builtin(interp=interp, name=fname)(frontend)
 
 
