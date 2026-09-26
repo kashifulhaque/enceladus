@@ -20,8 +20,10 @@ def _freeze(v: Any) -> Any:
         return tuple(sorted((k, _freeze(x)) for k, x in v.items()))
     if isinstance(v, (list, tuple)):
         return tuple(_freeze(x) for x in v)
-    if isinstance(v, float) and v != v:
-        return "nan"
+    if isinstance(v, float):
+        # By bits, so that 0.0 and -0.0 (equal in Python) stay distinct, and NaN
+        # matches itself.
+        return ("float", v.hex())
     return v
 
 

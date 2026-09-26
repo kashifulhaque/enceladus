@@ -130,8 +130,8 @@ typedef struct {
 void *fr_stream_new(void *queue);
 void fr_stream_free(void *stream);
 // Encodes one dispatch into the stream's open command buffer. grid is in
-// threadgroups, tg in threads. name identifies the kernel in error messages and
-// must outlive the stream's next sync (pipelines own it).
+// threadgroups, tg in threads. name identifies the kernel in error messages; the
+// stream copies it.
 void fr_stream_dispatch(void *stream, void *pso, const char *name, const fr_launch_plan *plan,
                         void *const *bufs, const uint64_t *offsets, const void *scalar_bytes,
                         const uint32_t grid[3], const uint32_t tg[3]);

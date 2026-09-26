@@ -11,6 +11,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "enceladus_rt.h"
@@ -64,6 +65,9 @@ struct Stream {
     int flush_every = 64;
     nb::object queue;         // keeps the queue alive
     nb::object log_sentinel;  // keeps the sentinel pipeline alive
+    // Buffers over borrowed memory (NumPy, DLPack) that dispatches since the last sync
+    // use. Holding them keeps that memory alive while the GPU might still access it.
+    std::unordered_map<PyObject *, nb::object> borrowed;
     ~Stream() { fr_stream_free(s); }
 };
 
@@ -98,7 +102,8 @@ static void read_dim3(nb::handle h, uint32_t out[3]) {
 }
 
 // Collects MTLBuffer handles and byte offsets without allocating.
-static int read_bufs(nb::handle bufs, nb::handle offsets, void **bp, uint64_t *op) {
+static int read_bufs(nb::handle bufs, nb::handle offsets, void **bp, uint64_t *op,
+                     std::unordered_map<PyObject *, nb::object> *borrowed = nullptr) {
     PyObject *fb = PySequence_Fast(bufs.ptr(), "bufs must be a sequence");
     if (!fb) throw nb::python_error();
     Py_ssize_t n = PySequence_Fast_GET_SIZE(fb);
@@ -115,6 +120,7 @@ static int read_bufs(nb::handle bufs, nb::handle offsets, void **bp, uint64_t *o
         }
         bp[i] = b->p;
         op[i] = 0;
+        if (borrowed && b->owner.is_valid()) borrowed->try_emplace(items[i], nb::borrow(items[i]));
     }
     Py_DECREF(fb);
     if (!offsets.is_none()) {
@@ -141,8 +147,9 @@ struct DispatchArgs {
 };
 
 static void prepare(DispatchArgs &a, const LaunchPlan &plan, nb::handle bufs, nb::handle offsets,
-                    nb::bytes &scalars, nb::handle grid, nb::handle tg) {
-    int n = read_bufs(bufs, offsets, a.bp, a.op);
+                    nb::bytes &scalars, nb::handle grid, nb::handle tg,
+                    std::unordered_map<PyObject *, nb::object> *borrowed = nullptr) {
+    int n = read_bufs(bufs, offsets, a.bp, a.op, borrowed);
     if (n != plan.plan.nbufs)
         throw std::invalid_argument("expected " + std::to_string(plan.plan.nbufs) +
                                     " buffers, got " + std::to_string(n));
@@ -400,7 +407,8 @@ NB_MODULE(_C, m) {
         .def_prop_ro("handle", &Buffer::addr)
         .def_prop_ro("ptr", [](Buffer &b) { return (uintptr_t)fr_buffer_contents(b.p); })
         .def_prop_ro("nbytes", [](Buffer &b) { return fr_buffer_length(b.p); })
-        .def_prop_ro("owner", [](Buffer &b) { return b.owner; });
+        // None for memory that Metal allocated; otherwise the object that owns it.
+        .def_prop_ro("owner", [](Buffer &b) { return b.owner.is_valid() ? b.owner : nb::none(); });
 
     nb::class_<LaunchPlan>(m, "LaunchPlan")
         .def(
@@ -441,7 +449,7 @@ NB_MODULE(_C, m) {
             [](Stream &s, Pipeline &pso, LaunchPlan &plan, nb::handle bufs, nb::handle offsets,
                nb::bytes scalars, nb::handle grid, nb::handle tg) {
                 DispatchArgs a;
-                prepare(a, plan, bufs, offsets, scalars, grid, tg);
+                prepare(a, plan, bufs, offsets, scalars, grid, tg, &s.borrowed);
                 fr_stream_dispatch(s.s, pso.p, pso.name.c_str(), &plan.plan, a.bp, a.op,
                                    a.scalars, a.grid, a.tg);
                 if (fr_stream_pending(s.s) >= s.flush_every) fr_stream_flush(s.s);
@@ -466,6 +474,7 @@ NB_MODULE(_C, m) {
                      nb::gil_scoped_release nogil;
                      rc = fr_stream_sync(s.s, err.get(), FR_ERR_LEN);
                  }
+                 s.borrowed.clear();  // the GPU has finished with every buffer
                  if (rc) throw MetalError(err.get());
              })
         .def(

@@ -1,10 +1,17 @@
 """Tests for the native runtime, buffers, streams, and raw MSL kernels."""
 
+import gc
+import os
+import subprocess
+import sys
+import textwrap
+
 import ml_dtypes
 import numpy as np
 import pytest
 
 import enceladus
+import enceladus.language as tl
 from enceladus.runtime.device import PAGE_SIZE
 
 VADD = """
@@ -154,3 +161,64 @@ def test_stream_batches_and_flushes_on_threshold(vadd):
         assert stream.pending == 0 and host[0] == 2.0
     finally:
         stream.flush_every = old
+
+
+SLOW_FILL = """
+#include <metal_stdlib>
+using namespace metal;
+kernel void slow_fill(device float* o [[buffer(0)]], constant int& iters [[buffer(1)]],
+                      uint i [[thread_position_in_grid]]) {
+    float acc = 0;
+    for (int k = 0; k < iters; ++k) acc = fma(acc, 0.999f, 1.0f);
+    o[i] = acc > 0 ? 7.0f : 0.0f;
+}
+"""
+
+
+@enceladus.jit
+def _slow_fill(o_ptr, iters, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for _ in range(iters):
+        acc = acc * 0.999 + 1.0
+    tl.store(o_ptr + offs, acc)  # stores the loop result, so the compiler keeps the loop
+
+
+@pytest.mark.parametrize("path", ["raw", "jit"])
+def test_async_launch_keeps_borrowed_host_memory_alive(path):
+    n = 1 << 20
+    if path == "raw":
+        k = enceladus.metal_kernel(SLOW_FILL, "slow_fill")
+        launch = lambda t: k[(n // 256,), (256,)](t, 20000)  # noqa: E731
+    else:
+        launch = lambda t: _slow_fill[(n // 1024,)](t, 20000, BLOCK=1024)  # noqa: E731
+    launch(enceladus.zeros(n))  # compiles first, so the compiler allocates nothing later
+    enceladus.synchronize()
+    t = enceladus.from_numpy(page_aligned(n))
+    launch(t)
+    enceladus.get_device().stream.flush()
+    # Dropping the tensor must not free the NumPy memory that the GPU still writes: the
+    # next allocation of the same size reuses those pages.
+    del t
+    gc.collect()
+    fresh = np.zeros(n * 4 + PAGE_SIZE, np.uint8)
+    enceladus.synchronize()
+    assert not fresh.any()
+
+
+@pytest.mark.skipif(not os.path.exists("/usr/lib/libgmalloc.dylib"),
+                    reason="needs Guard Malloc to catch the use after free")  # fmt: skip
+def test_stream_outlives_a_freed_kernel():
+    script = textwrap.dedent(f"""
+        import gc, enceladus
+        out = enceladus.zeros(1024)
+        k = enceladus.metal_kernel({VADD!r}, "vadd")
+        k[(4,), (256,)](out, out, out, 1024)
+        del k
+        gc.collect()
+        enceladus.synchronize()
+    """)
+    env = {**os.environ, "DYLD_INSERT_LIBRARIES": "/usr/lib/libgmalloc.dylib"}
+    r = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True,
+                       timeout=60)  # fmt: skip
+    assert r.returncode == 0, r.stderr.decode()[-2000:]

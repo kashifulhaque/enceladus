@@ -238,6 +238,8 @@ class JITFunction:
         self.arg_names = names
         self._src: SourceInfo | None = None
         self._cache_key: str | None = None
+        # (globals dict, name, value) for each global that `cache_key` covers.
+        self._deps: tuple[tuple[dict, str, Any], ...] = ()
         self._ir_cache: dict[str, ir.Module] = {}
         interp.register_kernel_code(fn.__code__)
 
@@ -255,8 +257,30 @@ class JITFunction:
         """A SHA-256 over the source and every referenced @enceladus.jit function and global
         constant. Changing a helper function changes the key of its callers."""
         if self._cache_key is None:
-            self._cache_key = _dependency_hash(self, set())
+            deps: list[tuple[dict, str, Any]] = []
+            self._cache_key = _dependency_hash(self, set(), deps)
+            self._deps = tuple(deps)
         return self._cache_key
+
+    def _check_globals(self) -> None:
+        """Drops compiled kernels if a global that they depend on was reassigned.
+
+        Compiled code bakes in global constants and helper functions, so a kernel
+        recompiles after, for example, `SCALE = 5` replaces `SCALE = 3`, as the
+        interpreter would see the new value.
+        """
+        for g, n, v in self._deps:
+            cur = core.unwrap(g.get(n))
+            if cur is not v and not (type(cur) is type(v) and cur == v):
+                break
+        else:
+            return
+        self._cache_key = None
+        self._deps = ()
+        self._ir_cache.clear()
+        if "_binder_fn" in self.__dict__:  # the compiled-launch state exists
+            self._compiled.clear()
+            self._spec_history.clear()
 
     # ---- calling and launching ----
 
@@ -368,6 +392,8 @@ class JITFunction:
         """Splits launch arguments into runtime and constexpr values, and returns them with
         the specialization key and the compiled kernel for that key, or `None`."""
         binder = self._binder()
+        if self._deps:
+            self._check_globals()
         try:
             runtime, consts = binder(*args, **kwargs)
             # List comprehensions: this runs on every launch, and generators cost more.
@@ -491,6 +517,8 @@ class JITFunction:
         """Builds and verifies the IR once per specialization, printing it for ENCELADUS_DUMP."""
         spec = self.specialize(bound)
         key = spec.key(num_warps, self.math_mode)
+        if self._deps:
+            self._check_globals()
         module = self._ir_cache.get(key)
         if module is None:
             module = build_ir(self, spec.arg_types, spec.arg_facts, spec.constexprs, num_warps,
@@ -620,7 +648,9 @@ def _warn_recompiles(fn: JITFunction) -> None:
     )
 
 
-def _dependency_hash(fn: JITFunction, seen: set[int]) -> str:
+def _dependency_hash(fn: JITFunction, seen: set[int], deps: list) -> str:
+    """Hashes `fn`'s source and dependencies, and appends each global that the hash
+    covers to `deps` as a `(globals dict, name, value)` triple."""
     seen.add(id(fn))
     h = hashlib.sha256(inspect.getsource(fn.fn).encode())
     g = fn.fn.__globals__
@@ -629,9 +659,11 @@ def _dependency_hash(fn: JITFunction, seen: set[int]) -> str:
         v = g.get(n)
         v = core.unwrap(v)
         if is_jit_function(v):
+            deps.append((g, n, v))
             if id(v) not in seen:
-                h.update(f"{n}:{_dependency_hash(v, seen)}".encode())
+                h.update(f"{n}:{_dependency_hash(v, seen, deps)}".encode())
         elif isinstance(v, (int, float, bool, str, core.dtype)):
+            deps.append((g, n, v))
             h.update(f"{n}={v!r}".encode())
     return h.hexdigest()
 

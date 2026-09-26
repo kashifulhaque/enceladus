@@ -219,3 +219,50 @@ def test_descriptor_accesses_outside_the_tensor_are_masked(rng_np, kind, offsets
 @pytest.fixture
 def rng_np():
     return np.random.default_rng(0)
+
+
+SCALE = 3.0
+OFFSET = 1.0
+
+
+@enceladus.jit
+def _add_offset(x):
+    return x + OFFSET
+
+
+@enceladus.jit
+def _scale_by_globals(x_ptr, out_ptr):
+    offs = tl.arange(0, 16)
+    tl.store(out_ptr + offs, _add_offset(tl.load(x_ptr + offs) * SCALE))
+
+
+@pytest.mark.parametrize("name", ["SCALE", "OFFSET"])  # OFFSET is read by an inlined helper
+def test_reassigned_global_constant_recompiles(monkeypatch, name):
+    x = np.arange(16, dtype=np.float32)
+    out = np.empty_like(x)
+    _scale_by_globals[(1,)](x, out)
+    np.testing.assert_array_equal(out, x * SCALE + OFFSET)
+    monkeypatch.setitem(globals(), name, 5.0)
+    _scale_by_globals[(1,)](x, out)
+    np.testing.assert_array_equal(out, x * SCALE + OFFSET)
+
+
+@enceladus.jit
+def _signed_zeros(x_ptr, out_ptr):
+    offs = tl.arange(0, 16)
+    x = tl.load(x_ptr + offs)
+    tl.store(out_ptr + offs, 1.0 / (x * 0.0))
+    tl.store(out_ptr + 16 + offs, 1.0 / (x * -0.0))
+
+
+def test_cse_keeps_signed_zero_constants_apart():
+    def run(x):
+        out = np.empty(32, np.float32)
+        _signed_zeros[(1,)](x, out)
+        return out
+
+    def reference(x):
+        with np.errstate(divide="ignore"):
+            return np.concatenate([1 / (x * 0.0), 1 / (x * -0.0)]).astype(np.float32)
+
+    check_kernel(run, [np.ones(16, np.float32)], reference)

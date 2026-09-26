@@ -337,7 +337,7 @@ struct fr_stream {
     id<MTLComputeCommandEncoder> enc;
     uint64_t next_value = 0;
     int pending = 0;
-    std::vector<const char *> names;  // kernels in the open command buffer
+    std::vector<std::string> names;  // kernels in the open command buffer (copies)
     std::vector<fr_committed> committed;  // since the previous sync
     id<MTLComputePipelineState> log_sentinel;  // see fr_stream_set_log_sentinel
     bool log_marked = false;
@@ -385,15 +385,16 @@ void fr_stream_dispatch(void *stream, void *pso, const char *name, const fr_laun
     fr_stream *s = (fr_stream *)stream;
     if (!s->enc) stream_open(s);
     encode(s->enc, pso, plan, bufs, offsets, scalar_bytes, grid, tg);
-    if (s->names.empty() || s->names.back() != name) s->names.push_back(name);
+    // Copy the name: the pipeline that owns it can be freed before the next flush.
+    const char *n = name ? name : "<unnamed>";
+    if (s->names.empty() || s->names.back() != n) s->names.emplace_back(n);
     ++s->pending;
 }
 
-static std::string join_names(const std::vector<const char *> &names) {
+static std::string join_names(const std::vector<std::string> &names) {
     std::string out;
     std::vector<std::string> seen;
-    for (const char *n : names) {
-        std::string v = n ? n : "<unnamed>";
+    for (const std::string &v : names) {
         bool dup = false;
         for (auto &x : seen) dup |= (x == v);
         if (dup) continue;
