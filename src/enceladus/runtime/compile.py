@@ -59,6 +59,7 @@ def compile_specialization(fn: JITFunction, spec: Specialization, num_warps: int
                           fn.math_mode)  # fmt: skip
         if dot_warps is not None:
             module.attrs["dot_warps"] = tuple(dot_warps)
+        module.attrs["apple_family"] = dev.caps.apple_family
         gen = compile_module(module, dev.caps.max_threadgroup_memory)
         ck = CompiledKernel(gen.name, gen.source, str(module), gen.args, gen.num_warps,
                             gen.threadgroup_memory, warnings=gen.warnings)  # fmt: skip

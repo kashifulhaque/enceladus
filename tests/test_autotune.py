@@ -117,6 +117,18 @@ def test_saved_result_of_rebuilt_configs_is_reused(monkeypatch):
     np.testing.assert_array_equal(out.numpy(), x.numpy())
 
 
+def test_saved_result_is_retuned_after_a_compiler_change(monkeypatch):
+    x = enceladus.randn(4096)
+    first = Autotuner(_accumulate, CONFIGS[1:], key=["n"], rep=3, warmup_ms=1)
+    first[_grid](x, enceladus.zeros(4096), 4096)
+
+    monkeypatch.setattr("enceladus.runtime.cache.compiler_hash", lambda: "a different compiler")
+    monkeypatch.setattr("enceladus.testing.do_bench", _no_bench)
+    second = Autotuner(_accumulate, CONFIGS[1:], key=["n"], rep=3, warmup_ms=1)
+    with pytest.raises(RuntimeError, match="re-benchmarked"):
+        second[_grid](x, enceladus.zeros(4096), 4096)
+
+
 def test_saved_result_missing_from_configs_is_retuned():
     x = enceladus.randn(4096)
     first = Autotuner(_accumulate, CONFIGS[1:2], key=["n"], rep=3, warmup_ms=1)

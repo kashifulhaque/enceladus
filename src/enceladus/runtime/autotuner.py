@@ -173,7 +173,10 @@ class Autotuner:
 
     def _path(self):
         arch = get_device().caps.architecture or "unknown"
-        return cache.cache_dir() / "autotune" / self.jit.cache_key[:32] / f"{arch}.json"
+        # The compiler hash keeps a winner from surviving a compiler change that alters
+        # which configs are fast or valid.
+        kernel = cache.stable_hash(self.jit.cache_key, cache.compiler_hash())[:32]
+        return cache.cache_dir() / "autotune" / kernel / f"{arch}.json"
 
     def _load(self) -> None:
         self._loaded = True
