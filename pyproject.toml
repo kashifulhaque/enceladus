@@ -1,0 +1,45 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tegula"
+version = "0.1.0.dev0"
+description = "A Triton-like tile language for Apple GPUs that compiles Python kernels to Metal"
+readme = "PLAN.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy>=1.26", "ml_dtypes>=0.4"]
+
+[project.optional-dependencies]
+torch = ["torch>=2.5"]
+mlx = ["mlx>=0.20"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "torch>=2.5", "mlx>=0.20"]
+
+[tool.scikit-build]
+wheel.packages = ["src/tegula"]
+wheel.exclude = ["tegula/_C/*.mm", "tegula/_C/*.h"]
+cmake.build-type = "Release"
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+CMAKE_OSX_DEPLOYMENT_TARGET = "15.0"
+
+[tool.scikit-build.env]
+MACOSX_DEPLOYMENT_TARGET = "15.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: tests that take more than a few seconds"]
+addopts = "-m 'not slow'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E741"]
