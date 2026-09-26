@@ -12,6 +12,16 @@ static inline float tg_erf(float x) {
 
 static inline float tg_sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
 
-// Python-style floor division and modulo for floats (Triton semantics).
-static inline float tg_floordiv(float a, float b) { return floor(a / b); }
-static inline float tg_fmod(float a, float b) { return a - b * floor(a / b); }
+// simd_shuffle_xor for every register type. bfloat, bool, and 64-bit integers aren't in
+// the native type set, so they shuffle through bit-compatible types.
+template <typename T> static inline T tg_shfl_xor(T x, ushort m) { return simd_shuffle_xor(x, m); }
+static inline bool tg_shfl_xor(bool x, ushort m) { return simd_shuffle_xor(ushort(x), m) != 0; }
+static inline bfloat tg_shfl_xor(bfloat x, ushort m) {
+  return as_type<bfloat>(simd_shuffle_xor(as_type<ushort>(x), m));
+}
+static inline long tg_shfl_xor(long x, ushort m) {
+  return as_type<long>(simd_shuffle_xor(as_type<uint2>(x), m));
+}
+static inline ulong tg_shfl_xor(ulong x, ushort m) {
+  return as_type<ulong>(simd_shuffle_xor(as_type<uint2>(x), m));
+}

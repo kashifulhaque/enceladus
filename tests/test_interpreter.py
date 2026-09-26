@@ -41,7 +41,8 @@ def test_vector_add(mode, rng, dtype, n):
 
 
 @pytest.mark.parametrize("dtype", [F32, F16])
-@pytest.mark.parametrize("shape", [(4, 128), (37, 1000)])
+# (3, 20) runs a 32-wide block on 128 threads, so whole lanes see only `other=-inf`.
+@pytest.mark.parametrize("shape", [(4, 128), (37, 1000), (3, 20)])
 def test_softmax(mode, rng, dtype, shape):
     ex = load_example("02_softmax")
     check_kernel(ex.softmax, (randn(rng, shape, dtype) * 4,), ex.reference, modes=(mode,))

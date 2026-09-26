@@ -9,6 +9,7 @@ import statistics
 import time
 
 import tegula
+import tegula.language as tl
 
 SRC = """
 #include <metal_stdlib>
@@ -75,6 +76,20 @@ def main() -> None:
         stream.dispatch(k.pipeline, plan, bufs, offs, scal, (n // 256, 1, 1), (256, 1, 1))
 
     report("native Stream.dispatch, sustained", sustained(native))
+
+    # @tegula.jit hit path: binding, specialization key, packing, and dispatch.
+    @tegula.jit
+    def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) + tl.load(y_ptr + offs,
+                 mask=mask), mask=mask)  # fmt: skip
+
+    def jit_launch() -> None:
+        add_kernel[(1,)](x, y, o, n, BLOCK=1024)
+
+    jit_launch()
+    report("@tegula.jit launch, sustained", sustained(jit_launch))
 
 
 if __name__ == "__main__":

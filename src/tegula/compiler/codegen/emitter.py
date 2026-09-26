@@ -68,22 +68,28 @@ class NameGen:
 
     def __init__(self) -> None:
         self._counts: dict[str, int] = {}
+        self._used: set[str] = set(RESERVED)
 
     def fresh(self, hint: str | None) -> str:
         base = re.sub(r"[^A-Za-z0-9_]", "_", hint or "v") or "v"
         if base[0].isdigit():
             base = "v" + base
-        if base.startswith("__"):
+        if base.startswith("__") or base.startswith("tg_"):
             base = "u" + base
-        n = self._counts.get(base, 0)
-        self._counts[base] = n + 1
-        name = f"{base}_{n}"
-        return f"{name}_" if name in RESERVED else name
+        while True:
+            n = self._counts.get(base, 0)
+            self._counts[base] = n + 1
+            name = f"{base}_{n}"
+            if name not in self._used:
+                self._used.add(name)
+                return name
 
     def reserve(self, name: str) -> str:
-        """Returns `name` unchanged (escaped if reserved) and prevents clashes with it."""
+        """Returns `name` (escaped if reserved) and prevents later clashes with it."""
         safe = re.sub(r"[^A-Za-z0-9_]", "_", name)
-        if safe in RESERVED:
+        if safe[0].isdigit() or safe.startswith("tg_"):
+            safe = "u" + safe
+        while safe in self._used:
             safe += "_"
-        self._counts.setdefault(safe, 0)
+        self._used.add(safe)
         return safe

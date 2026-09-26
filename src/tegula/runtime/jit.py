@@ -1,8 +1,7 @@
 """`@tegula.jit`: kernel functions, argument specialization, and launch.
 
-A `JITFunction` wraps a Python kernel. `kernel[grid](*args, **kwargs)` launches it. In M1
-only the interpreter runs kernels (`TEGULA_INTERPRET=1` or `@tegula.jit(interpret=True)`);
-compiled execution arrives in M2.
+A `JITFunction` wraps a Python kernel. `kernel[grid](*args, **kwargs)` launches it on the
+GPU, or in the NumPy interpreter with `TEGULA_INTERPRET=1` or `@tegula.jit(interpret=True)`.
 
 The IR for one specialization comes from `build_ir(fn, arg_types, arg_facts, constexprs,
 num_warps, math_mode)`, which is re-exported here from `tegula.compiler.frontend`. It does
@@ -39,8 +38,9 @@ __all__ = [
     "next_power_of_2",
 ]
 
-COMPILED_AVAILABLE = False
-"""Whether compiled (GPU) execution is implemented. M2 sets this to `True`."""
+COMPILED_AVAILABLE = True
+"""Whether compiled (GPU) execution is implemented."""
+RECOMPILE_WARNING = 16
 
 MATH_MODES = ("relaxed", "fast")
 
@@ -296,16 +296,92 @@ class JITFunction:
             **kwargs: Any) -> None:  # fmt: skip
         """Launches the kernel. `num_stages` is accepted for Triton compatibility and has no
         effect."""
+        interpret = self.interpret if self.interpret is not None else _env_flag("TEGULA_INTERPRET")
+        if not interpret:
+            self._run_compiled(args, kwargs, grid, num_warps)
+            return
         if num_warps not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
         bound = self.bind(args, kwargs)
         g = _resolve_grid(grid, bound)
-        interpret = self.interpret if self.interpret is not None else _env_flag("TEGULA_INTERPRET")
-        if not interpret:
-            raise NotImplementedError("compiled execution arrives in M2; set TEGULA_INTERPRET=1")
         if _env_flag("TEGULA_DUMP") or ir.verify_enabled():
             self._interp_ir(bound, num_warps)
         interp.run_grid(self.fn, g, self._interp_args(bound))
+
+    # ---- compiled execution ----
+
+    def _binder(self) -> Callable[..., tuple[tuple, tuple]]:
+        """Builds (once) a function that splits call arguments into runtime and constexpr
+        values, applying defaults, faster than `inspect.Signature.bind`."""
+        b = self.__dict__.get("_binder_fn")
+        if b is None:
+            ns: dict[str, Any] = {}
+            params = []
+            for p in self.signature.parameters.values():
+                if p.default is p.empty:
+                    params.append(p.name)
+                else:
+                    ns[f"_d_{p.name}"] = p.default
+                    params.append(f"{p.name}=_d_{p.name}")
+            rt = [p.name for p in self.params if not p.is_constexpr]
+            ce = [p.name for p in self.params if p.is_constexpr]
+            src = (f"def binder({', '.join(params)}):\n"
+                   f"    return ({''.join(n + ', ' for n in rt)}), "
+                   f"({''.join(n + ', ' for n in ce)})\n")  # fmt: skip
+            exec(src, ns)  # noqa: S102 - the source is built from parameter names only
+            b = self.__dict__["_binder_fn"] = ns["binder"]
+            self._rt_names = rt
+            self._ce_names = ce
+            self._dns = tuple(p.do_not_specialize for p in self.params if not p.is_constexpr)
+            self._compiled: dict[tuple, Any] = {}
+            self._spec_history: list[tuple] = []
+        return b
+
+    def _run_compiled(self, args: tuple, kwargs: dict, grid: Any, num_warps: int) -> None:
+        binder = self._binder()
+        try:
+            runtime, consts = binder(*args, **kwargs)
+        except TypeError as e:
+            raise TypeError(f"{self.__name__}: {e}") from None
+        key = (tuple(_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)),
+               tuple(core.unwrap(c) for c in consts), num_warps)  # fmt: skip
+        ck = self._compiled.get(key)
+        if ck is None:
+            ck = self._compile_for(runtime, consts, num_warps, key)
+        if callable(grid):
+            meta = dict(zip(self._rt_names, runtime, strict=True))
+            meta.update(zip(self._ce_names, (core.unwrap(c) for c in consts), strict=True))
+            grid = grid(meta)
+        if type(grid) is not tuple or len(grid) != 3:
+            grid = _normalize_grid(grid)
+        ck.launch(grid, runtime)
+
+    def _compile_for(self, runtime: tuple, consts: tuple, num_warps: int, key: tuple):
+        if num_warps not in (1, 2, 4, 8, 16, 32):
+            raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
+        from tegula.runtime.compile import compile_specialization
+
+        bound = dict(zip(self._rt_names, runtime, strict=True))
+        bound.update(zip(self._ce_names, consts, strict=True))
+        spec = self.specialize(bound)
+        ck = compile_specialization(self, spec, num_warps)
+        self._compiled[key] = ck
+        self._spec_history.append(key)
+        if len(self._spec_history) == RECOMPILE_WARNING + 1:
+            _warn_recompiles(self)
+        return ck
+
+    def warmup(self, *args: Any, grid: Any = None, num_warps: int = 4, **kwargs: Any):
+        """Compiles the kernel for these arguments without launching it.
+
+        Returns:
+            A `CompiledKernel` with `msl`, `ir`, `threadgroup_memory_bytes`, and `num_warps`.
+        """
+        binder = self._binder()
+        runtime, consts = binder(*args, **kwargs)
+        key = (tuple(_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)),
+               tuple(core.unwrap(c) for c in consts), num_warps)  # fmt: skip
+        return self._compiled.get(key) or self._compile_for(runtime, consts, num_warps, key)
 
     def _interp_ir(self, bound: Mapping[str, Any], num_warps: int) -> ir.Module:
         """Builds and verifies the IR once per specialization, printing it for TEGULA_DUMP."""
@@ -345,6 +421,64 @@ def _resolve_grid(grid: Any, bound: Mapping[str, Any]) -> tuple[int, int, int]:
     if any(x < 0 for x in g):
         raise ValueError(f"grid dimensions can't be negative, but got {g}")
     return (*g, *(1,) * (3 - len(g)))  # type: ignore[return-value]
+
+
+def _normalize_grid(g: Any) -> tuple[int, int, int]:
+    if isinstance(g, (int, np.integer)):
+        g = (g,)
+    g = tuple(int(x) for x in g)
+    if not 1 <= len(g) <= 3:
+        raise ValueError(f"the grid needs 1 to 3 dimensions, but got {g}")
+    if any(x < 0 for x in g):
+        raise ValueError(f"grid dimensions can't be negative, but got {g}")
+    return (*g, *(1,) * (3 - len(g)))  # type: ignore[return-value]
+
+
+def _spec_key(v: Any, no_facts: bool) -> Any:
+    """Returns the part of the specialization key contributed by one runtime argument."""
+    t = type(v)
+    if t is bool:
+        return "i1"
+    if t is int:
+        if -(1 << 31) <= v < (1 << 31):
+            return "i32" if no_facts else ("i32", v % 16 == 0, v == 1)
+        return "i64" if no_facts else ("i64", v % 16 == 0, v == 1)
+    if t is float:
+        return "f32"
+    from tegula.runtime.tensor import Tensor
+
+    if t is Tensor:
+        return (v.np_dtype, True if no_facts else v.data_ptr % 16 == 0)
+    if t is np.ndarray:
+        return (v.dtype, True if no_facts else v.__array_interface__["data"][0] % 16 == 0)
+    ty = arg_type(v)
+    facts = {} if no_facts else arg_facts(v)
+    return (str(ty), tuple(sorted(facts.items())))
+
+
+def _warn_recompiles(fn: JITFunction) -> None:
+    import warnings
+
+    hist = fn._spec_history
+    changes: dict[str, int] = {}
+    for prev, cur in zip(hist, hist[1:], strict=False):
+        for name, a, b in zip(fn._rt_names, prev[0], cur[0], strict=True):
+            if a != b:
+                changes[name] = changes.get(name, 0) + 1
+        for name, a, b in zip(fn._ce_names, prev[1], cur[1], strict=True):
+            if a != b:
+                changes[name] = changes.get(name, 0) + 1
+    worst = max(changes, key=changes.get) if changes else "?"
+    hint = ""
+    if worst in fn._rt_names:
+        i = fn._rt_names.index(worst)
+        if all(isinstance(k[0][i], tuple) and k[0][i][0] in ("i32", "i64") for k in hist):
+            hint = " If it's a size that varies, add it to do_not_specialize."
+    warnings.warn(
+        f"{fn.__name__} has been compiled {len(hist)} times; argument `{worst}` changed its "
+        f"specialization most often.{hint}",
+        stacklevel=4,
+    )
 
 
 def _dependency_hash(fn: JITFunction, seen: set[int]) -> str:
