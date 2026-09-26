@@ -87,5 +87,6 @@ def compile_specialization(fn: JITFunction, spec: Specialization, num_warps: int
         print(f"enceladus: {fn.__name__}: IR and MSL in {where}", file=sys.stderr)
     if "simdgroup_multiply_accumulate" in ck.msl:
         check_simdgroup_layout()
+    ck.math_mode = fn.math_mode
     ck.pipeline = cache.get_pipeline(ck.msl, ck.name, None, fn.math_mode)
     return ck

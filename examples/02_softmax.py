@@ -1,6 +1,9 @@
 """Row softmax, one row per program.
 
-Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/02_softmax.py`.
+`softmax` accepts NumPy arrays, `enceladus.Tensor` objects, PyTorch tensors on the
+`mps` device, and MLX arrays, including row views with nonzero offsets.
+
+Run the demo with `uv run python examples/02_softmax.py`.
 """
 
 import numpy as np
@@ -21,13 +24,15 @@ def softmax_kernel(out_ptr, in_ptr, stride_in, stride_out, n_cols, BLOCK: tl.con
     tl.store(out_ptr + row * stride_out + cols, num / tl.sum(num, axis=0), mask=mask)
 
 
-def softmax(x: np.ndarray) -> np.ndarray:
-    """Returns the softmax of each row of a 2D array, in the input dtype."""
+def softmax(x):
+    """Returns the softmax of each row of a 2D array, in the input dtype.
+
+    The rows can be strided, but the elements within a row must be contiguous.
+    """
     m, n = x.shape
-    out = np.empty_like(x)
-    item = x.itemsize
+    out = enceladus.new_empty(x)
     softmax_kernel[(m,)](
-        out, x, x.strides[0] // item, out.strides[0] // item, n,
+        out, x, enceladus.element_strides(x)[0], enceladus.element_strides(out)[0], n,
         BLOCK=enceladus.next_power_of_2(n),
     )  # fmt: skip
     return out

@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from enceladus import _C
+from enceladus.runtime import interop
 from enceladus.runtime.device import get_device
 from enceladus.runtime.interop import as_kernel_arg, is_array_like
 from enceladus.runtime.tensor import Tensor
@@ -29,6 +30,11 @@ _SCALAR_FORMATS = {
     85: "Q",  # ulong
 }
 _MTL_BFLOAT = 121
+# MTLDataType raw value -> IR scalar name, for the PyTorch launch path.
+_SCALAR_TYPES = {
+    3: "f32", 16: "f16", 29: "i32", 33: "u32", 37: "i16", 41: "u16", 45: "i8", 49: "u8",
+    53: "i1", 81: "i64", 85: "u64", _MTL_BFLOAT: "bf16",
+}  # fmt: skip
 
 
 def language_version_code(version: str | tuple[int, int] | int | None) -> int:
@@ -110,6 +116,9 @@ class MetalKernel:
         self._bindings = bindings
         self._plans: dict[tuple[bool, ...], _C.LaunchPlan] = {}
         self._max_threads = self.pipeline.max_total_threads_per_threadgroup
+        self.math_mode = math_mode
+        self._torch: dict[tuple[bool, ...], Any] = {}  # TorchLaunch or a reason string
+        self._fallback_logged = False
 
     @property
     def arg_names(self) -> list[str]:
@@ -168,6 +177,9 @@ class MetalKernel:
                 offsets.append(a.offset * a.np_dtype.itemsize if a.offset else 0)
                 mask.append(True)
             elif is_array_like(a):
+                if interop.framework_of(a) is not None:
+                    self._launch_foreign(grid, tg, args)
+                    return
                 ba = as_kernel_arg(a)
                 bufs.append(ba.buffer)
                 offsets.append(ba.byte_offset)
@@ -188,6 +200,49 @@ class MetalKernel:
         )
         if sync:
             stream.synchronize()
+
+
+    def _launch_foreign(self, grid: tuple, tg: tuple, args: tuple) -> None:
+        """Launches with at least one PyTorch or MLX array argument.
+
+        When every array argument is a PyTorch MPS tensor, the kernel runs on PyTorch's
+        stream through `torch.mps.compile_shader`. Otherwise, the launch synchronizes.
+        """
+        # launcher imports the compiler, which imports this module through cache.
+        from enceladus.runtime.launcher import (
+            TorchLaunch,
+            launch_synced,
+            log_fallback,
+            make_torch_launch,
+        )
+
+        mask = tuple(is_array_like(a) for a in args)
+        kinds = {interop.framework_of(a) for a, m in zip(args, mask, strict=True) if m}
+        reason = None
+        if kinds == {interop.KIND_TORCH}:
+            for a in args:
+                if interop.framework_of(a) is not None:
+                    interop.torch_np_dtype(a)  # refuses CPU and float64 tensors
+            tl = self._torch.get(mask)
+            if tl is None:
+                types = [None if m else _SCALAR_TYPES.get(b["data_type"], "?")
+                         for m, b in zip(mask, self._bindings, strict=True)]  # fmt: skip
+                tl = self._torch[mask] = make_torch_launch(self.source, self.name,
+                                                           self.math_mode, types)  # fmt: skip
+            if isinstance(tl, TorchLaunch):
+                threads = (grid[0] * tg[0], grid[1] * tg[1], grid[2] * tg[2])
+                tl.launch(args, threads, tg)
+                return
+            reason = f"torch.mps.compile_shader can't run it ({tl})"
+        elif interop.KIND_TORCH in kinds:
+            reason = "it mixes PyTorch tensors with other array types"
+        if reason is not None and not self._fallback_logged:
+            self._fallback_logged = True
+            log_fallback(self.name, reason)
+        scalars = b"".join(self._pack(i, a) for i, a in enumerate(args) if not mask[i])
+        launch_synced(get_device().stream, self.pipeline, self._plans.get(mask) or
+                      self._plan(mask), [a for a, m in zip(args, mask, strict=True) if m],
+                      scalars, grid, tg)  # fmt: skip
 
 
 class _Launcher:

@@ -26,6 +26,7 @@ from enceladus.compiler import ir
 from enceladus.compiler.frontend import SourceInfo, build_ir, is_jit_function, parse_function
 from enceladus.interpreter import interp
 from enceladus.language import core
+from enceladus.runtime import interop
 
 __all__ = [
     "JITFunction",
@@ -72,7 +73,10 @@ def _is_array_like(v: Any) -> bool:
 
 def _elem_dtype(v: Any) -> core.dtype:
     d = v.dtype
-    return d if isinstance(d, core.dtype) else core.dtype_from_numpy(np.dtype(d))
+    if isinstance(d, core.dtype):
+        return d
+    fd = interop.element_dtype(v)  # PyTorch and MLX dtypes aren't NumPy dtypes
+    return core.dtype_from_numpy(fd if fd is not None else np.dtype(d))
 
 
 def arg_type(value: Any) -> ir.Type:
@@ -138,8 +142,11 @@ def arg_facts(value: Any) -> dict[str, Any]:
             facts["equal_to_1"] = True
         return facts
     if _is_array_like(value):
-        p = _data_ptr(value)
-        return {"divisibility": 16} if p is not None and p % 16 == 0 else {}
+        aligned = interop.aligned16(value)
+        if aligned is None:
+            p = _data_ptr(value)
+            aligned = p is not None and p % 16 == 0
+        return {"divisibility": 16} if aligned else {}
     return {}
 
 
@@ -311,6 +318,9 @@ class JITFunction:
         g = _resolve_grid(grid, bound)
         if _env_flag("ENCELADUS_DUMP") or ir.verify_enabled():
             self._interp_ir(bound, num_warps)
+        if any(interop.framework_of(v) is not None for v in bound.values()):
+            # The interpreter works on NumPy views of the frameworks' shared memory.
+            bound = {k: interop.host_view(v) for k, v in bound.items()}
         interp.run_grid(self.fn, g, self._interp_args(bound))
 
     # ---- compiled execution ----
@@ -349,8 +359,9 @@ class JITFunction:
             runtime, consts = binder(*args, **kwargs)
         except TypeError as e:
             raise TypeError(f"{self.__name__}: {e}") from None
-        key = (tuple(_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)),
-               tuple(core.unwrap(c) for c in consts), num_warps, dot_warps)  # fmt: skip
+        # List comprehensions: this runs on every launch, and generators cost more.
+        key = (tuple([_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)]),
+               tuple([core.unwrap(c) for c in consts]), num_warps, dot_warps)  # fmt: skip
         ck = self._compiled.get(key)
         if ck is None:
             ck = self._compile_for(runtime, consts, num_warps, key, dot_warps)
@@ -359,7 +370,9 @@ class JITFunction:
             meta.update(zip(self._ce_names, (core.unwrap(c) for c in consts), strict=True))
             grid = grid(meta)
         if type(grid) is not tuple or len(grid) != 3:
-            grid = _normalize_grid(grid)
+            g0 = grid[0] if type(grid) is tuple and len(grid) == 1 else None
+            # A 1-tuple of a non-negative int is the common case; skip the general path.
+            grid = (g0, 1, 1) if type(g0) is int and g0 >= 0 else _normalize_grid(grid)
         ck.launch(grid, runtime)
 
     def _compile_for(self, runtime: tuple, consts: tuple, num_warps: int, key: tuple,
@@ -457,12 +470,16 @@ def _spec_key(v: Any, no_facts: bool) -> Any:
         return "i64" if no_facts else ("i64", v % 16 == 0, v == 1)
     if t is float:
         return "f32"
+    if t.__name__ == "Tensor" and t.__module__ == "torch":
+        return interop.torch_spec_key(v, no_facts)
     from enceladus.runtime.tensor import Tensor
 
     if t is Tensor:
         return (v.np_dtype, True if no_facts else v.data_ptr % 16 == 0)
     if t is np.ndarray:
         return (v.dtype, True if no_facts else v.__array_interface__["data"][0] % 16 == 0)
+    if interop.framework_of(v) == interop.KIND_TORCH:  # a torch.Tensor subclass
+        return interop.torch_spec_key(v, no_facts)
     ty = arg_type(v)
     facts = {} if no_facts else arg_facts(v)
     return (str(ty), tuple(sorted(facts.items())))

@@ -1,5 +1,9 @@
 """Measures launch overhead: sustained batched launches and synchronous round trips.
 
+The PyTorch rows launch through `torch.mps.compile_shader` on PyTorch's MPS stream, and
+the MLX row measures the synchronous MLX path. Rows for a framework that isn't installed
+are skipped.
+
 Run with `uv run python benchmarks/bench_dispatch.py`.
 """
 
@@ -22,26 +26,29 @@ kernel void vadd(device const float* x [[buffer(0)]], device const float* y [[bu
 """
 
 
-def sustained(launch, n: int = 10_000, reps: int = 5) -> list[float]:
-    """Returns µs per launch for `reps` runs of `n` back-to-back launches."""
+def sustained(launch, n: int = 10_000, reps: int = 5, sync=enceladus.synchronize) -> list[float]:
+    """Returns µs per launch for `reps` runs of `n` back-to-back launches.
+
+    `sync` waits for the stream that `launch` uses.
+    """
     out = []
     for _ in range(reps):
-        enceladus.synchronize()
+        sync()
         t0 = time.perf_counter()
         for _ in range(n):
             launch()
-        enceladus.synchronize()
+        sync()
         out.append((time.perf_counter() - t0) / n * 1e6)
     return out
 
 
-def round_trip(launch, n: int = 300) -> list[float]:
+def round_trip(launch, n: int = 300, sync=enceladus.synchronize) -> list[float]:
     """Returns µs for `n` launch-and-wait round trips."""
     out = []
     for _ in range(n):
         t0 = time.perf_counter()
         launch()
-        enceladus.synchronize()
+        sync()
         out.append((time.perf_counter() - t0) * 1e6)
     return out
 
@@ -90,6 +97,53 @@ def main() -> None:
 
     jit_launch()
     report("@enceladus.jit launch, sustained", sustained(jit_launch))
+    bench_torch(add_kernel, n)
+    bench_mlx(add_kernel, n)
+
+
+def bench_torch(add_kernel, n: int) -> None:
+    """Measures launches through the PyTorch path against PyTorch's own floors."""
+    try:
+        import torch
+    except ImportError:
+        return
+    if not torch.backends.mps.is_available():
+        return
+    sync = torch.mps.synchronize
+    x, y, o = (torch.randn(n, device="mps") for _ in range(3))
+
+    def jit_launch() -> None:
+        add_kernel[(1,)](x, y, o, n, BLOCK=1024)
+
+    jit_launch()
+    sustained(jit_launch, n=20_000, reps=1, sync=sync)  # warm up
+    report("@enceladus.jit on torch MPS, sustained", sustained(jit_launch, sync=sync))
+    report("@enceladus.jit on torch MPS, sync round trip", round_trip(jit_launch, sync=sync))
+
+    # Floors: the same compile_shader kernel called directly, and a built-in torch op.
+    lib = torch.mps.compile_shader(SRC)
+
+    def direct() -> None:
+        lib.vadd(x, y, o, n, threads=(n,), group_size=(256,), arg_casts={3: "int32"})
+
+    report("torch compile_shader call, sustained", sustained(direct, sync=sync))
+    report("torch.add(out=), sustained", sustained(lambda: torch.add(x, y, out=o), sync=sync))
+
+
+def bench_mlx(add_kernel, n: int) -> None:
+    """Measures the synchronous MLX path."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+    x, y, o = mx.random.normal((n,)), mx.random.normal((n,)), mx.zeros((n,))
+    mx.eval(x, y, o)
+
+    def jit_launch() -> None:
+        add_kernel[(1,)](x, y, o, n, BLOCK=1024)
+
+    jit_launch()
+    report("@enceladus.jit on MLX arrays, sync round trip", round_trip(jit_launch))
 
 
 if __name__ == "__main__":

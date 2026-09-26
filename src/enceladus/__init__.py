@@ -6,7 +6,7 @@ __version__ = "0.1.0.dev0"
 from enceladus._C import MetalError
 from enceladus.runtime.autotuner import Config, autotune, heuristics
 from enceladus.runtime.device import Capabilities, get_device
-from enceladus.runtime.interop import async_numpy
+from enceladus.runtime.interop import async_numpy, element_strides, new_empty
 from enceladus.runtime.raw import metal_kernel
 from enceladus.runtime.stream import synchronize
 from enceladus.runtime.tensor import (

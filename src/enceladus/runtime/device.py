@@ -100,21 +100,24 @@ kernel void probe(device const float* m [[buffer(0)]], device float* out [[buffe
 }
 """
 _simd_layout_ok: bool | None = None
+# Autotuning compiles on several threads; the probe launches on the shared stream, which
+# isn't thread-safe, so only one thread runs it.
 _simd_layout_lock = threading.Lock()
 
 
 def check_simdgroup_layout() -> None:
     """Verifies the `simdgroup_matrix` lane layout that `tl.dot` codegen assumes.
 
-    Metal leaves the layout unspecified. This runs once per process on first use. The
-    autotuner compiles configurations from several threads, so the probe runs under a lock:
-    concurrent probes that launch and synchronize on the shared stream crash the process.
+    Metal leaves the layout unspecified. This runs once per process on first use.
 
     Raises:
         enceladus.CompilationError: The device uses a different layout.
     """
-    with _simd_layout_lock:
-        _probe_simdgroup_layout()
+    global _simd_layout_ok
+    if _simd_layout_ok is None:
+        with _simd_layout_lock:
+            if _simd_layout_ok is None:
+                _simd_layout_ok = _probe_simdgroup_layout()
     if not _simd_layout_ok:
         from enceladus.compiler.errors import CompilationError
 
@@ -125,20 +128,18 @@ def check_simdgroup_layout() -> None:
         )
 
 
-def _probe_simdgroup_layout() -> None:
-    global _simd_layout_ok
-    if _simd_layout_ok is None:
-        import numpy as np
+def _probe_simdgroup_layout() -> bool:
+    import numpy as np
 
-        from enceladus.runtime.raw import metal_kernel
-        from enceladus.runtime.tensor import empty, from_numpy
+    from enceladus.runtime.raw import metal_kernel
+    from enceladus.runtime.tensor import empty, from_numpy
 
-        k = metal_kernel(_SIMD_LAYOUT_SRC, "probe")
-        m = from_numpy(np.arange(64, dtype=np.float32))
-        out = empty(64)
-        k[(1,), (64,)](m, out)
-        lane = np.arange(32)
-        row = ((lane >> 2) & 4) + ((lane >> 1) & 3)
-        col = ((lane >> 1) & 4) + ((lane << 1) & 2)
-        expect = np.stack([row * 8 + col, row * 8 + col + 1], axis=1).reshape(-1)
-        _simd_layout_ok = bool(np.array_equal(out.numpy(), expect))
+    k = metal_kernel(_SIMD_LAYOUT_SRC, "probe")
+    m = from_numpy(np.arange(64, dtype=np.float32))
+    out = empty(64)
+    k[(1,), (64,)](m, out)
+    lane = np.arange(32)
+    row = ((lane >> 2) & 4) + ((lane >> 1) & 3)
+    col = ((lane >> 1) & 4) + ((lane << 1) & 2)
+    expect = np.stack([row * 8 + col, row * 8 + col + 1], axis=1).reshape(-1)
+    return bool(np.array_equal(out.numpy(), expect))

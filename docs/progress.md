@@ -439,6 +439,157 @@ only the per-step interior test, the edge-fragment helper, and the epilogue mask
 - If configs share an identity but have different `pre_hook`s, a saved result maps back
   to the first of them, which might not be the one that won the benchmark.
 
+## M6: Framework interop
+
+### What was built
+
+- `runtime/interop.py` accepts PyTorch tensors on the `mps` device and MLX arrays as
+  kernel arguments. It detects them by `type(obj).__module__`, so importing Enceladus
+  imports neither framework.
+  - A PyTorch tensor binds `t.untyped_storage().data_ptr()` (the `id<MTLBuffer>`) at
+    the byte offset `t.storage_offset() * t.element_size()`, with its shape and strides.
+  - An MLX array is evaluated with `mx.eval()`. Its `id<MTLBuffer>`, byte offset, shape,
+    and strides come from its `kDLMetal` DLPack capsule, which `_C.dlpack_inspect` reads
+    without consuming it. The launch retains the buffer and holds the array and the
+    capsule until the GPU finishes. The dtype comes from `a.dtype`, because MLX's
+    capsule reports `bool` as a 32-bit integer.
+  - CPU tensors are refused with an error that suggests `.to("mps")`. `float64` is
+    refused for NumPy, PyTorch, and MLX.
+  - Specialization facts are correct for both frameworks: divisibility by 16 comes from
+    the byte offset, not from `data_ptr()`.
+  - `enceladus.new_empty(like, shape, dtype)` allocates an output of the caller's kind
+    (NumPy, `enceladus.Tensor`, PyTorch, or MLX). `enceladus.element_strides(x)` returns
+    strides in elements for every kind. The examples use both, so one host wrapper
+    serves all four kinds.
+- `runtime/launcher.py` has three launch paths:
+  - **PyTorch path.** When every array argument is an MPS tensor, the generated MSL runs
+    through `torch.mps.compile_shader` on PyTorch's MPS stream, so it orders with
+    surrounding PyTorch operations. Libraries are cached per SHA-256 of the source. The
+    launch uses `threads = (grid[0] * tg, grid[1], grid[2])` and
+    `group_size = (tg, 1, 1)`. The argument call is generated once per kernel.
+  - **Synchronized native path.** Any other launch that involves PyTorch or MLX memory
+    (PyTorch mixed with other array kinds, a kernel that `compile_shader` rejects, or MLX
+    arrays) calls `torch.mps.synchronize()`, dispatches on Enceladus's stream, and waits
+    for it. A PyTorch fallback logs one warning per kernel on the `enceladus` logger.
+  - The native path is unchanged for `enceladus.Tensor` and NumPy arguments.
+- Raw `enceladus.metal_kernel` launches take the same PyTorch and synchronized paths,
+  with scalar types from pipeline reflection.
+- `enceladus.Tensor.__dlpack__` and `__dlpack_device__` export `kDLMetal` capsules whose
+  `data` is the `id<MTLBuffer>` and whose `byte_offset` locates the view. The export
+  waits for Enceladus's stream first. `max_version >= (1, 0)` selects a
+  `dltensor_versioned` capsule. `torch.from_dlpack` and `mx.from_dlpack` both import
+  these capsules without copying; writes on either side are visible on the other. The
+  capsule code is in `_C/bindings.mm` (`dlpack_export`, `dlpack_inspect`).
+- The interpreter accepts PyTorch and MLX arguments: it runs on NumPy views of their
+  shared memory after waiting for the framework.
+- The autotuner benchmarks PyTorch and MLX arguments through `enceladus.Tensor` views
+  of their memory, because `do_bench` times Enceladus's stream. The final launch takes
+  the PyTorch path.
+
+#### How `compile_shader` binds arguments (torch 2.14)
+
+- Argument `i` binds at `[[buffer(i)]]`, which matches Enceladus's ABI. Tensors bind at
+  `storage_offset() * element_size()`, so views with nonzero offsets work.
+- A Python `int` binds as `int64`, a `float` as `float32`. `arg_casts` takes a
+  `dict[int, str]`, and only `"int8"`, `"int16"`, `"int32"`, and `"uint8"` are accepted
+  for ints. There's no half or bfloat cast for floats.
+- The adapter maps each ABI scalar type as follows: `i1` to an `int8` cast; `i8`, `i16`,
+  `i32`, and `u8` to their casts; `u16` and `u32` to the signed cast of the same width
+  with the same bit pattern; `i64` and `u64` (wrapped to signed) to the default `int64`;
+  `f32` to the default `float`; and `f16` and `bf16` to a 0-d CPU tensor, which
+  `compile_shader` binds by value with `setBytes`.
+- `compile_shader` compiles with MSL 4.0, safe math, and precise math functions.
+  Enceladus prepends `#pragma METAL fp math_mode(relaxed)` (or `fast`) to match its
+  native semantics; without it, `x != x` NaN tests behave differently. MSL has no
+  pragma for the math-function precision, so `exp` and similar functions are precise
+  (1.4 ULP measured) on the PyTorch path and fast (61 ULP) on the native path.
+
+### Benchmarks
+
+Preliminary: other agents shared the GPU during these runs. `benchmarks/bench_dispatch.py`
+measured the following, as the minimum and median of 5 runs of 10,000 launches:
+
+| Launch | Min | Median | Target |
+|---|---|---|---|
+| `@enceladus.jit` on PyTorch MPS tensors, sustained | 4.89-5.03 µs | 5.00-5.07 µs | 5 µs or less |
+| `torch.mps.compile_shader` call made directly, sustained | 2.31 µs | 2.34 µs | Not applicable |
+| `torch.add(out=)`, sustained | 2.04 µs | 2.08 µs | Not applicable |
+| `@enceladus.jit` on `enceladus.Tensor`, sustained | 3.36 µs | 3.38 µs | 5 µs or less |
+| `@enceladus.jit` on PyTorch MPS tensors, sync round trip | 66-75 µs | 116 µs | Not applicable |
+| `@enceladus.jit` on MLX arrays, sync round trip | 101 µs | 133 µs | About 100 µs |
+
+The PyTorch path is host-bound. The host enqueues a launch in about 4.0 µs, and
+PyTorch's stream adds about 1 µs per launch after the call returns, for direct
+`compile_shader` calls too. Two changes to the shared launch path brought the sustained
+cost from 7.0 µs to about 5 µs: a fast path for 1-tuple grids, and list comprehensions
+instead of generators in the specialization key. They also moved `@enceladus.jit` on
+`enceladus.Tensor` from 3.8 µs to 3.4 µs.
+
+### Tests
+
+`tests/test_interop.py` has 42 cases; the module skips when PyTorch or MPS is missing,
+and the MLX cases skip when MLX is missing:
+
+- The vector add, softmax, pointer matmul, and descriptor matmul examples run on PyTorch
+  and MLX arrays in FP32 and FP16, with and without a 3-row offset (byte offsets that
+  aren't 16-byte aligned). Each case runs `check_kernel` in compiled and interpreted
+  modes against NumPy, and asserts that PyTorch launches don't take the synchronized
+  fallback.
+- A raw kernel binds every ABI scalar type at its extreme values on the PyTorch path,
+  and a `@enceladus.jit` kernel binds `i1`, `i32`, `i64`, and `f32`, compared bit for bit.
+- 200 iterations of "PyTorch `fill_` writes, Enceladus reads and writes, PyTorch reads"
+  run without a host sync and see no stale data. With the ordering broken on purpose
+  (native dispatch without `torch.mps.synchronize()`), the test fails.
+- DLPack export to PyTorch (legacy and versioned capsules) and to MLX shares memory in
+  both directions and waits for a pending Enceladus launch.
+- A launch that mixes PyTorch tensors with an `enceladus.Tensor` falls back, returns
+  correct results without an explicit sync, and logs once.
+- CPU tensors, `float64` arrays, and writes to a broadcast MLX array are refused.
+
+The whole suite runs 518 tests, with 18 skipped, in about 2 s.
+
+### Deviations from the plan
+
+- The PyTorch path prepends a math-mode pragma to the source, because `compile_shader`
+  compiles with safe math. Math functions stay precise there, so results can differ from
+  the native path in the last bits.
+- Half and bfloat scalar arguments bind as 0-d CPU tensors, because `arg_casts` has no
+  float casts. Each such argument allocates a small CPU tensor per launch.
+- A launch that mixes PyTorch tensors with other array kinds takes the synchronized
+  native path, as the plan's fallback describes.
+- `check_simdgroup_layout` in `runtime/device.py` holds a lock. Autotuning compiles on
+  several threads, and concurrent probes raced on the stream, which isn't thread-safe.
+  With PyTorch arguments, `matmul_tuned` crashed in one run and deadlocked in the
+  next. The race predates M6.
+
+### Known gaps
+
+- The lazy MLX integration through `mx.fast.metal_kernel` isn't implemented. A probe
+  shows that it's feasible: the vector add kernel, renamed from `[[kernel]]` to an
+  `inline` function in `header`, with its attributes stripped and a body that passes
+  MLX's `threadgroup_position_in_grid` and related values, ran correctly, and a chain of
+  1,000 dependent launches cost 7.7 µs per launch against about 100 µs for the
+  synchronous path. The blockers for general use:
+  - MLX allocates outputs, so kernels that read or partially write an output need
+    `init_value` or an input copy to keep in-place semantics.
+  - Threadgroup memory is declared inside the kernel and must move into the body.
+  - Scalars must become 0-d arrays or template constants.
+  - mlx#4534 clamps `group_dims` to the grid.
+- MLX launches are synchronous (about 100 µs each). Outputs must be arrays allocated for
+  the purpose, such as `mx.zeros(shape)` followed by `mx.eval()`, or
+  `enceladus.new_empty(like)`. Enceladus writes to them in place, which MLX's immutable
+  arrays don't expect: an array that MLX shares or reuses, such as one from
+  `mx.broadcast_to` (refused) or a lazily computed result, can't be an output.
+- An `enceladus.Tensor` exported through DLPack is ordered with the consumer only at
+  export. Launches on the original `enceladus.Tensor` after that need
+  `enceladus.synchronize()` before the consumer reads; launches on the imported PyTorch
+  tensor take the PyTorch path and order themselves.
+- Raw `metal_kernel` launches on PyTorch tensors take about 5.4 µs of host time, because
+  their path rebuilds the argument mask on each launch. They weren't optimized.
+- The sustained PyTorch launch cost sits at the 5 µs target within noise, not clearly
+  under it. Most of the host time is the shared `@enceladus.jit` binding and
+  specialization-key work.
+
 ## M7: Atomics and scans
 
 This entry covers the atomics and scans parts of M7. Flash attention has its own entry.

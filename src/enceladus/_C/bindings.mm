@@ -146,6 +146,149 @@ static void prepare(DispatchArgs &a, const LaunchPlan &plan, nb::handle bufs, nb
     read_dim3(tg, a.tg);
 }
 
+// ---- DLPack ------------------------------------------------------------------
+// The subset of dlpack.h (v1.0) that Enceladus needs. The layouts match the header.
+
+enum { kDLMetal = 8 };
+
+struct DLDevice {
+    int32_t device_type;
+    int32_t device_id;
+};
+struct DLDataType {
+    uint8_t code;
+    uint8_t bits;
+    uint16_t lanes;
+};
+struct DLTensor {
+    void *data;
+    DLDevice device;
+    int32_t ndim;
+    DLDataType dtype;
+    int64_t *shape;
+    int64_t *strides;
+    uint64_t byte_offset;
+};
+struct DLManagedTensor {
+    DLTensor dl_tensor;
+    void *manager_ctx;
+    void (*deleter)(DLManagedTensor *self);
+};
+struct DLPackVersion {
+    uint32_t major;
+    uint32_t minor;
+};
+struct DLManagedTensorVersioned {
+    DLPackVersion version;
+    void *manager_ctx;
+    void (*deleter)(DLManagedTensorVersioned *self);
+    uint64_t flags;
+    DLTensor dl_tensor;
+};
+
+// Owns the shape and strides arrays and a reference to the Python object that keeps
+// the MTLBuffer alive.
+struct DLContext {
+    PyObject *owner = nullptr;
+    std::vector<int64_t> shape, strides;
+};
+
+template <typename M>
+static void dl_delete(M *m) {
+    auto *ctx = static_cast<DLContext *>(m->manager_ctx);
+    // Consumers can call the deleter from any thread, with or without the GIL.
+    PyGILState_STATE s = PyGILState_Ensure();
+    Py_XDECREF(ctx->owner);
+    PyGILState_Release(s);
+    delete ctx;
+    delete m;
+}
+
+template <typename M>
+static void dl_capsule_destructor(PyObject *cap, const char *name) {
+    // A consumer renames the capsule when it takes ownership.
+    if (!PyCapsule_IsValid(cap, name)) return;
+    PyObject *type, *value, *tb;
+    PyErr_Fetch(&type, &value, &tb);
+    auto *m = static_cast<M *>(PyCapsule_GetPointer(cap, name));
+    if (m && m->deleter) m->deleter(m);
+    PyErr_Restore(type, value, tb);
+}
+
+static void dl_destroy_legacy(PyObject *cap) {
+    dl_capsule_destructor<DLManagedTensor>(cap, "dltensor");
+}
+static void dl_destroy_versioned(PyObject *cap) {
+    dl_capsule_destructor<DLManagedTensorVersioned>(cap, "dltensor_versioned");
+}
+
+static nb::object dlpack_export(Buffer &buf, const std::vector<int64_t> &shape,
+                                const std::vector<int64_t> &strides, uint64_t byte_offset,
+                                uint8_t code, uint8_t bits, nb::object owner, bool versioned) {
+    if (shape.size() != strides.size())
+        throw std::invalid_argument("shape and strides differ in length");
+    auto *ctx = new DLContext();
+    ctx->shape = shape;
+    ctx->strides = strides;
+    ctx->owner = owner.inc_ref().ptr();
+    DLTensor t{};
+    t.data = buf.p;  // kDLMetal: the id<MTLBuffer>, not its contents
+    t.device = {kDLMetal, 0};
+    t.ndim = (int32_t)shape.size();
+    t.dtype = {code, bits, 1};
+    t.shape = ctx->shape.data();
+    t.strides = ctx->strides.data();
+    t.byte_offset = byte_offset;
+    PyObject *cap;
+    if (versioned) {
+        auto *m = new DLManagedTensorVersioned();
+        m->version = {1, 0};
+        m->manager_ctx = ctx;
+        m->deleter = dl_delete<DLManagedTensorVersioned>;
+        m->flags = 0;
+        m->dl_tensor = t;
+        cap = PyCapsule_New(m, "dltensor_versioned", dl_destroy_versioned);
+        if (!cap) m->deleter(m);
+    } else {
+        auto *m = new DLManagedTensor();
+        m->dl_tensor = t;
+        m->manager_ctx = ctx;
+        m->deleter = dl_delete<DLManagedTensor>;
+        cap = PyCapsule_New(m, "dltensor", dl_destroy_legacy);
+        if (!cap) m->deleter(m);
+    }
+    if (!cap) throw nb::python_error();
+    return nb::steal(cap);
+}
+
+// Reads a DLPack capsule without consuming it.
+static nb::tuple dlpack_inspect(nb::handle cap) {
+    const DLTensor *t = nullptr;
+    if (PyCapsule_IsValid(cap.ptr(), "dltensor_versioned")) {
+        auto *m = static_cast<DLManagedTensorVersioned *>(
+            PyCapsule_GetPointer(cap.ptr(), "dltensor_versioned"));
+        if (m->version.major != 1)
+            throw std::invalid_argument("unsupported DLPack major version " +
+                                        std::to_string(m->version.major));
+        t = &m->dl_tensor;
+    } else if (PyCapsule_IsValid(cap.ptr(), "dltensor")) {
+        t = &static_cast<DLManagedTensor *>(PyCapsule_GetPointer(cap.ptr(), "dltensor"))
+                 ->dl_tensor;
+    } else {
+        throw std::invalid_argument("expected an unconsumed DLPack capsule");
+    }
+    nb::list shape, strides;
+    for (int i = 0; i < t->ndim; ++i) shape.append(t->shape[i]);
+    nb::object st = nb::none();
+    if (t->strides) {
+        for (int i = 0; i < t->ndim; ++i) strides.append(t->strides[i]);
+        st = nb::tuple(strides);
+    }
+    return nb::make_tuple((uintptr_t)t->data, t->device.device_type, t->device.device_id,
+                          t->byte_offset, nb::tuple(shape), st,
+                          nb::make_tuple(t->dtype.code, t->dtype.bits, t->dtype.lanes));
+}
+
 NB_MODULE(_C, m) {
     nb::exception<MetalError>(m, "MetalError");
 
@@ -386,4 +529,11 @@ NB_MODULE(_C, m) {
             return buf;
         },
         nb::arg("handle"), nb::arg("owner").none());
+    m.def("dlpack_export", &dlpack_export, nb::arg("buffer"), nb::arg("shape"),
+          nb::arg("strides"), nb::arg("byte_offset"), nb::arg("code"), nb::arg("bits"),
+          nb::arg("owner").none(), nb::arg("versioned") = false,
+          "Returns a kDLMetal DLPack capsule whose data is the buffer's id<MTLBuffer>.");
+    m.def("dlpack_inspect", &dlpack_inspect, nb::arg("capsule"),
+          "Returns (data, device_type, device_id, byte_offset, shape, strides, "
+          "(code, bits, lanes)) without consuming the capsule.");
 }
