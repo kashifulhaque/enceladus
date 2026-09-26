@@ -593,6 +593,9 @@ class _Codegen:
             "reduce",
             "if",
             "for",
+            "scan",
+            "atomic_rmw",
+            "atomic_cas",
         ):
             if self.plan.classify(res) != ANCHORED:
                 return  # emitted lazily at each use
@@ -859,6 +862,24 @@ class _Codegen:
 
         emit_reduce(self, op)
 
+    # ---- scans and atomics ----
+
+    def op_scan(self, op: ir.Op) -> None:
+        from enceladus.compiler.codegen.scan import emit_scan
+
+        emit_scan(self, op)
+
+    def op_atomic_rmw(self, op: ir.Op) -> None:
+        from enceladus.compiler.codegen.atomic import emit_atomic
+
+        emit_atomic(self, op)
+
+    op_atomic_cas = op_atomic_rmw
+
+    def helper(self, key: str, code: str) -> None:
+        """Adds a helper function that the kernel needs, once, after the prelude."""
+        self.__dict__.setdefault("helpers", {}).setdefault(key, code)
+
     # ---- kernel ----
 
     def run(self) -> GeneratedKernel:
@@ -888,6 +909,8 @@ class _Codegen:
         out.line("#include <metal_stdlib>")
         out.line("using namespace metal;")
         out.lines(PRELUDE)
+        for code in self.__dict__.get("helpers", {}).values():
+            out.lines(code)
         params = []
         for a in args:
             ct = CTYPES[a.dtype]

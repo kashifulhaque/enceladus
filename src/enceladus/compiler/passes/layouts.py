@@ -226,6 +226,11 @@ class _Assigner:
             if not isinstance(t, ir.TileType):
                 return None
             return L.slice_layout(lay, op.attrs["axis"])
+        if op.name == "scan":
+            # Every result of a scan keeps the layout of its first input.
+            return self.resolve(op.operands[0]) or p.default(op.operands[0].type)
+        if op.name in ("atomic_rmw", "atomic_cas"):
+            return self._atomic_layout(op)
         if op.name == "if":
             i = op.results.index(v)
             for rg in op.regions:
@@ -258,6 +263,17 @@ class _Assigner:
                                        op.loc)  # fmt: skip
             return L.simd_acc(bm, bn, wm, wn)
         return None
+
+    def _atomic_layout(self, op: ir.Op) -> L.BitLayout:
+        """Returns the layout an atomic runs in: its value's, else its pointer's, like a store."""
+        p = self.plan
+        ptr = op.operands[0]
+        for v in (op.operands[-1] if op.name == "atomic_cas" else op.operands[1], ptr):
+            if p.classify(v) != CHEAP:
+                lay = self.resolve(v)
+                if lay is not None:
+                    return lay
+        return p.default(op.result.type, contiguous_order(p.axis.get(ptr)))
 
 
 def dot_warps(bm: int, bn: int, num_warps: int, loc=None,

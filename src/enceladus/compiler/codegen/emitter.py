@@ -49,6 +49,14 @@ RESERVED = frozenset(
     simdgroup_load simdgroup_store simdgroup_multiply_accumulate
     make_filled_simdgroup_matrix threadgroup_barrier mem_flags
     """.split()
+    # Metal atomics and SIMD functions that `atomic.py` and `scan.py` call.
+    + """
+    atomic_int atomic_uint atomic_float atomic_ulong memory_order_relaxed atomic_load_explicit
+    atomic_exchange_explicit atomic_compare_exchange_weak_explicit atomic_fetch_add_explicit
+    atomic_fetch_max_explicit atomic_fetch_min_explicit atomic_fetch_and_explicit
+    atomic_fetch_or_explicit atomic_fetch_xor_explicit atomic_max_explicit atomic_min_explicit
+    simd_shuffle simd_prefix_exclusive_sum
+    """.split()
     + _MACROS
     # Kernel parameters, and the fixed locals of `msl.py`, `dot.py`, and `reduce.py`: the
     # register loop index `r`, the exchange buffer `buf`, the MMA loop's `kk`, `i`, `j`,
