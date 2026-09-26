@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import tegula
+import enceladus
 
 HERE = Path(__file__).resolve().parent
 BENCHMARKS = ["bench_dispatch", "bench_elementwise", "bench_softmax", "bench_norms",
@@ -19,15 +19,15 @@ BENCHMARKS = ["bench_dispatch", "bench_elementwise", "bench_softmax", "bench_nor
 
 
 def main() -> None:
-    caps = tegula.get_device().caps
+    caps = enceladus.get_device().caps
     date = datetime.date.today().isoformat()
     out = HERE / "results" / f"{date}-{caps.architecture}.md"
     out.parent.mkdir(exist_ok=True)
     lines = [
-        f"# Tegula benchmarks, {date}",
+        f"# Enceladus benchmarks, {date}",
         "",
-        f"Device: {caps.name} ({caps.architecture}). Tegula {tegula.__version__}.",
-        "Tegula times use GPU timestamps; MLX and PyTorch times use the wall clock.",
+        f"Device: {caps.name} ({caps.architecture}). Enceladus {enceladus.__version__}.",
+        "Enceladus times use GPU timestamps; MLX and PyTorch times use the wall clock.",
         "",
     ]
     for name in BENCHMARKS:

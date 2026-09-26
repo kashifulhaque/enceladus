@@ -1,15 +1,15 @@
 """Vector add: `out = x + y`.
 
-Run the demo with `TEGULA_INTERPRET=1 uv run python examples/01_vector_add.py`.
+Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/01_vector_add.py`.
 """
 
 import numpy as np
 
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
 
-@tegula.jit
+@enceladus.jit
 def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -23,7 +23,7 @@ def add(x: np.ndarray, y: np.ndarray, block: int = 1024) -> np.ndarray:
     """Returns `x + y` for two contiguous arrays of the same shape and dtype."""
     out = np.empty_like(x)
     n = x.size
-    add_kernel[(tegula.cdiv(n, block),)](x, y, out, n, BLOCK=block)
+    add_kernel[(enceladus.cdiv(n, block),)](x, y, out, n, BLOCK=block)
     return out
 
 

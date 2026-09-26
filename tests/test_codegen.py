@@ -4,13 +4,13 @@ import numpy as np
 import pytest
 from conftest import check_kernel
 
-import tegula
-import tegula.language as tl
-from tegula.compiler import ir
-from tegula.compiler.passes.axis_info import AxisAnalysis, contiguous_order
+import enceladus
+import enceladus.language as tl
+from enceladus.compiler import ir
+from enceladus.compiler.passes.axis_info import AxisAnalysis, contiguous_order
 
 
-@tegula.jit
+@enceladus.jit
 def _add_transposed(x_ptr, y_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
     rm = tl.arange(0, M)
     rn = tl.arange(0, N)
@@ -36,14 +36,14 @@ def test_layout_conversion_through_threadgroup_memory(rng_np, dtype):
 
 def test_threadgroup_memory_overflow_names_the_line(rng_np):
     x = np.zeros((128, 128), np.float32)
-    with pytest.raises(tegula.CompilationError) as e:
+    with pytest.raises(enceladus.CompilationError) as e:
         _add_transposed.warmup(x, x, x, M=128, N=128)
     msg = str(e.value)
     assert "threadgroup memory" in msg and "smaller blocks" in msg
     assert "x + tl.trans(y)" in msg
 
 
-@tegula.jit
+@enceladus.jit
 def _row_center(x_ptr, out_ptr, N: tl.constexpr, M: tl.constexpr):
     rm = tl.arange(0, M)
     rn = tl.arange(0, N)
@@ -86,13 +86,13 @@ def test_generated_msl_is_deterministic():
     x = np.zeros((16, 256), np.float32)
     first = _row_center.ir(x, x, N=256, M=16)
     second = _row_center.ir(x, x, N=256, M=16)
-    from tegula.compiler.pipeline import compile_module
+    from enceladus.compiler.pipeline import compile_module
 
     assert compile_module(first).source == compile_module(second).source
 
 
 def test_axis_info_tracks_contiguity_and_order():
-    @tegula.jit
+    @enceladus.jit
     def k(p, stride_m, stride_n, BM: tl.constexpr, BN: tl.constexpr):
         rm = tl.arange(0, BM)
         rn = tl.arange(0, BN)

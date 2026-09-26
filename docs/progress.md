@@ -8,7 +8,7 @@ from [PLAN.md](../PLAN.md). All numbers come from the development machine (M4 Pr
 
 ### What was built
 
-- `src/tegula/_C/`: the Objective-C++ runtime (`tegula_rt.h`, `tegula_rt.mm`) and the
+- `src/enceladus/_C/`: the Objective-C++ runtime (`enceladus_rt.h`, `enceladus_rt.mm`) and the
   nanobind module (`bindings.mm`), built by scikit-build-core and CMake.
   - Compile options: language version (3.2 by default, always set explicitly), math mode,
     FP32 function precision, invariance, and logging. Diagnostics return in a 64 KB
@@ -18,15 +18,15 @@ from [PLAN.md](../PLAN.md). All numbers come from the development machine (M4 Pr
   - `Stream`: one open command buffer with a serial encoder. It commits every
     `flush_every` dispatches, signals an `MTLSharedEvent`, and on sync spin-waits on the
     event with back-off. Command-buffer errors are collected at sync and raised as
-    `tegula.MetalError` with the names of the kernels in the failing batch.
+    `enceladus.MetalError` with the names of the kernels in the failing batch.
   - `LaunchPlan`: a precomputed binding plan (buffer indices plus a scalar table). Each
     scalar gets its own `setBytes` call at its own index.
   - Timing: `Stream.timed_run` and `Stream.flush_timed` return GPU start and end
     timestamps.
-- `src/tegula/runtime/`: `device.py` (singleton and `Capabilities`), `tensor.py`
-  (`tegula.Tensor` and allocation helpers), `interop.py` (`as_kernel_arg` for tensors and
-  NumPy arrays), `stream.py`, and `raw.py` (`tegula.metal_kernel`).
-- `src/tegula/testing.py`: `do_bench` with GPU timestamps and warm-up, plus
+- `src/enceladus/runtime/`: `device.py` (singleton and `Capabilities`), `tensor.py`
+  (`enceladus.Tensor` and allocation helpers), `interop.py` (`as_kernel_arg` for tensors and
+  NumPy arrays), `stream.py`, and `raw.py` (`enceladus.metal_kernel`).
+- `src/enceladus/testing.py`: `do_bench` with GPU timestamps and warm-up, plus
   `assert_close`. The plan schedules `do_bench` for M5; it arrived early because the M2
   benchmarks need it.
 
@@ -101,7 +101,7 @@ propagation; and flush-on-threshold with cross-batch dependencies.
   constexprs, num_warps, math_mode)`.
 - `interpreter/interp.py`: `ITile`, `IPointer`, and `IDesc` over NumPy, with a sequential
   grid. An out-of-bounds unmasked access raises `IndexError` with the kernel line.
-- `runtime/jit.py`: `@tegula.jit`, specialization facts as function-argument attributes,
+- `runtime/jit.py`: `@enceladus.jit`, specialization facts as function-argument attributes,
   and a SHA-256 dependency hash.
 - Examples 01-06.
 
@@ -110,11 +110,11 @@ propagation; and flush-on-threshold with cross-batch dependencies.
 - The default suite runs 189 tests and skips 130 in 0.4 s. Every skip is a compiled-mode
   case that M2 enables.
 - The frontend plus verifier takes about 0.14 ms for vector add and 0.6 ms for matmul.
-- `TEGULA_INTERPRET=1 TEGULA_DUMP=1` prints readable IR for every example.
+- `ENCELADUS_INTERPRET=1 ENCELADUS_DUMP=1` prints readable IR for every example.
 
 ### Deviations from the plan
 
-- `build_ir` always verifies. `TEGULA_VERIFY=1` makes interpreted launches also build
+- `build_ir` always verifies. `ENCELADUS_VERIFY=1` makes interpreted launches also build
   and verify IR once per specialization, which is how the tests check every example's IR.
 - Triton hints with no effect on Apple GPUs (`num_stages`, `cache_modifier`,
   `eviction_policy`, and `input_precision`) are accepted and ignored.
@@ -145,7 +145,7 @@ propagation; and flush-on-threshold with cross-batch dependencies.
   `bfloat`, `bool`, and 64-bit types), `msl.py`, and `reduce.py`.
 - `runtime/compile.py`, `launcher.py`, and the compiled path in `jit.py`: a generated
   argument binder, a per-kernel specialization cache, the disk cache,
-  `TEGULA_ALWAYS_COMPILE`, `TEGULA_DUMP`, `TEGULA_OVERRIDE_DIR`, `kernel.warmup()`, and
+  `ENCELADUS_ALWAYS_COMPILE`, `ENCELADUS_DUMP`, `ENCELADUS_OVERRIDE_DIR`, `kernel.warmup()`, and
   the recompilation warning.
 
 ### Benchmarks
@@ -154,8 +154,8 @@ propagation; and flush-on-threshold with cross-batch dependencies.
 |---|---|---|
 | Vector add, 256 MB per array, FP32 | 235 GB/s (MLX 225, wall clock) | 220 GB/s or more |
 | Vector add, 256 MB per array, FP16 | 239 GB/s (MLX 219, wall clock) | 220 GB/s or more |
-| Tegula compile time, vector add (frontend to MSL) | 0.32 ms | Under 5 ms |
-| `@tegula.jit` launch, sustained | 3.8 µs | 5 µs or less |
+| Enceladus compile time, vector add (frontend to MSL) | 0.32 ms | Under 5 ms |
+| `@enceladus.jit` launch, sustained | 3.8 µs | 5 µs or less |
 
 ### Tests
 
@@ -187,7 +187,7 @@ case where whole lanes see only `other=-inf`.
   interpreter exactly (FP32 has enough precision that this equals correctly rounded
   native FP16 and BF16 arithmetic).
 - **The disk cache key includes a hash of the compiler's source.** Without it, a
-  compiler change silently reused stale MSL from `~/.cache/tegula`, which happened once
+  compiler change silently reused stale MSL from `~/.cache/enceladus`, which happened once
   while benchmarking.
 
 ### Known gaps
@@ -262,7 +262,7 @@ Welford through a tuple `tl.reduce`, and argmax ties pass in both modes.
 ### Benchmarks
 
 The following numbers come from `benchmarks/bench_matmul.py`, config 64x64x32 with 4 SIMD
-groups, in TFLOPS (Tegula GPU-timed; MLX and torch wall clock):
+groups, in TFLOPS (Enceladus GPU-timed; MLX and torch wall clock):
 
 | Shape | FP32 (MLX, torch) | FP16 (MLX, torch) | BF16 (MLX, torch) |
 |---|---|---|---|
@@ -312,28 +312,28 @@ matmul uses no threadgroup memory while the pointer variant does.
 ### Known gaps
 
 - Integer `dot` raises an error (the MPP path in M8 covers it).
-- `dot_warps` from `tegula.Config` arrives with the autotuner in M5.
+- `dot_warps` from `enceladus.Config` arrives with the autotuner in M5.
 
 ## M5: Autotuning and benchmarking
 
 ### What was built
 
-- `runtime/autotuner.py`: `tegula.Config`, `@tegula.autotune`, and `@tegula.heuristics`.
+- `runtime/autotuner.py`: `enceladus.Config`, `@enceladus.autotune`, and `@enceladus.heuristics`.
   - Candidates compile in parallel on up to `min(8, maximumConcurrentCompilationTaskCount)`
     threads. A config that fails to compile is skipped with a warning; if every config
     fails, the error names the first failure.
   - Each config is timed with `do_bench` (GPU timestamps, warm-up, median). NumPy
-    arguments are wrapped as `tegula.Tensor` views for timing so launches don't
+    arguments are wrapped as `enceladus.Tensor` views for timing so launches don't
     synchronize.
   - Configs slower than 3x the median are rejected as probable spill cliffs (logged at
     debug level).
   - `reset_to_zero`, `restore_value`, `pre_hook`, `prune_configs_by` (`early_config_prune`,
-    `perf_model` with `top_k`), `TEGULA_PRINT_AUTOTUNING=1`, and `config_for()`.
-  - Results persist in `~/.cache/tegula/autotune/<kernel-hash>/<architecture>.json`,
+    `perf_model` with `top_k`), `ENCELADUS_PRINT_AUTOTUNING=1`, and `config_for()`.
+  - Results persist in `~/.cache/enceladus/autotune/<kernel-hash>/<architecture>.json`,
     keyed by the key-argument values and the argument dtypes.
 - `dot_warps=(WM, WN)` is a launch option and a `Config` field, and it's part of the
   specialization key.
-- `tegula/configs.py`: `matmul_configs(dtype)`, the pre-validated list from the research
+- `enceladus/configs.py`: `matmul_configs(dtype)`, the pre-validated list from the research
   sweep (6 configs for FP32, 8 for FP16 and BF16).
 - `examples/04_matmul.py` gained `matmul_tuned`; `benchmarks/run_all.py` writes
   `benchmarks/results/<date>-<arch>.md`.
@@ -360,7 +360,7 @@ The whole suite runs 390 tests, with 18 skipped, in 1.3 s.
 ### Known gaps
 
 - FP32 matmul at 4096³ measured 4.76-5.04 TFLOPS across runs in this session, around
-  the 4.9 target. MLX measured 5.23-5.26 in the same runs, so Tegula is at 91-96% of MLX.
+  the 4.9 target. MLX measured 5.23-5.26 in the same runs, so Enceladus is at 91-96% of MLX.
   The reference kernel measured 4.95-5.09 in the same harness.
 - The recompilation warning can name a misleading argument when many launch
   configurations are in play; its hint is only a heuristic.

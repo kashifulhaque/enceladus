@@ -1,15 +1,15 @@
 """RMSNorm forward, one row per program: `x * rsqrt(mean(x^2) + eps) * w`.
 
-Run the demo with `TEGULA_INTERPRET=1 uv run python examples/06_rmsnorm.py`.
+Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/06_rmsnorm.py`.
 """
 
 import numpy as np
 
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
 
-@tegula.jit
+@enceladus.jit
 def rmsnorm_kernel(x_ptr, w_ptr, out_ptr, stride_x, stride_out, n_cols, eps,
                    BLOCK: tl.constexpr):  # fmt: skip
     row = tl.program_id(0)
@@ -26,7 +26,7 @@ def rmsnorm(x: np.ndarray, w: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     m, n = x.shape
     out = np.empty_like(x)
     rmsnorm_kernel[(m,)](x, w, out, x.strides[0] // x.itemsize, out.strides[0] // out.itemsize,
-                         n, eps, BLOCK=tegula.next_power_of_2(n))  # fmt: skip
+                         n, eps, BLOCK=enceladus.next_power_of_2(n))  # fmt: skip
     return out
 
 

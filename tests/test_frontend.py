@@ -8,10 +8,10 @@ import numpy as np
 import pytest
 from conftest import load_example
 
-import tegula
-import tegula.language as tl
-from tegula.compiler import ir
-from tegula.compiler.semantic import computation_dtype
+import enceladus
+import enceladus.language as tl
+from enceladus.compiler import ir
+from enceladus.compiler.semantic import computation_dtype
 
 X = np.zeros(64, np.float32)
 
@@ -20,25 +20,25 @@ X = np.zeros(64, np.float32)
 # ---------------------------------------------------------------------------
 
 
-@tegula.jit
+@enceladus.jit
 def _missing_constexpr(x_ptr, BLOCK):
     offs = tl.arange(0, BLOCK)  # error
     tl.store(x_ptr + offs, 1.0)
 
 
-@tegula.jit
+@enceladus.jit
 def _non_pow2_arange(x_ptr):
     offs = tl.arange(0, 100)  # error
     tl.store(x_ptr + offs, 1.0)
 
 
-@tegula.jit
+@enceladus.jit
 def _non_pow2_zeros(x_ptr, BLOCK: tl.constexpr):
     acc = tl.zeros((BLOCK, 3), dtype=tl.float32)  # error
     tl.store(x_ptr + tl.arange(0, BLOCK), tl.sum(acc, axis=1))
 
 
-@tegula.jit
+@enceladus.jit
 def _while_loop(x_ptr, n):
     i = 0
     while i < n:  # error
@@ -46,7 +46,7 @@ def _while_loop(x_ptr, n):
     tl.store(x_ptr, i)
 
 
-@tegula.jit
+@enceladus.jit
 def _break_in_loop(x_ptr, n):
     for i in range(n):
         if i > 3:
@@ -54,7 +54,7 @@ def _break_in_loop(x_ptr, n):
     tl.store(x_ptr, 0.0)
 
 
-@tegula.jit
+@enceladus.jit
 def _if_on_tile(x_ptr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + tl.arange(0, BLOCK))
     if x > 0:  # error
@@ -62,7 +62,7 @@ def _if_on_tile(x_ptr, BLOCK: tl.constexpr):
     tl.store(x_ptr + tl.arange(0, BLOCK), x)
 
 
-@tegula.jit
+@enceladus.jit
 def _loop_type_change(x_ptr, n, BLOCK: tl.constexpr):
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
     for _ in range(n):  # error
@@ -70,17 +70,17 @@ def _loop_type_change(x_ptr, n, BLOCK: tl.constexpr):
     tl.store(x_ptr + tl.arange(0, BLOCK), acc)
 
 
-@tegula.jit
+@enceladus.jit
 def _returns_value(x_ptr):
     return tl.load(x_ptr)  # error
 
 
-@tegula.jit
+@enceladus.jit
 def _recursive(x):
     return _recursive(x)  # error
 
 
-@tegula.jit
+@enceladus.jit
 def _calls_recursive(x_ptr):
     tl.store(x_ptr, _recursive(1.0))
 
@@ -103,7 +103,7 @@ ERROR_CASES = [
 def test_error_points_at_source_line(kernel, constexprs, phrase):
     n_runtime = sum(not p.is_constexpr for p in kernel.params)
     args = [X, 64, 64][:n_runtime]
-    with pytest.raises(tegula.CompilationError) as e:
+    with pytest.raises(enceladus.CompilationError) as e:
         kernel.ir(*args, **constexprs)
     msg = str(e.value)
     assert phrase in msg
@@ -144,9 +144,9 @@ def test_promotion(op, a, b, expected):
 
 
 def test_promotion_rejects_float_bitwise_and_floordiv():
-    with pytest.raises(tegula.CompilationError, match="integer operands"):
+    with pytest.raises(enceladus.CompilationError, match="integer operands"):
         computation_dtype("and", tl.float32, tl.int32)
-    with pytest.raises(tegula.CompilationError, match="tl.floor"):
+    with pytest.raises(enceladus.CompilationError, match="tl.floor"):
         computation_dtype("floordiv", tl.float32, 2)
 
 
@@ -155,7 +155,7 @@ def test_promotion_rejects_float_bitwise_and_floordiv():
 # ---------------------------------------------------------------------------
 
 
-@tegula.jit(do_not_specialize=["m"])
+@enceladus.jit(do_not_specialize=["m"])
 def _facts_kernel(x_ptr, n, m, one, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     tl.store(x_ptr + offs * one, 1.0, mask=offs < n + m)
@@ -177,11 +177,11 @@ def test_specialization_facts_are_attributes():
 def test_descriptor_requires_unit_last_stride():
     ex_kernel = _desc_kernel
     ex_kernel.ir(X, 8, 8, 1, BLOCK=8)  # A specialized stride == 1 is accepted.
-    with pytest.raises(tegula.CompilationError, match="last stride"):
+    with pytest.raises(enceladus.CompilationError, match="last stride"):
         ex_kernel.ir(X, 8, 8, 2, BLOCK=8)
 
 
-@tegula.jit
+@enceladus.jit
 def _desc_kernel(x_ptr, m, n, stride_n, BLOCK: tl.constexpr):
     d = tl.make_tensor_descriptor(x_ptr, [m, n], [n, stride_n], [BLOCK, BLOCK])
     d.store([0, 0], d.load([0, 0]) * 2)
@@ -213,5 +213,5 @@ def test_verifier_rejects_malformed_ir(corrupt, phrase):
     module = ex.add_kernel.ir(X, X, X, 64, BLOCK=64)
     ir.verify(module)
     corrupt(module)
-    with pytest.raises(tegula.CompilationError, match=phrase):
+    with pytest.raises(enceladus.CompilationError, match=phrase):
         ir.verify(module)

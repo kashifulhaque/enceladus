@@ -8,8 +8,8 @@ from __future__ import annotations
 import statistics
 import time
 
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
 SRC = """
 #include <metal_stdlib>
@@ -26,11 +26,11 @@ def sustained(launch, n: int = 10_000, reps: int = 5) -> list[float]:
     """Returns µs per launch for `reps` runs of `n` back-to-back launches."""
     out = []
     for _ in range(reps):
-        tegula.synchronize()
+        enceladus.synchronize()
         t0 = time.perf_counter()
         for _ in range(n):
             launch()
-        tegula.synchronize()
+        enceladus.synchronize()
         out.append((time.perf_counter() - t0) / n * 1e6)
     return out
 
@@ -41,7 +41,7 @@ def round_trip(launch, n: int = 300) -> list[float]:
     for _ in range(n):
         t0 = time.perf_counter()
         launch()
-        tegula.synchronize()
+        enceladus.synchronize()
         out.append((time.perf_counter() - t0) * 1e6)
     return out
 
@@ -51,12 +51,12 @@ def report(name: str, samples: list[float]) -> None:
 
 
 def main() -> None:
-    dev = tegula.get_device()
+    dev = enceladus.get_device()
     print(f"Device: {dev.caps.name} ({dev.caps.architecture}), flush every "
           f"{dev.stream.flush_every} dispatches")
-    k = tegula.metal_kernel(SRC, "vadd")
+    k = enceladus.metal_kernel(SRC, "vadd")
     n = 1024
-    x, y, o = tegula.randn(n), tegula.randn(n), tegula.empty(n)
+    x, y, o = enceladus.randn(n), enceladus.randn(n), enceladus.empty(n)
     launcher = k[(n // 256,), (256,)]
 
     def launch() -> None:
@@ -77,8 +77,8 @@ def main() -> None:
 
     report("native Stream.dispatch, sustained", sustained(native))
 
-    # @tegula.jit hit path: binding, specialization key, packing, and dispatch.
-    @tegula.jit
+    # @enceladus.jit hit path: binding, specialization key, packing, and dispatch.
+    @enceladus.jit
     def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
@@ -89,7 +89,7 @@ def main() -> None:
         add_kernel[(1,)](x, y, o, n, BLOCK=1024)
 
     jit_launch()
-    report("@tegula.jit launch, sustained", sustained(jit_launch))
+    report("@enceladus.jit launch, sustained", sustained(jit_launch))
 
 
 if __name__ == "__main__":

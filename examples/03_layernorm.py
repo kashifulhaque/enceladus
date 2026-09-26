@@ -1,15 +1,15 @@
 """LayerNorm forward, one row per program, looping over the row in blocks.
 
-Run the demo with `TEGULA_INTERPRET=1 uv run python examples/03_layernorm.py`.
+Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/03_layernorm.py`.
 """
 
 import numpy as np
 
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
 
-@tegula.jit
+@enceladus.jit
 def layernorm_kernel(x_ptr, y_ptr, w_ptr, b_ptr, mean_ptr, rstd_ptr, stride, n_cols, eps,
                      BLOCK: tl.constexpr):  # fmt: skip
     row = tl.program_id(0)
@@ -46,7 +46,7 @@ def layernorm(x: np.ndarray, w: np.ndarray, b: np.ndarray, eps: float = 1e-5,
     y = np.empty_like(x)
     mean = np.empty(m, np.float32)
     rstd = np.empty(m, np.float32)
-    block = block or min(1024, tegula.next_power_of_2(n))
+    block = block or min(1024, enceladus.next_power_of_2(n))
     layernorm_kernel[(m,)](x, y, w, b, mean, rstd, x.strides[0] // x.itemsize, n, eps,
                            BLOCK=block)  # fmt: skip
     return y, mean, rstd

@@ -10,11 +10,11 @@ import math
 
 import numpy as np
 
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
 
-@tegula.jit
+@enceladus.jit
 def matmul_bias_gelu_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, M, N, K, stride_am, stride_bk,
                             stride_cm, BM: tl.constexpr, BN: tl.constexpr,
                             BK: tl.constexpr):  # fmt: skip
@@ -36,9 +36,9 @@ def matmul_bias_gelu(a, b, bias, c=None, bm: int = 64, bn: int = 64, bk: int = 3
     """Returns `gelu(a @ b + bias)` in the input dtype."""
     (m, k), (_, n) = a.shape, b.shape
     if c is None:
-        c = np.empty((m, n), a.dtype) if isinstance(a, np.ndarray) else tegula.empty((m, n),
+        c = np.empty((m, n), a.dtype) if isinstance(a, np.ndarray) else enceladus.empty((m, n),
                                                                                    a.dtype)
-    grid = (tegula.cdiv(n, bn), tegula.cdiv(m, bm))
+    grid = (enceladus.cdiv(n, bn), enceladus.cdiv(m, bm))
     matmul_bias_gelu_kernel[grid](a, b, bias, c, m, n, k, k, n, n, BM=bm, BN=bn, BK=bk)
     return c
 

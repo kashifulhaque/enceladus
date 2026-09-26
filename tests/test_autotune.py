@@ -1,14 +1,14 @@
-"""Tests for `@tegula.autotune` and `@tegula.heuristics`."""
+"""Tests for `@enceladus.autotune` and `@enceladus.heuristics`."""
 
 import numpy as np
 import pytest
 
-import tegula
-import tegula.language as tl
-from tegula.runtime.autotuner import Autotuner
+import enceladus
+import enceladus.language as tl
+from enceladus.runtime.autotuner import Autotuner
 
 
-@tegula.jit
+@enceladus.jit
 def _accumulate(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
@@ -17,24 +17,24 @@ def _accumulate(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
 
 
 def _grid(meta):
-    return (tegula.cdiv(meta["n"], meta["BLOCK"]),)
+    return (enceladus.cdiv(meta["n"], meta["BLOCK"]),)
 
 
-CONFIGS = [tegula.Config({"BLOCK": b}) for b in (100, 256, 1024)]  # 100 isn't a power of two
+CONFIGS = [enceladus.Config({"BLOCK": b}) for b in (100, 256, 1024)]  # 100 isn't a power of two
 
 
 @pytest.fixture(autouse=True)
 def cache_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("TEGULA_CACHE_DIR", str(tmp_path))
-    monkeypatch.delenv("TEGULA_ALWAYS_COMPILE", raising=False)
-    monkeypatch.setenv("TEGULA_INTERPRET", "0")
+    monkeypatch.setenv("ENCELADUS_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("ENCELADUS_ALWAYS_COMPILE", raising=False)
+    monkeypatch.setenv("ENCELADUS_INTERPRET", "0")
     return tmp_path
 
 
 def test_failing_configs_are_skipped_and_state_is_reset():
     tuned = Autotuner(_accumulate, CONFIGS, key=["n"], reset_to_zero=["out_ptr"], rep=3,
                       warmup_ms=1)  # fmt: skip
-    x, out = tegula.randn(5000), tegula.zeros(5000)
+    x, out = enceladus.randn(5000), enceladus.zeros(5000)
     with pytest.warns(UserWarning, match=r"skipping .*'BLOCK': 100.*power of two"):
         tuned[_grid](x, out, 5000)
     # Benchmark runs accumulated into `out`, but it was reset: one real launch remains.
@@ -46,14 +46,14 @@ def test_failing_configs_are_skipped_and_state_is_reset():
 def test_all_configs_failing_raises():
     tuned = Autotuner(_accumulate, CONFIGS[:1], key=["n"], rep=3, warmup_ms=1)
     with pytest.raises(RuntimeError, match="every autotuning config"):
-        tuned[_grid](tegula.randn(64), tegula.zeros(64), 64)
+        tuned[_grid](enceladus.randn(64), enceladus.zeros(64), 64)
 
 
 def test_results_persist_across_processes(monkeypatch):
     first = Autotuner(_accumulate, CONFIGS[1:], key=["n"], reset_to_zero=["out_ptr"], rep=3,
                       warmup_ms=1)  # fmt: skip
-    x = tegula.randn(4096)
-    first[_grid](x, tegula.zeros(4096), 4096)
+    x = enceladus.randn(4096)
+    first[_grid](x, enceladus.zeros(4096), 4096)
     chosen = next(iter(first.best.values()))
 
     # A fresh autotuner (as in a new process) must reuse the saved result without
@@ -61,16 +61,16 @@ def test_results_persist_across_processes(monkeypatch):
     def no_bench(*a, **k):
         raise AssertionError("re-benchmarked a persisted key")
 
-    monkeypatch.setattr("tegula.testing.do_bench", no_bench)
+    monkeypatch.setattr("enceladus.testing.do_bench", no_bench)
     second = Autotuner(_accumulate, CONFIGS[1:], key=["n"], rep=3, warmup_ms=1)
-    out = tegula.zeros(4096)
+    out = enceladus.zeros(4096)
     second[_grid](x, out, 4096)
     assert next(iter(second.best.values())) == chosen
     np.testing.assert_array_equal(out.numpy(), x.numpy())
 
 
 def test_heuristics_compute_constexprs():
-    kernel = tegula.heuristics({"BLOCK": lambda a: tegula.next_power_of_2(a["n"])})(_accumulate)
+    kernel = enceladus.heuristics({"BLOCK": lambda a: enceladus.next_power_of_2(a["n"])})(_accumulate)
     x, out = np.arange(300, dtype=np.float32), np.zeros(300, np.float32)
     kernel[(1,)](x, out, 300)
     np.testing.assert_array_equal(out, x)

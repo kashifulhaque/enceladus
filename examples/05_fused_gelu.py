@@ -1,17 +1,17 @@
 """Fused elementwise op: `gelu(x * scale + bias)`, with a bias per column.
 
-Run the demo with `TEGULA_INTERPRET=1 uv run python examples/05_fused_gelu.py`.
+Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/05_fused_gelu.py`.
 """
 
 import math
 
 import numpy as np
 
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
 
-@tegula.jit
+@enceladus.jit
 def fused_gelu_kernel(x_ptr, bias_ptr, out_ptr, n, n_cols, scale, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -26,7 +26,7 @@ def fused_gelu(x: np.ndarray, bias: np.ndarray, scale: float, block: int = 1024)
     """Returns `gelu(x * scale + bias)` for a contiguous 2D `x` and a bias per column."""
     out = np.empty_like(x)
     n = x.size
-    fused_gelu_kernel[(tegula.cdiv(n, block),)](x, bias, out, n, x.shape[-1], scale, BLOCK=block)
+    fused_gelu_kernel[(enceladus.cdiv(n, block),)](x, bias, out, n, x.shape[-1], scale, BLOCK=block)
     return out
 
 

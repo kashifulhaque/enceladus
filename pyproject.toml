@@ -3,7 +3,7 @@ requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "tegula"
+name = "enceladus"
 version = "0.1.0.dev0"
 description = "A Triton-like tile language for Apple GPUs that compiles Python kernels to Metal"
 readme = "PLAN.md"
@@ -19,8 +19,8 @@ mlx = ["mlx>=0.20"]
 dev = ["pytest>=8", "ruff>=0.6", "torch>=2.5", "mlx>=0.20"]
 
 [tool.scikit-build]
-wheel.packages = ["src/tegula"]
-wheel.exclude = ["tegula/_C/*.mm", "tegula/_C/*.h"]
+wheel.packages = ["src/enceladus"]
+wheel.exclude = ["enceladus/_C/*.mm", "enceladus/_C/*.h"]
 cmake.build-type = "Release"
 minimum-version = "0.10"
 build-dir = "build/{wheel_tag}"

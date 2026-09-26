@@ -12,8 +12,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import tegula
-from tegula.testing import do_bench
+import enceladus
+from enceladus.testing import do_bench
 
 ROOT = Path(__file__).resolve().parents[1]
 M = N = 4096
@@ -28,12 +28,12 @@ def load(stem: str):
 
 def main() -> None:
     ln, rms = load("03_layernorm"), load("06_rmsnorm")
-    print(f"Device: {tegula.get_device().caps.name}; {M} x {N}")
+    print(f"Device: {enceladus.get_device().caps.name}; {M} x {N}")
     for dtype in ("float32", "float16"):
-        x = tegula.randn(M, N, dtype=dtype)
-        y = tegula.empty_like(x)
-        w, b = tegula.randn(N, dtype=dtype), tegula.randn(N, dtype=dtype)
-        mean, rstd = tegula.empty(M), tegula.empty(M)
+        x = enceladus.randn(M, N, dtype=dtype)
+        y = enceladus.empty_like(x)
+        w, b = enceladus.randn(N, dtype=dtype), enceladus.randn(N, dtype=dtype)
+        mean, rstd = enceladus.empty(M), enceladus.empty(M)
         nbytes = 2 * M * N * x.itemsize
         for block in (1024, 4096):
             def run_ln(block=block):

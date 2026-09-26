@@ -4,8 +4,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-import tegula
-from tegula.runtime.device import PAGE_SIZE
+import enceladus
+from enceladus.runtime.device import PAGE_SIZE
 
 VADD = """
 #include <metal_stdlib>
@@ -20,7 +20,7 @@ kernel void vadd(device const float* x [[buffer(0)]], device const float* y [[bu
 
 @pytest.fixture(scope="module")
 def vadd():
-    return tegula.metal_kernel(VADD, "vadd")
+    return enceladus.metal_kernel(VADD, "vadd")
 
 
 def page_aligned(n: int, dtype=np.float32) -> np.ndarray:
@@ -35,10 +35,10 @@ def make_args(kind: str, n: int):
     x = rng.standard_normal(n).astype(np.float32)
     y = rng.standard_normal(n).astype(np.float32)
     if kind == "tensor":
-        return tegula.from_numpy(x), tegula.from_numpy(y), tegula.zeros(n)
+        return enceladus.from_numpy(x), enceladus.from_numpy(y), enceladus.zeros(n)
     if kind == "tensor_view":
         # Views with nonzero element offsets inside a larger buffer.
-        big = [tegula.zeros(n + 7) for _ in range(3)]
+        big = [enceladus.zeros(n + 7) for _ in range(3)]
         views = [b[7:] for b in big]
         views[0].copy_(x)
         views[1].copy_(y)
@@ -59,12 +59,12 @@ def make_args(kind: str, n: int):
 def test_raw_vector_add(vadd, kind, n):
     x, y, out = make_args(kind, n)
     vadd[(-(-n // 256),), (256,)](x, y, out, n)
-    got = out.numpy() if isinstance(out, tegula.Tensor) else out
+    got = out.numpy() if isinstance(out, enceladus.Tensor) else out
     np.testing.assert_array_equal(got, np.asarray(x) + np.asarray(y))
 
 
 def test_zero_copy_aliasing_both_directions():
-    fill = tegula.metal_kernel(
+    fill = enceladus.metal_kernel(
         """
         #include <metal_stdlib>
         using namespace metal;
@@ -77,10 +77,10 @@ def test_zero_copy_aliasing_both_directions():
     )
     host = page_aligned(4096)
     host[:] = np.arange(4096, dtype=np.float32)
-    t = tegula.from_numpy(host)
+    t = enceladus.from_numpy(host)
     assert t.data_ptr == host.ctypes.data  # shares memory, no copy
     fill[(16,), (256,)](t, 2.0, 4096)
-    tegula.synchronize()  # tensor-only launches are asynchronous
+    enceladus.synchronize()  # tensor-only launches are asynchronous
     np.testing.assert_array_equal(host, np.arange(4096) * 2)  # GPU write -> host
     host[:] = 1.0
     fill[(16,), (256,)](t, 3.0, 4096)
@@ -92,7 +92,7 @@ def test_zero_copy_aliasing_both_directions():
 
 
 def test_scalar_arguments_bind_by_declared_type():
-    k = tegula.metal_kernel(
+    k = enceladus.metal_kernel(
         """
         #include <metal_stdlib>
         using namespace metal;
@@ -105,40 +105,40 @@ def test_scalar_arguments_bind_by_declared_type():
         """,
         "scalars",
     )
-    out = tegula.zeros(5)
+    out = enceladus.zeros(5)
     k[(1,), (32,)](out, 1.5, -7, 3.25, 5 << 40, 200)
     expected = [1.5, -7, float(ml_dtypes.bfloat16(3.25)), 5, 200]
     np.testing.assert_array_equal(out.numpy(), expected)
 
 
 def test_errors_raise_python_exceptions(vadd):
-    with pytest.raises(tegula.MetalError, match=r"program_source:3:.*undeclared"):
-        tegula.metal_kernel(
+    with pytest.raises(enceladus.MetalError, match=r"program_source:3:.*undeclared"):
+        enceladus.metal_kernel(
             "#include <metal_stdlib>\nkernel void bad(device float* o [[buffer(0)]]) {\n"
             "  o[0] = nope;\n}\n",
             "bad",
         )
-    with pytest.raises(tegula.MetalError, match="no kernel function named 'missing'"):
-        tegula.metal_kernel(VADD, "missing")
-    x = tegula.zeros(8)
+    with pytest.raises(enceladus.MetalError, match="no kernel function named 'missing'"):
+        enceladus.metal_kernel(VADD, "missing")
+    x = enceladus.zeros(8)
     with pytest.raises(TypeError, match=r"takes 4 arguments \(x, y, o, n\), but 3"):
         vadd[(1,), (32,)](x, x, x)
     with pytest.raises(ValueError, match="exceeds the pipeline limit"):
         vadd[(1,), (2048,)]
     with pytest.raises(TypeError, match="float64"):
         vadd[(1,), (32,)](np.zeros(8), x, x, 8)
-    tegula.synchronize()  # the stream is still usable
+    enceladus.synchronize()  # the stream is still usable
 
 
 def test_stream_batches_and_flushes_on_threshold(vadd):
-    stream = tegula.get_device().stream
+    stream = enceladus.get_device().stream
     old = stream.flush_every
     stream.flush_every = 4
     try:
         n = 256
-        x, y = tegula.ones(n), tegula.ones(n)
-        outs = [tegula.zeros(n) for _ in range(6)]
-        tegula.synchronize()
+        x, y = enceladus.ones(n), enceladus.ones(n)
+        outs = [enceladus.zeros(n) for _ in range(6)]
+        enceladus.synchronize()
         for i in range(3):
             vadd[(1,), (256,)](x, y, outs[i], n)
         assert stream.pending == 3  # tensor-only launches don't wait

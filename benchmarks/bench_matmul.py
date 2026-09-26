@@ -1,6 +1,6 @@
 """Matmul TFLOPS against MLX and PyTorch MPS.
 
-Tegula uses GPU timestamps. MLX and PyTorch use wall clock around a synchronized call
+Enceladus uses GPU timestamps. MLX and PyTorch use wall clock around a synchronized call
 (overhead is under 1% at 4096^3). Operands come from memory, never constants.
 
 Run with `uv run python benchmarks/bench_matmul.py [--quick]`.
@@ -13,8 +13,8 @@ import sys
 import time
 from pathlib import Path
 
-import tegula
-from tegula.testing import do_bench
+import enceladus
+from enceladus.testing import do_bench
 
 ROOT = Path(__file__).resolve().parents[1]
 SHAPES = [(4096, 4096, 4096), (2000, 2000, 2000), (513, 513, 513), (1024, 4096, 1024)]
@@ -69,12 +69,12 @@ def main() -> None:
     ex = load("04_matmul")
     fused = load("07_matmul_fused")
     shapes = SHAPES[:1] if "--quick" in sys.argv else SHAPES
-    print(f"Device: {tegula.get_device().caps.name}")
+    print(f"Device: {enceladus.get_device().caps.name}")
     print(f"{'shape':<18}{'dtype':<10}{'config':<22}{'TFLOPS':>8}{'MLX':>8}{'torch':>8}")
     for m, n, k in shapes:
         for dtype in ("float32", "float16", "bfloat16"):
-            a, b = tegula.randn(m, k, dtype=dtype), tegula.randn(k, n, dtype=dtype)
-            c = tegula.empty((m, n), dtype)
+            a, b = enceladus.randn(m, k, dtype=dtype), enceladus.randn(k, n, dtype=dtype)
+            c = enceladus.empty((m, n), dtype)
             refs = [mlx_ms(m, n, k, dtype), torch_ms(m, n, k, dtype)]
             ref = "".join(f"{tflops(m, n, k, r):8.2f}" if r else f"{'n/a':>8}" for r in refs)
             for bm, bn, bk, nw in ((64, 64, 32, 4),):
@@ -94,7 +94,7 @@ def main() -> None:
             tcfg = f"tuned {best.kwargs['BM']}x{best.kwargs['BN']} w{best.dot_warps}"
             print(f"{'':<18}{dtype:<10}{tcfg:<22}{tflops(m, n, k, tms):8.2f}")
             if (m, n, k) == SHAPES[0] and dtype != "bfloat16":
-                bias = tegula.randn(n, dtype=dtype)
+                bias = enceladus.randn(n, dtype=dtype)
 
                 def run_fused():
                     fused.matmul_bias_gelu(a, b, bias, c)

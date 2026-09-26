@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(tegula LANGUAGES CXX OBJCXX)
+project(enceladus LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_OBJCXX_STANDARD 17)
@@ -11,9 +11,9 @@ execute_process(
 find_package(nanobind CONFIG REQUIRED)
 
 nanobind_add_module(_C NB_STATIC
-  src/tegula/_C/bindings.mm
-  src/tegula/_C/tegula_rt.mm)
+  src/enceladus/_C/bindings.mm
+  src/enceladus/_C/enceladus_rt.mm)
 target_compile_options(_C PRIVATE -fobjc-arc)
 target_link_libraries(_C PRIVATE "-framework Metal" "-framework Foundation")
 
-install(TARGETS _C LIBRARY DESTINATION tegula)
+install(TARGETS _C LIBRARY DESTINATION enceladus)

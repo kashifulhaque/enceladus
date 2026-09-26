@@ -1,9 +1,9 @@
-# Tegula
+# Enceladus
 
-Tegula is a Triton-like Python language for writing GPU kernels for Apple M-series GPUs.
+Enceladus is a Triton-like Python language for writing GPU kernels for Apple M-series GPUs.
 It compiles Python tile programs to Metal Shading Language (MSL) and runs them through
-Metal. The distribution and import names are both `tegula`, and the language namespace is
-`import tegula.language as tl`.
+Metal. The distribution and import names are both `enceladus`, and the language namespace is
+`import enceladus.language as tl`.
 
 ## Start here
 
@@ -33,7 +33,7 @@ matter most:
 - Keep performance checks in `benchmarks/`, not in `pytest`. Time with GPU timestamps,
   warm up first, and compare against MLX.
 - Keep generated MSL deterministic. Refuse unsupported constructs with a
-  source-located `tegula.CompilationError`. Never miscompile silently.
+  source-located `enceladus.CompilationError`. Never miscompile silently.
 - After each milestone, append results, benchmark numbers, known gaps, and any deviations
   from the plan to `docs/progress.md`.
 

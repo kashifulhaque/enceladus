@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from tegula.compiler import layout as L
+from enceladus.compiler import layout as L
 
 
 def owners(lay: L.BitLayout) -> np.ndarray:

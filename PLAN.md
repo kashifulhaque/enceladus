@@ -1,12 +1,12 @@
-# Tegula implementation plan
+# Enceladus implementation plan
 
-Tegula is a Python-embedded, tile-based language for writing GPU compute kernels for Apple
+Enceladus is a Python-embedded, tile-based language for writing GPU compute kernels for Apple
 M-series GPUs. You write a kernel as a decorated Python function that operates on tiles,
-the way you write Triton kernels. Tegula compiles it to Metal Shading Language (MSL) and
-runs it through Metal. Tegula doesn't aim for feature parity with Triton. It aims to be
+the way you write Triton kernels. Enceladus compiles it to Metal Shading Language (MSL) and
+runs it through Metal. Enceladus doesn't aim for feature parity with Triton. It aims to be
 the fastest way to write a correct, fast custom kernel on a Mac.
 
-The name *tegula* is Latin for a roof tile, which fits a language built on tiles. The
+The name *enceladus* is Latin for a roof tile, which fits a language built on tiles. The
 research reports in `docs/research/` use the project's working name, Forge, and the
 prototype files keep `forge_` prefixes. Treat both as referring to this project.
 
@@ -49,12 +49,12 @@ On Apple silicon, you have two ways to run custom GPU compute from Python:
   not the kernel-side complexity.
 
 Triton solved this for NVIDIA and AMD GPUs: you write NumPy-like code over tiles, and
-the compiler handles the mapping to threads. Tegula brings that model to Apple GPUs.
+the compiler handles the mapping to threads. Enceladus brings that model to Apple GPUs.
 
 ## The landscape, honestly
 
-The research found that Tegula isn't entering an empty field. As of September 2026, the
-following projects overlap with Tegula (details and sources in
+The research found that Enceladus isn't entering an empty field. As of September 2026, the
+following projects overlap with Enceladus (details and sources in
 [`03-prior-art.md`](docs/research/03-prior-art.md)):
 
 | Project | What it is | Why it doesn't close the gap |
@@ -65,18 +65,18 @@ following projects overlap with Tegula (details and sources in
 | **MLX `metal_kernel`, `torch.mps.compile_shader`** | Raw MSL body with generated signature | No tiles, no autotuning, and no bounds help. You write MSL. |
 | **Mojo and MAX, Metal.jl, warp-metal, CubeCL** | Other languages or SIMT models | Not Python tile DSLs, or no PyTorch and MLX interop. |
 
-Tegula's niche is therefore specific. Tegula competes on these properties:
+Enceladus's niche is therefore specific. Enceladus competes on these properties:
 
 1. **Apple-first semantics.** The tile rules, layouts, and matmul lowering come from
    Apple hardware facts: 32-wide SIMD groups, 8x8 `simdgroup_matrix` fragments, direct
-   device-to-register loads, and Metal 4 tensor operations. Tegula doesn't port CUDA
+   device-to-register loads, and Metal 4 tensor operations. Enceladus doesn't port CUDA
    concepts and then work around them.
-2. **A light install.** `pip install` works in seconds. Tegula needs no LLVM, MLIR, TVM,
+2. **A light install.** `pip install` works in seconds. Enceladus needs no LLVM, MLIR, TVM,
    or Triton build, and it doesn't need the offline Metal toolchain. The compiler is pure
    Python. The only native code is a small Objective-C++ runtime extension.
 3. **Framework-neutral interop.** NumPy arrays, PyTorch MPS tensors, and MLX arrays all
    work as kernel arguments with zero copies.
-4. **Correctness first.** Tegula refuses unsupported programs with an error at the Python
+4. **Correctness first.** Enceladus refuses unsupported programs with an error at the Python
    source line. It never silently miscompiles. A NumPy interpreter serves as both a
    debugger and a test oracle.
 
@@ -86,16 +86,16 @@ Tegula's niche is therefore specific. Tegula competes on these properties:
 > framework neutrality require one. Revisit this decision if triton-ext ships macOS
 > wheels with fast matmul support.
 
-## What using Tegula looks like
+## What using Enceladus looks like
 
 The following code shows a vector-add kernel. It reads like Triton, down to the `tl`
 alias, so porting a Triton kernel mostly means changing the imports:
 
 ```python
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
-@tegula.jit
+@enceladus.jit
 def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -104,17 +104,17 @@ def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
     y = tl.load(y_ptr + offs, mask=mask)
     tl.store(out_ptr + offs, x + y, mask=mask)
 
-x = tegula.randn(1 << 24)
-y = tegula.randn(1 << 24)
-out = tegula.empty_like(x)
-add_kernel[(tegula.cdiv(x.numel, 1024),)](x, y, out, x.numel, BLOCK=1024)
+x = enceladus.randn(1 << 24)
+y = enceladus.randn(1 << 24)
+out = enceladus.empty_like(x)
+add_kernel[(enceladus.cdiv(x.numel, 1024),)](x, y, out, x.numel, BLOCK=1024)
 ```
 
 The following code shows a row softmax. The reductions (`tl.max`, `tl.sum`) compile to
 SIMD-group shuffles plus one threadgroup-memory exchange:
 
 ```python
-@tegula.jit
+@enceladus.jit
 def softmax_kernel(out_ptr, in_ptr, stride_in, stride_out, n_cols,
                    BLOCK: tl.constexpr):
     row = tl.program_id(0)
@@ -132,14 +132,14 @@ strides. Descriptors handle out-of-bounds tiles automatically and let the compil
 matrix fragments straight from device memory:
 
 ```python
-@tegula.autotune(
+@enceladus.autotune(
     configs=[
-        tegula.Config({"BM": 64, "BN": 64, "BK": 32}, num_warps=4),
-        tegula.Config({"BM": 32, "BN": 64, "BK": 32}, num_warps=2),
+        enceladus.Config({"BM": 64, "BN": 64, "BK": 32}, num_warps=4),
+        enceladus.Config({"BM": 32, "BN": 64, "BK": 32}, num_warps=2),
     ],
     key=["M", "N", "K"],
 )
-@tegula.jit
+@enceladus.jit
 def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bk, stride_cm,
                   BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     pid_n, pid_m = tl.program_id(0), tl.program_id(1)
@@ -151,41 +151,41 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bk, stride_cm,
         acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
     c.store([pid_m * BM, pid_n * BN], acc.to(c.dtype))
 
-grid = lambda meta: (tegula.cdiv(N, meta["BN"]), tegula.cdiv(M, meta["BM"]))
+grid = lambda meta: (enceladus.cdiv(N, meta["BN"]), enceladus.cdiv(M, meta["BM"]))
 matmul_kernel[grid](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0))
 ```
 
 To debug any of these kernels on the CPU with `print()` and `pdb`, set
-`TEGULA_INTERPRET=1`.
+`ENCELADUS_INTERPRET=1`.
 
 ## Architecture
 
-Tegula has a pure-Python compiler and a thin native runtime. The following diagram shows
+Enceladus has a pure-Python compiler and a thin native runtime. The following diagram shows
 the flow from a decorated function to a GPU dispatch:
 
 ```mermaid
 flowchart LR
-    A["@tegula.jit<br/>Python function"] --> B["Frontend<br/>AST → Tegula IR"]
+    A["@enceladus.jit<br/>Python function"] --> B["Frontend<br/>AST → Enceladus IR"]
     B --> C["Passes<br/>simplify, layouts,<br/>memory, barriers"]
     C --> D["MSL codegen<br/>deterministic text"]
     D --> E["Metal compiler<br/>newLibraryWithSource"]
     E --> F["Pipeline cache"]
     F --> G["Stream<br/>batched dispatch"]
-    A -.->|"TEGULA_INTERPRET=1"| H["NumPy interpreter"]
+    A -.->|"ENCELADUS_INTERPRET=1"| H["NumPy interpreter"]
     G --> I["Metal GPU"]
-    J["NumPy / torch MPS /<br/>MLX / tegula.Tensor"] -->|"zero-copy<br/>DLPack"| G
+    J["NumPy / torch MPS /<br/>MLX / enceladus.Tensor"] -->|"zero-copy<br/>DLPack"| G
 ```
 
 The components are as follows:
 
 - **Frontend.** Parses the kernel's Python AST, evaluates `constexpr` expressions in
-  Python, inlines helper functions, and emits Tegula IR: a small, typed, SSA tile IR with
+  Python, inlines helper functions, and emits Enceladus IR: a small, typed, SSA tile IR with
   structured control flow. The frontend reuses Triton's proven approach, and the
   `kernel[grid](...)` launch syntax, `constexpr`, and `grid=lambda meta:` all carry over.
 - **Passes.** Simplify the IR, assign a *layout* to every tile (which thread holds which
   element), allocate threadgroup memory, insert barriers, and strength-reduce index math.
 - **MSL codegen.** Prints MSL text. Apple's Metal compiler does register allocation and
-  instruction scheduling, so Tegula doesn't need LLVM.
+  instruction scheduling, so Enceladus doesn't need LLVM.
 - **Runtime.** An Objective-C++ core with a C ABI, exposed through a nanobind extension.
   It compiles MSL, caches pipelines, wraps foreign memory, and batches dispatches into
   command buffers.
@@ -213,9 +213,9 @@ processes, so a repeat compile costs 0.05 to 0.5 ms. For details, see
 
 ### Write the compiler in pure Python
 
-Triton's MLIR stack is what makes a Triton Metal backend a one-hour LLVM build. Tegula's
+Triton's MLIR stack is what makes a Triton Metal backend a one-hour LLVM build. Enceladus's
 IR and passes are small enough for Python dataclasses. The Metal compiler handles the
-hard back-end work. Tegula's own compile time target is under 20 ms for a matmul kernel,
+hard back-end work. Enceladus's own compile time target is under 20 ms for a matmul kernel,
 which is below Metal's own compile cost.
 
 ### Use one bit-linear layout representation
@@ -225,7 +225,7 @@ of layout classes with pairwise conversions. Triton's 2025 *linear layouts* work
 the zoo with one representation: a map from the bits of (register, lane, SIMD group) to
 the bits of the tile coordinates.
 
-Tegula adopts that idea from day one, restricted to power-of-two shapes. The research
+Enceladus adopts that idea from day one, restricted to power-of-two shapes. The research
 confirmed that `simdgroup_matrix` fragments are bit-linear too: each lane holds two
 elements whose row comes from lane bits 1, 2, and 4 and whose column comes from lane
 bits 0 and 3. So one representation covers elementwise tiles, reduction results, and
@@ -246,14 +246,14 @@ The kernel benchmarks measured the options at 4096³ on this machine:
 
 The measured compute ceiling is about 6.2 TFLOPS for both FP32 and FP16. FP16 has no 2x
 rate on this GPU. Direct device loads beat threadgroup staging by 7-15%, because the GPU
-caches supply the reuse and the kernel skips two barriers per K step. So Tegula's default
+caches supply the reuse and the kernel skips two barriers per K step. So Enceladus's default
 `dot` lowering loads fragments straight from device memory. The research has a verified
 reference kernel at
 [`best_matmul.metal`](docs/research/reference/kernels/best_matmul.metal).
 
 Metal 4's `matmul2d` is 3-6% faster on M4 and is the only path to the M5 Neural
 Accelerators. It costs about 200 ms to compile, compared with about 10 ms, and its
-register layout is opaque, which limits what you can fuse after it. Tegula offers it as a
+register layout is opaque, which limits what you can fuse after it. Enceladus offers it as a
 second `dot` backend: the default on M5 and later, and an autotuning candidate on M4.
 
 ### Autotune matmul configurations and verify them
@@ -261,7 +261,7 @@ second `dot` backend: the default on M5 and later, and an autotuning candidate o
 Some per-SIMD-group tile shapes collapse by 7-15x from register spilling. The collapse
 depends on the shape and dtype in ways that a register-count model doesn't predict. For
 example, FP32 with a 4x4 fragment grid collapses, but FP32 with a 2x8 grid (the same
-accumulator count) runs at full speed. Tegula ships a small, pre-validated configuration
+accumulator count) runs at full speed. Enceladus ships a small, pre-validated configuration
 set per dtype, autotunes over it, and rejects configurations that run far below the
 median.
 
@@ -270,7 +270,7 @@ median.
 Every bridge pays about 95 µs for a synchronous launch-and-wait. The GPU driver sets that
 floor. One command buffer per launch caps throughput at about 11 µs per launch, even in
 pure C. Batching 64 dispatches per command buffer brings it to 1.1 µs per launch, set by
-the GPU. So Tegula launches are asynchronous and batched, like CUDA streams. Tegula commits
+the GPU. So Enceladus launches are asynchronous and batched, like CUDA streams. Enceladus commits
 a command buffer every 64 dispatches, or when the host needs results.
 
 ### Use nanobind over an Objective-C++ C ABI
@@ -294,12 +294,12 @@ working prototype in [`reference/runtime/`](docs/research/reference/runtime/).
 ### Accept framework tensors through DLPack
 
 PyTorch MPS tensors and MLX arrays both export DLPack with device type `kDLMetal`. Their
-data field holds the `id<MTLBuffer>` pointer, plus a byte offset for views. Tegula binds
+data field holds the `id<MTLBuffer>` pointer, plus a byte offset for views. Enceladus binds
 the buffer directly with no copy. NumPy arrays wrap with `newBufferWithBytesNoCopy`. The
-catch is ordering: Tegula's queue and PyTorch's MPS stream don't order against each other.
+catch is ordering: Enceladus's queue and PyTorch's MPS stream don't order against each other.
 The benchmark read stale data in 1 of 50 trials without a sync. For PyTorch tensors,
-Tegula therefore launches through `torch.mps.compile_shader`, which runs inside PyTorch's
-stream (3.4 µs per launch sustained). If that path can't express a kernel, Tegula falls
+Enceladus therefore launches through `torch.mps.compile_shader`, which runs inside PyTorch's
+stream (3.4 µs per launch sustained). If that path can't express a kernel, Enceladus falls
 back to synchronizing.
 
 ### Make the interpreter a first-class feature
@@ -307,12 +307,12 @@ back to synchronizing.
 Tile-level semantics mean each language operation is one NumPy call over a whole tile,
 with no thread simulation. That makes the interpreter small. It's also the most valuable
 feature per line of code: it gives you `pdb` and `print()` in kernels, and it's the
-oracle that every compiled-kernel test compares against. Tegula uses `ml_dtypes` so the
+oracle that every compiled-kernel test compares against. Enceladus uses `ml_dtypes` so the
 interpreter supports `bfloat16`, which Triton's interpreter doesn't.
 
 ### Borrow from Triton, but drop what hurts
 
-The following table summarizes what Tegula takes from Triton, per
+The following table summarizes what Enceladus takes from Triton, per
 [`01-triton-internals.md`](docs/research/01-triton-internals.md):
 
 | Borrow | Simplify | Drop |
@@ -323,7 +323,7 @@ The following table summarizes what Tegula takes from Triton, per
 | `@autotune`, `@heuristics`, `Config` | Autotuning: block sizes and `num_warps` only | A backend plug-in system (one target only) |
 | The interpreter, IR dumps, kernel override | Error reporting: every pass reports the Python source line | A lower-level Gluon-style language; a raw MSL escape hatch covers experts |
 
-Tegula specializes on facts such as "this integer is 1" or "this integer is divisible by
+Enceladus specializes on facts such as "this integer is 1" or "this integer is divisible by
 16" without removing the argument from the launch signature. The kernel ABI therefore
 never changes shape between specializations.
 
@@ -332,7 +332,7 @@ never changes shape between specializations.
 The following targets apply to the M4 Pro development machine. The ceilings column shows
 the best hand-written or library result measured during research.
 
-| Workload | Measured ceiling | Tegula target |
+| Workload | Measured ceiling | Enceladus target |
 |---|---|---|
 | Vector add, 256 MB per array | 238 GB/s | 220 GB/s or more |
 | Row softmax, 4096 x 4096, FP32 and FP16 | 230-243 GB/s (MLX 237-254) | 215 GB/s or more |
@@ -342,7 +342,7 @@ the best hand-written or library result measured during research.
 | Matmul 4096³ FP16, `mpp` backend | 6.19 TFLOPS | 5.9 TFLOPS or more |
 | Flash attention forward, FP16, head dim 64 and 128 | MLX SDPA (measure in M7) | Within 1.3x of MLX |
 | Sustained launch cost, small kernels | 1.1 µs (prototype) | 5 µs or less |
-| Tegula compile time, matmul, excluding Metal | Not applicable | 20 ms or less |
+| Enceladus compile time, matmul, excluding Metal | Not applicable | 20 ms or less |
 
 ## Roadmap
 
@@ -352,8 +352,8 @@ two weeks or more.
 
 | Milestone | Delivers | Size |
 |---|---|---|
-| M0: Runtime and raw kernels | Native runtime, stream, buffers, `tegula.metal_kernel` raw-MSL escape hatch, `tegula.Tensor` | M |
-| M1: Frontend, IR, and interpreter | `@tegula.jit` parsing to IR, the full P0 language surface, the NumPy interpreter | M |
+| M0: Runtime and raw kernels | Native runtime, stream, buffers, `enceladus.metal_kernel` raw-MSL escape hatch, `enceladus.Tensor` | M |
+| M1: Frontend, IR, and interpreter | `@enceladus.jit` parsing to IR, the full P0 language surface, the NumPy interpreter | M |
 | M2: Elementwise codegen | Bit layouts, MSL codegen, specialization, caching; vector add at target | M |
 | M3: Reductions and 2D tiles | `sum`, `max`, `min`, `argmax`, broadcasting, layout conversion; softmax and LayerNorm at target | M |
 | M4: Matmul | `tl.dot` on `simdgroup_matrix`, tensor descriptors, edge versioning; matmul at target | L |
@@ -365,18 +365,18 @@ two weeks or more.
 
 ## Risks and open questions
 
-- **Competition moves faster than Tegula.** If triton-ext lands fast matmul and macOS
-  wheels, the portability argument for Tegula weakens. Mitigation: prioritize what
+- **Competition moves faster than Enceladus.** If triton-ext lands fast matmul and macOS
+  wheels, the portability argument for Enceladus weakens. Mitigation: prioritize what
   incumbents lack, which is a light install, MLX support, and Apple-first ergonomics, and
   ship M0-M4 as the first public release.
 - **The `simdgroup_matrix` lane layout is officially unspecified.** MLX and the reference
-  kernel depend on it, and it's verified on this M4 Pro. Tegula runs a small self-test
+  kernel depend on it, and it's verified on this M4 Pro. Enceladus runs a small self-test
   kernel on first use of each device and refuses the `simdgroup` `dot` path if the
   layout differs.
 - **Apple compiler bugs.** The research found three: a single-SIMD-group threadgroup-size
   bound that makes `simdgroup_load` read stale data (CubeCL), miscompiles of unrolled
   4x4-or-larger matrix products (warp-metal), and weak BF16 code generation
-  (ThunderMittens). Tegula never emits `max_total_threads_per_threadgroup(32)`, and its
+  (ThunderMittens). Enceladus never emits `max_total_threads_per_threadgroup(32)`, and its
   differential tests cover BF16.
 - **Register-spill cliffs** can make a valid configuration 10x slower. Autotuning with
   verification handles this for tuned kernels. Untuned kernels use the pre-validated
@@ -385,7 +385,7 @@ two weeks or more.
   to reach full clocks, and background GPU load caused 2-3x slowdowns during research.
   The benchmark harness warms up, waits for an idle GPU, and reports the minimum of N
   runs.
-- **Package name.** On 2026-09-26, `tegula` was unclaimed on PyPI, and the only GitHub
+- **Package name.** On 2026-09-26, `enceladus` was unclaimed on PyPI, and the only GitHub
   repository with that name is a small academic project on 2D tilings. Reserve the PyPI
   name early, because the working name `forge` and the alternative `forge-metal` are both
   taken (`forge-metal` is an unrelated Apple-silicon array framework).
@@ -462,7 +462,7 @@ rules:
   dependence. Metal's front-end cache keys on the exact source text.
 - Every IR operation carries a source location. Every error raised after the frontend
   must include it.
-- Refuse loudly. If a construct isn't supported, raise `tegula.CompilationError` with the
+- Refuse loudly. If a construct isn't supported, raise `enceladus.CompilationError` with the
   source location. Never emit code you aren't sure is correct.
 - Commit at the end of each milestone task with a message that says what changed and why.
 - At the end of each milestone, append a short entry to `docs/progress.md`: what you
@@ -474,29 +474,29 @@ Create the following layout in M0. Later milestones fill it in.
 
 ```text
 ./                            # repository root
-├── pyproject.toml            # scikit-build-core + nanobind; dist name tegula
-├── CMakeLists.txt            # builds tegula._C from Objective-C++
+├── pyproject.toml            # scikit-build-core + nanobind; dist name enceladus
+├── CMakeLists.txt            # builds enceladus._C from Objective-C++
 ├── PLAN.md                   # this file
 ├── docs/
 │   ├── progress.md           # milestone log (you maintain it)
 │   ├── research/             # research reports and reference code (read-only)
 │   └── guide/                # user docs (M9)
-├── src/tegula/
+├── src/enceladus/
 │   ├── __init__.py           # public API re-exports
 │   ├── _C/                   # native runtime (Objective-C++)
-│   │   ├── tegula_rt.h        # C ABI
-│   │   ├── tegula_rt.mm       # Metal implementation
+│   │   ├── enceladus_rt.h        # C ABI
+│   │   ├── enceladus_rt.mm       # Metal implementation
 │   │   └── bindings.mm       # nanobind module
 │   ├── runtime/
 │   │   ├── device.py         # device singleton, capabilities, self-tests
-│   │   ├── tensor.py         # tegula.Tensor, allocation, numpy views
+│   │   ├── tensor.py         # enceladus.Tensor, allocation, numpy views
 │   │   ├── interop.py        # argument adapters: numpy, DLPack, torch, MLX
 │   │   ├── stream.py         # batching stream, synchronize
 │   │   ├── launcher.py       # native and torch launch paths
 │   │   ├── cache.py          # in-memory and on-disk caches, hashing
 │   │   ├── jit.py            # JITFunction, specialization, binder
 │   │   ├── autotuner.py      # Autotuner, Config, heuristics
-│   │   └── raw.py            # tegula.metal_kernel escape hatch
+│   │   └── raw.py            # enceladus.metal_kernel escape hatch
 │   ├── language/
 │   │   ├── __init__.py       # the `tl` namespace
 │   │   ├── core.py           # dtypes, constexpr, builtin registry
@@ -528,21 +528,21 @@ Configure `pyproject.toml` with these settings:
 
 - Build backend: `scikit-build-core`, with `nanobind` as a build requirement.
 - Runtime dependencies: `numpy` and `ml_dtypes`.
-- Optional extras: `torch` (`tegula[torch]`) and `mlx` (`tegula[mlx]`).
+- Optional extras: `torch` (`enceladus[torch]`) and `mlx` (`enceladus[mlx]`).
 - Dev dependency group: `pytest`, `ruff`, `torch`, and `mlx`.
-- `[tool.scikit-build]`: set `wheel.packages = ["src/tegula"]`, set
+- `[tool.scikit-build]`: set `wheel.packages = ["src/enceladus"]`, set
   `cmake.build-type = "Release"`, and set `MACOSX_DEPLOYMENT_TARGET=15.0`.
 
 Configure `CMakeLists.txt` with these settings:
 
-- `project(tegula LANGUAGES CXX OBJCXX)`.
+- `project(enceladus LANGUAGES CXX OBJCXX)`.
 - `find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)` and
-  nanobind's `nanobind_add_module(_C NB_STATIC src/tegula/_C/bindings.mm
-  src/tegula/_C/tegula_rt.mm)`.
+  nanobind's `nanobind_add_module(_C NB_STATIC src/enceladus/_C/bindings.mm
+  src/enceladus/_C/enceladus_rt.mm)`.
 - Compile flags `-fobjc-arc -std=c++17`. Link `-framework Metal -framework Foundation`.
-- Install the module into `tegula/`.
+- Install the module into `enceladus/`.
 
-After you change native code, rebuild with `uv sync --reinstall-package tegula`.
+After you change native code, rebuild with `uv sync --reinstall-package enceladus`.
 Python-only changes need no rebuild. The research prototype built with plain clang in
 about 2 seconds (see [`build.sh`](docs/research/reference/runtime/build.sh)), which is a
 useful fallback for debugging build problems.
@@ -557,8 +557,8 @@ batched dispatch.
 
 ### Build the native core
 
-Port the prototype's `forge_rt.h` and `forge_rt.mm`, renamed to `tegula_rt.h` and
-`tegula_rt.mm`, then change them as follows:
+Port the prototype's `forge_rt.h` and `forge_rt.mm`, renamed to `enceladus_rt.h` and
+`enceladus_rt.mm`, then change them as follows:
 
 1. Keep the C ABI style: opaque `void*` handles to retained Objective-C objects, released
    with `fr_release`. Keep `@autoreleasepool` around every call that creates autoreleased
@@ -596,7 +596,7 @@ Port the prototype's `forge_rt.h` and `forge_rt.mm`, renamed to `tegula_rt.h` an
 
 ### Build the nanobind module
 
-Port `forge_nb.mm` into `bindings.mm` as the module `tegula._C`. The requirements are as
+Port `forge_nb.mm` into `bindings.mm` as the module `enceladus._C`. The requirements are as
 follows:
 
 - Release the GIL (`nb::gil_scoped_release`) in library compilation, pipeline creation,
@@ -611,36 +611,36 @@ follows:
 
 1. `runtime/device.py`: a lazily created device singleton with a `Capabilities`
    dataclass. The flush threshold is 64 dispatches; make it configurable with
-   `TEGULA_FLUSH_EVERY`.
-2. `runtime/tensor.py`: `tegula.Tensor` with `shape`, `strides` (in elements), `dtype`,
+   `ENCELADUS_FLUSH_EVERY`.
+2. `runtime/tensor.py`: `enceladus.Tensor` with `shape`, `strides` (in elements), `dtype`,
    `offset`, `numel`, `nbytes`, `stride(i)`, `.numpy()`, `__dlpack__`, and
    `__dlpack_device__`. `.numpy()` synchronizes the default stream, then returns a
-   zero-copy view of shared storage. Add `tegula.empty`, `zeros`, `ones`, `full`,
+   zero-copy view of shared storage. Add `enceladus.empty`, `zeros`, `ones`, `full`,
    `randn`, `rand`, `arange`, `empty_like`, `zeros_like`, and `from_numpy` (zero copy when
    the memory is page-aligned, copy otherwise).
 3. `runtime/interop.py`: `as_kernel_arg(obj)` returns a `BufferArg(buffer, byte_offset,
-   dtype, shape, strides, owner, kind)`. Handle `tegula.Tensor` and NumPy arrays in M0.
+   dtype, shape, strides, owner, kind)`. Handle `enceladus.Tensor` and NumPy arrays in M0.
    For NumPy, call `newBufferWithBytesNoCopy` only on page-aligned memory (16 KB pages).
-   If that returns `nil`, or the memory isn't aligned, copy into a Tegula buffer and copy
+   If that returns `nil`, or the memory isn't aligned, copy into a Enceladus buffer and copy
    back after the launch for writable outputs. Cache the wrapped buffer per
    `(data pointer, nbytes)` in a small `WeakValueDictionary` keyed on the array's base.
-4. `runtime/stream.py`: the Python `Stream` wrapper and `tegula.synchronize()`.
-5. `runtime/raw.py`: `tegula.metal_kernel(source, name, language_version=...)` returns a
+4. `runtime/stream.py`: the Python `Stream` wrapper and `enceladus.synchronize()`.
+5. `runtime/raw.py`: `enceladus.metal_kernel(source, name, language_version=...)` returns a
    launchable object. Its launch syntax is `k[grid, threads_per_group](*args)`. This is
    the expert escape hatch, and M0 tests use it.
 
 ### Define synchronization semantics
 
-- Launches that touch only `tegula.Tensor` arguments are asynchronous.
+- Launches that touch only `enceladus.Tensor` arguments are asynchronous.
 - A launch that touches a NumPy array synchronizes before it returns, because NumPy has
   no stream concept. This is a usability trade-off. Document it and add
-  `tegula.async_numpy(True)` to opt out.
-- `Tensor.numpy()`, `Tensor.tolist()`, `print(tensor)`, and `tegula.synchronize()` flush
+  `enceladus.async_numpy(True)` to opt out.
+- `Tensor.numpy()`, `Tensor.tolist()`, `print(tensor)`, and `enceladus.synchronize()` flush
   and wait.
 
 ### Acceptance criteria
 
-- A raw-MSL vector add runs correctly on `tegula.Tensor` and on NumPy arrays (aligned and
+- A raw-MSL vector add runs correctly on `enceladus.Tensor` and on NumPy arrays (aligned and
   unaligned).
 - A launch error, for example a missing buffer, raises a Python exception, not a crash.
 - A benchmark in `benchmarks/bench_dispatch.py` shows sustained cost of 2 µs or less per
@@ -653,12 +653,12 @@ follows:
 **Read first:** sections 1, 2, and 5 of
 [`01-triton-internals.md`](docs/research/01-triton-internals.md).
 
-**Goal:** `@tegula.jit` functions parse into verified Tegula IR, and the interpreter runs
+**Goal:** `@enceladus.jit` functions parse into verified Enceladus IR, and the interpreter runs
 them correctly on the CPU.
 
 ### Define the language surface
 
-The `tl` namespace (`tegula.language`) contains the following builtins. P0 items are
+The `tl` namespace (`enceladus.language`) contains the following builtins. P0 items are
 required in M1. P1 items arrive in the milestones noted.
 
 | Group | P0 (M1) | P1 (later) |
@@ -692,14 +692,14 @@ Semantics follow Triton unless noted:
 
 ### Define kernel arguments
 
-- An array-like argument (`tegula.Tensor`, NumPy array, torch MPS tensor, MLX array)
+- An array-like argument (`enceladus.Tensor`, NumPy array, torch MPS tensor, MLX array)
   becomes a pointer of its dtype, for example `*fp32`. `x_ptr.dtype.element_ty` and the
   shorthand `x_ptr.dtype` both give the element dtype inside the kernel.
 - A Python `int` becomes `i32` if it fits in 32 bits, and `i64` otherwise. A `bool`
   becomes `i1`. A `float` becomes `fp32`.
 - A parameter annotated `tl.constexpr` is a compile-time value. It becomes part of the
   cache key and is never passed at run time.
-- `do_not_specialize=["n"]` on `@tegula.jit` turns off value-fact specialization for the
+- `do_not_specialize=["n"]` on `@enceladus.jit` turns off value-fact specialization for the
   named arguments.
 
 ### Build the IR
@@ -715,11 +715,11 @@ plain Python:
   argument.
 - **Ops:** `Op(name, operands, results, attrs, regions, loc)`. `Region` holds one `Block`
   with arguments and a list of ops.
-- **Printer:** a textual format similar to MLIR generic form. Use it for `TEGULA_DUMP=1`
+- **Printer:** a textual format similar to MLIR generic form. Use it for `ENCELADUS_DUMP=1`
   and in error messages.
 - **Verifier:** checks operand types and counts for every op, single definition,
   dominance, and region terminators. Run it after every pass in debug mode
-  (`TEGULA_VERIFY=1`, on by default in tests).
+  (`ENCELADUS_VERIFY=1`, on by default in tests).
 
 The op set is as follows. Every op has a verifier rule and an interpreter rule.
 
@@ -752,7 +752,7 @@ Implement `compiler/frontend.py` as an `ast.NodeVisitor` modeled on Triton's
 5. `for i in range(...)` emits a `for` op. Variables that are assigned in the body and
    live after it become iteration arguments. `for i in tl.static_range(...)` unrolls in
    the frontend.
-6. Calls to other `@tegula.jit` functions are inlined at the AST level with their own
+6. Calls to other `@enceladus.jit` functions are inlined at the AST level with their own
    scope. Recursion is an error.
 7. Forbid the following with clear errors: `break`, `continue`, `return` with a value in
    a kernel, `return` inside a runtime `if` or `for`, `while` (until P1), closures over
@@ -778,7 +778,7 @@ directly, the way Triton's interpreter does:
    `IndexError` that names the kernel line, which is a debugging feature the GPU can't
    offer.
 4. The grid runs sequentially. Set `program_id` values before each program.
-5. Activate the interpreter with `TEGULA_INTERPRET=1` or `@tegula.jit(interpret=True)`.
+5. Activate the interpreter with `ENCELADUS_INTERPRET=1` or `@enceladus.jit(interpret=True)`.
    Arrays pass through as NumPy views of shared memory, so no copies are needed.
 
 ### Acceptance criteria
@@ -786,7 +786,7 @@ directly, the way Triton's interpreter does:
 - The examples `examples/01_vector_add.py`, `02_softmax.py`, `03_layernorm.py`, and
   `04_matmul.py` run correctly under the interpreter. Matmul uses pointer tiles in M1;
   M4 adds the descriptor version.
-- `TEGULA_DUMP=1` prints readable IR for each example.
+- `ENCELADUS_DUMP=1` prints readable IR for each example.
 - Tests: the frontend error cases listed in [Tests](#tests), and interpreter checks
   against NumPy for the four examples.
 
@@ -936,10 +936,10 @@ The codegen rules are as follows:
 - **Names:** derive MSL identifiers from Python names with a numeric suffix
   (`acc_3`), so that generated code is readable. Escape MSL reserved words.
 - **Source mapping:** emit a `// file.py:LINE` comment before the code for each IR op in
-  debug mode (`TEGULA_DEBUG=1`). Don't emit these comments by default. They're
+  debug mode (`ENCELADUS_DEBUG=1`). Don't emit these comments by default. They're
   deterministic, but they make the source text larger.
 - **Math mode:** compile with `mathMode = relaxed` by default, which keeps `inf` and NaN
-  semantics for masking with `-inf`. Add `@tegula.jit(math_mode="fast")` for kernels that
+  semantics for masking with `-inf`. Add `@enceladus.jit(math_mode="fast")` for kernels that
   are bound by `exp`. Fast mode measured 1.8x faster `exp`, but it assumes no infinities.
   Write a test that a softmax with `other=-float("inf")` and fully masked lanes gives the
   right answer under the default mode.
@@ -969,7 +969,7 @@ generated source serves both.
 
 1. At decoration time, capture the source, the signature, constexpr parameters, and a
    dependency hash: SHA-256 over the kernel source plus every transitively referenced
-   `@tegula.jit` function and global constant (Triton's `DependenciesFinder` pattern).
+   `@enceladus.jit` function and global constant (Triton's `DependenciesFinder` pattern).
 2. At call time, build the specialization key: for each runtime argument, the dtype and
    16-byte alignment for arrays, or the Python type, bit width, `value % 16 == 0`, and
    `value == 1` for integers; plus all constexpr values, `num_warps`, the math mode, and
@@ -981,14 +981,14 @@ generated source serves both.
    Precompile a `struct.Struct` for the scalar bytes and a native `LaunchPlan` per
    specialization. Target 5 µs or less of host time per launch, measured in
    `benchmarks/bench_dispatch.py`.
-5. Keep an on-disk cache in `~/.cache/tegula/<key-hash>/` with `kernel.metal`, `ir.txt`,
+5. Keep an on-disk cache in `~/.cache/enceladus/<key-hash>/` with `kernel.metal`, `ir.txt`,
    and `meta.json`. The key hash includes the dependency hash, the specialization key,
-   the Tegula version, the OS build, and `device.architecture.name`. Metal's own disk
-   cache handles the compiled binaries, so Tegula doesn't store them in M2.
+   the Enceladus version, the OS build, and `device.architecture.name`. Metal's own disk
+   cache handles the compiled binaries, so Enceladus doesn't store them in M2.
 6. Warn once per kernel after 16 recompilations, and name the argument whose
    specialization changed most.
-7. Support `TEGULA_ALWAYS_COMPILE=1` (ignore caches), `TEGULA_DUMP=1` (write IR and MSL next
-   to the cache entry and print their paths), and `TEGULA_OVERRIDE_DIR` (load hand-edited
+7. Support `ENCELADUS_ALWAYS_COMPILE=1` (ignore caches), `ENCELADUS_DUMP=1` (write IR and MSL next
+   to the cache entry and print their paths), and `ENCELADUS_OVERRIDE_DIR` (load hand-edited
    MSL from `<dir>/<kernel_name>.metal` instead of generated code).
 8. Expose `compiled = kernel.warmup(*args, grid=...)`, with `compiled.msl`,
    `compiled.ir`, `compiled.threadgroup_memory_bytes`, and `compiled.num_warps`.
@@ -1001,7 +1001,7 @@ generated source serves both.
   passes.
 - `benchmarks/bench_elementwise.py` shows vector add at 220 GB/s or more at 256 MB per
   array.
-- Tegula compile time (frontend through codegen) is under 5 ms for vector add.
+- Enceladus compile time (frontend through codegen) is under 5 ms for vector add.
 
 ## Milestone M3: Reductions and 2D tiles
 
@@ -1106,7 +1106,7 @@ Implement `passes/lower_dot.py` and the codegen for it:
 1. **Choose the SIMD-group grid.** The default is `WN = 1` and `WM = num_warps`, which is
    the measured best configuration (4 SIMD groups along M, each owning a 16 x 64 strip).
    It also makes the attention `P @ V` conversion free (see M7). Allow an override with
-   `tegula.Config(..., dot_warps=(WM, WN))`. Require `BM % (8 * WM) == 0` and
+   `enceladus.Config(..., dot_warps=(WM, WN))`. Require `BM % (8 * WM) == 0` and
    `BN % (8 * WN) == 0`, and require `BK % 8 == 0`.
 2. **Classify each operand.**
    - *Direct operand:* the operand is a `desc_load` (optionally through `trans`) with no
@@ -1174,35 +1174,35 @@ costs 0-1% on aligned sizes. Implement `passes/edge_versioning.py`:
 
 **Read first:** section 4 of [`01-triton-internals.md`](docs/research/01-triton-internals.md).
 
-**Goal:** `@tegula.autotune` picks the fastest valid configuration and remembers it.
+**Goal:** `@enceladus.autotune` picks the fastest valid configuration and remembers it.
 
-1. Implement `tegula.Config(kwargs, num_warps=4, dot_warps=None, dot_backend="auto",
-   pre_hook=None)` and `@tegula.autotune(configs, key, prune_configs_by=None,
+1. Implement `enceladus.Config(kwargs, num_warps=4, dot_warps=None, dot_backend="auto",
+   pre_hook=None)` and `@enceladus.autotune(configs, key, prune_configs_by=None,
    reset_to_zero=None, restore_value=None, warmup_ms=50, rep=20)`, with Triton's
    semantics.
 2. On a new key, compile all configurations in parallel with a `ThreadPoolExecutor` sized
    to `min(8, maximumConcurrentCompilationTaskCount)`. The native compile releases the
    GIL, and parallel compiles measured 6.8x faster. Raise compile failures per
    configuration and skip them with a warning, unless every configuration fails.
-3. Benchmark with `tegula.testing.do_bench(fn, warmup_ms, rep)`: warm the GPU, run each
+3. Benchmark with `enceladus.testing.do_bench(fn, warmup_ms, rep)`: warm the GPU, run each
    repetition in its own command buffer, read GPU timestamps, and return the median.
    Between repetitions, don't clear caches. Clearing the system-level cache doesn't
    reflect real use for kernels whose working sets fit in it.
 4. Protect in-place outputs with `reset_to_zero` and `restore_value`, as Triton does.
 5. Reject configurations that run more than 3x slower than the median as probable spill
    cliffs, and log them at debug level.
-6. Persist results to `~/.cache/tegula/autotune/<kernel-hash>/<architecture>.json`, keyed
+6. Persist results to `~/.cache/enceladus/autotune/<kernel-hash>/<architecture>.json`, keyed
    by the key-argument values and dtypes. Load them on the next process start.
-7. `TEGULA_PRINT_AUTOTUNING=1` prints the winner as a pasteable `tegula.Config(...)`
+7. `ENCELADUS_PRINT_AUTOTUNING=1` prints the winner as a pasteable `enceladus.Config(...)`
    expression, following Helion's "freeze the tuned config" workflow.
-8. Implement `@tegula.heuristics({"BLOCK": lambda args: ...})`.
-9. Ship a default configuration list for matmul in `tegula/configs.py`, based on the sweep
+8. Implement `@enceladus.heuristics({"BLOCK": lambda args: ...})`.
+9. Ship a default configuration list for matmul in `enceladus/configs.py`, based on the sweep
    in [`05-kernel-bench.md`](docs/research/05-kernel-bench.md). The valid per-SIMD-group
    tiles are 16 x 32, 16 x 64, and 32 x 16 for all dtypes, plus 32 x 32 for FP16 and
    BF16 only, with 2 to 8 SIMD groups. Exclude the measured cliffs: FP32 with 32 x 32 or
    16 x 128 per SIMD group, and any dtype with 64 x 32.
 10. Build the benchmark suite: `benchmarks/run_all.py` runs every benchmark and writes a
-    Markdown table to `benchmarks/results/<date>-<arch>.md`, comparing Tegula with MLX and
+    Markdown table to `benchmarks/results/<date>-<arch>.md`, comparing Enceladus with MLX and
     torch.
 
 **Acceptance criteria:** the autotuned matmul matches or beats the fixed M4 configuration
@@ -1227,7 +1227,7 @@ and without copies.
    `t.data_ptr()`, which is the buffer address plus the offset and isn't an object
    pointer. Pass shape and strides through for descriptors.
 3. Implement the torch launch path in `launcher.py` on top of `torch.mps.compile_shader`,
-   so that Tegula kernels run inside PyTorch's MPS stream and order correctly with
+   so that Enceladus kernels run inside PyTorch's MPS stream and order correctly with
    surrounding torch ops. Use it when any argument is an MPS tensor.
    - Compile the same generated MSL with `torch.mps.compile_shader` and cache the library
      per source hash.
@@ -1253,24 +1253,24 @@ and without copies.
    `kDLMetal`), and retain the buffer while it's in use. Keep the array alive until the
    launch completes.
 3. MLX launches are synchronous in M6: evaluate inputs, launch, and sync. A lazy MLX
-   integration through `mx.fast.metal_kernel` (with Tegula's kernel in the `header`
+   integration through `mx.fast.metal_kernel` (with Enceladus's kernel in the `header`
    argument and a body that calls it) is a stretch goal. Record findings in
    `docs/progress.md` if you try it.
-4. MLX's own outputs are immutable by convention. Tegula writes to arrays you pass as
+4. MLX's own outputs are immutable by convention. Enceladus writes to arrays you pass as
    outputs, so document that outputs must be allocated for the purpose, for example with
    `mx.zeros(...)` followed by `mx.eval(...)`.
 
 ### Support DLPack out
 
-`tegula.Tensor.__dlpack__` exports with device type `kDLMetal` and the `id<MTLBuffer>` as
-`data`, so `torch.from_dlpack(tegula_tensor)` and `mx.array(...)` interop work. Sync the
-Tegula stream before export.
+`enceladus.Tensor.__dlpack__` exports with device type `kDLMetal` and the `id<MTLBuffer>` as
+`data`, so `torch.from_dlpack(enceladus_tensor)` and `mx.array(...)` interop work. Sync the
+Enceladus stream before export.
 
 ### Acceptance criteria
 
 - The vector add, softmax, and matmul examples run on torch MPS tensors and MLX arrays,
   including views with nonzero offsets.
-- A test runs 200 iterations of "torch op writes, Tegula kernel reads, torch op reads" and
+- A test runs 200 iterations of "torch op writes, Enceladus kernel reads, torch op reads" and
   sees no stale data.
 - `benchmarks/bench_dispatch.py` reports the sustained launch cost through the torch path
   (target 5 µs or less).
@@ -1283,7 +1283,7 @@ SDPA).
 
 ### Implement flash attention forward
 
-Write `examples/08_flash_attention.py` as a user-level Tegula kernel, in the style of
+Write `examples/08_flash_attention.py` as a user-level Enceladus kernel, in the style of
 Triton's fused-attention tutorial: one program per `(batch * head, BLOCK_M query rows)`,
 a loop over key blocks, online softmax with running max and sum, and FP32 accumulation.
 Make the compiler support it:
@@ -1374,14 +1374,14 @@ kernels fall back correctly.
    to Python's `sys.stderr`, prefixed with the program ID. Printing is incompatible with
    GPU capture, so document that.
 2. **Device asserts:** `tl.device_assert(cond, "msg")` writes the failing program ID and
-   message index to a small error buffer, only when `TEGULA_DEBUG=1`. The runtime checks
-   it at sync and raises `tegula.DeviceAssertionError` with the Python source line.
+   message index to a small error buffer, only when `ENCELADUS_DEBUG=1`. The runtime checks
+   it at sync and raises `enceladus.DeviceAssertionError` with the Python source line.
    Metal's shader validation didn't catch out-of-bounds writes in testing, so this is
-   Tegula's own bounds-debugging tool.
+   Enceladus's own bounds-debugging tool.
 3. **Explain:** `kernel.explain(*args, grid=...)` prints the chosen layouts, conversions,
    threadgroup memory use, `dot` backend, and register estimate per tile, with source
    lines.
-4. **GPU capture:** `tegula.capture("trace.gputrace")` as a context manager that uses
+4. **GPU capture:** `enceladus.capture("trace.gputrace")` as a context manager that uses
    `MTLCaptureManager`. It requires `MTL_CAPTURE_ENABLED=1` in the environment, so check
    for it and explain the requirement if it's missing.
 5. **Error-message pass:** review every `CompilationError` raised in the test suite and
@@ -1428,7 +1428,7 @@ decisions. Sources are in the research reports.
 
 The first public release (after M5, with M6 recommended) is done when all of these hold:
 
-- A new user can run `uv add tegula`, copy the quickstart, and run vector add,
+- A new user can run `uv add enceladus`, copy the quickstart, and run vector add,
   softmax, and matmul without installing Xcode components.
 - Every example in `examples/` passes differential tests in compiled and interpreted
   modes.

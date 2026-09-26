@@ -1,6 +1,6 @@
 """Row softmax bandwidth at 4096 x 4096 against MLX and PyTorch MPS, plus a reduction sweep.
 
-GB/s counts one read and one write of the matrix. Tegula uses GPU timestamps; MLX and
+GB/s counts one read and one write of the matrix. Enceladus uses GPU timestamps; MLX and
 PyTorch use wall clock around a synchronized call, so they include about 0.1 ms of
 launch and sync overhead.
 
@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import time
 
-import tegula
-import tegula.language as tl
-from tegula.testing import do_bench
+import enceladus
+import enceladus.language as tl
+from enceladus.testing import do_bench
 
 M = N = 4096
 
 
-@tegula.jit
+@enceladus.jit
 def softmax_kernel(out_ptr, in_ptr, stride, n_cols, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -30,7 +30,7 @@ def softmax_kernel(out_ptr, in_ptr, stride, n_cols, BLOCK: tl.constexpr):
     tl.store(out_ptr + row * stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-@tegula.jit
+@enceladus.jit
 def rowsum_kernel(out_ptr, in_ptr, stride, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     x = tl.load(in_ptr + row * stride + tl.arange(0, BLOCK))
@@ -76,11 +76,11 @@ def torch_ms(dtype: str) -> float | None:
 
 
 def main() -> None:
-    print(f"Device: {tegula.get_device().caps.name}; softmax {M} x {N}")
+    print(f"Device: {enceladus.get_device().caps.name}; softmax {M} x {N}")
     print(f"{'dtype':<10}{'num_warps':>10}{'ms':>9}{'GB/s':>8}{'MLX':>8}{'torch':>8}")
     for dtype in ("float32", "float16"):
-        x = tegula.randn(M, N, dtype=dtype)
-        out = tegula.empty_like(x)
+        x = enceladus.randn(M, N, dtype=dtype)
+        out = enceladus.empty_like(x)
         nbytes = 2 * M * N * x.itemsize
         ref = [mlx_ms(dtype), torch_ms(dtype)]
         refs = "".join(f"{gbps(nbytes, r):8.1f}" if r else f"{'n/a':>8}" for r in ref)
@@ -92,8 +92,8 @@ def main() -> None:
             print(f"{dtype:<10}{nw:>10}{ms:9.3f}{gbps(nbytes, ms):8.1f}{refs}")
 
     # Reduction microbenchmark: row sums across threadgroup sizes.
-    x = tegula.randn(M, N)
-    out = tegula.empty(M)
+    x = enceladus.randn(M, N)
+    out = enceladus.empty(M)
     print("\nRow sum 4096 x 4096 fp32, by threads per threadgroup:")
     results = {}
     for nw in (4, 8, 16, 32):

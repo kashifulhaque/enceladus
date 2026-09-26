@@ -1,15 +1,15 @@
 """Row softmax, one row per program.
 
-Run the demo with `TEGULA_INTERPRET=1 uv run python examples/02_softmax.py`.
+Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/02_softmax.py`.
 """
 
 import numpy as np
 
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
 
-@tegula.jit
+@enceladus.jit
 def softmax_kernel(out_ptr, in_ptr, stride_in, stride_out, n_cols, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -28,7 +28,7 @@ def softmax(x: np.ndarray) -> np.ndarray:
     item = x.itemsize
     softmax_kernel[(m,)](
         out, x, x.strides[0] // item, out.strides[0] // item, n,
-        BLOCK=tegula.next_power_of_2(n),
+        BLOCK=enceladus.next_power_of_2(n),
     )  # fmt: skip
     return out
 

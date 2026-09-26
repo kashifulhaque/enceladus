@@ -1,6 +1,6 @@
 """Differential tests: kernels against NumPy references, in every available mode.
 
-With `TEGULA_VERIFY=1` (set in conftest), each interpreted launch also builds and verifies
+With `ENCELADUS_VERIFY=1` (set in conftest), each interpreted launch also builds and verifies
 the kernel's IR, so these tests cover the frontend for every kernel they run.
 """
 
@@ -13,8 +13,8 @@ import numpy as np
 import pytest
 from conftest import check_kernel, execution_mode, load_example
 
-import tegula
-import tegula.language as tl
+import enceladus
+import enceladus.language as tl
 
 F32, F16, BF16 = np.float32, np.float16, ml_dtypes.bfloat16
 
@@ -126,7 +126,7 @@ UNARY = {
 }  # fmt: skip
 
 
-@tegula.jit
+@enceladus.jit
 def _unary_kernel(x_ptr, out_ptr, n, OP: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     mask = offs < n
@@ -163,7 +163,7 @@ BINARY = {
 }  # fmt: skip
 
 
-@tegula.jit
+@enceladus.jit
 def _binary_kernel(x_ptr, y_ptr, out_ptr, n, OP: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     mask = offs < n
@@ -224,7 +224,7 @@ INT_OPS = {
 }  # fmt: skip
 
 
-@tegula.jit
+@enceladus.jit
 def _int_kernel(x_ptr, y_ptr, out_ptr, n, OP: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     mask = offs < n
@@ -279,7 +279,7 @@ SHAPE_OPS = {
 }  # fmt: skip
 
 
-@tegula.jit
+@enceladus.jit
 def _shape_kernel(x_ptr, out_ptr, OP: tl.constexpr, M: tl.constexpr, N: tl.constexpr):
     rm, rn = tl.arange(0, M), tl.arange(0, N)
     x = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
@@ -321,7 +321,7 @@ def test_shape_and_reduce_ops(mode, rng, op, dtype):
     check_kernel(run, (x,), ref, modes=(mode,), atol=0.05 if op == "sum_all" else None)
 
 
-@tegula.jit
+@enceladus.jit
 def _int_div_kernel(a_ptr, b_ptr, q_ptr, r_ptr, n, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     mask = offs < n
@@ -347,12 +347,12 @@ def test_integer_division_truncates(mode):
     check_kernel(run, (a, b), ref, modes=(mode,))
 
 
-@tegula.jit
+@enceladus.jit
 def _add_combine(a, b):
     return a + b
 
 
-@tegula.jit
+@enceladus.jit
 def _row_stats_kernel(x_ptr, amax_ptr, sum_ptr, max_ptr, N: tl.constexpr):
     row = tl.program_id(0)
     x = tl.load(x_ptr + row * N + tl.arange(0, N)[None, :])  # shape (1, N)
@@ -375,14 +375,14 @@ def test_reductions(mode):
     check_kernel(run, (x,), ref, modes=(mode,))
 
 
-@tegula.jit
+@enceladus.jit
 def _scale(x, FACTOR: tl.constexpr):
     if FACTOR == 1:
         return x, 0
     return x * FACTOR, 1
 
 
-@tegula.jit
+@enceladus.jit
 def _control_flow_kernel(x_ptr, out_ptr, flags_ptr, n_blocks, thresh, BLOCK: tl.constexpr,
                          FACTOR: tl.constexpr):  # fmt: skip
     total = 0.0  # A literal that becomes a loop-carried f32.
@@ -426,11 +426,11 @@ def test_control_flow(mode):
     top = [op.name for op in module.body.ops]
     assert top.count("for") == 1, "static_range must unroll; only range() emits a for op"
     loop = next(op for op in module.body.ops if op.name == "for")
-    assert [r.type for r in loop.results] == [tegula.compiler.ir.f32, tegula.compiler.ir.i32]
+    assert [r.type for r in loop.results] == [enceladus.compiler.ir.f32, enceladus.compiler.ir.i32]
     assert any(op.name == "if" and len(op.results) == 2 for op in loop.walk())
 
 
-@tegula.jit
+@enceladus.jit
 def _desc_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_b, stride_cm,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                         TRANS_B: tl.constexpr):  # fmt: skip
@@ -459,7 +459,7 @@ def test_descriptor_matmul(mode, rng, dtype, mkn, trans_b):
 
     def run(a, b):
         c = np.full((m, n + 3), 7, dtype)  # The padding columns must stay untouched.
-        grid = (tegula.cdiv(n, 16), tegula.cdiv(m, 32))
+        grid = (enceladus.cdiv(n, 16), enceladus.cdiv(m, 32))
         bb = np.ascontiguousarray(b.T) if trans_b else b
         _desc_matmul_kernel[grid](a, bb, c, m, n, k, k, bb.shape[1], n + 3, BM=32, BN=16,
                                   BK=16, TRANS_B=trans_b)  # fmt: skip
@@ -474,7 +474,7 @@ def test_descriptor_matmul(mode, rng, dtype, mkn, trans_b):
                  modes=(mode,), atol=1e-4 if dtype is F32 else None)  # fmt: skip
 
 
-@tegula.jit
+@enceladus.jit
 def _oob_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + tl.arange(0, BLOCK))  # oob-line
     tl.store(out_ptr + tl.arange(0, BLOCK), x)
@@ -489,7 +489,7 @@ def test_out_of_bounds_load_names_kernel_line():
     assert "# oob-line" in msg and __file__ in msg
 
 
-@tegula.jit
+@enceladus.jit
 def _welford_combine(mean_a, m2_a, n_a, mean_b, m2_b, n_b):
     n = n_a + n_b
     delta = mean_b - mean_a
@@ -497,7 +497,7 @@ def _welford_combine(mean_a, m2_a, n_a, mean_b, m2_b, n_b):
     return mean_a + delta * frac, m2_a + m2_b + delta * delta * n_a * frac, n
 
 
-@tegula.jit
+@enceladus.jit
 def _welford_kernel(x_ptr, mean_ptr, var_ptr, n_cols, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)

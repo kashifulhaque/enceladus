@@ -15,9 +15,9 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-# The interpreter builds and verifies the IR of every kernel it runs when TEGULA_VERIFY is
+# The interpreter builds and verifies the IR of every kernel it runs when ENCELADUS_VERIFY is
 # set, so every interpreter test is also a frontend and verifier test.
-os.environ.setdefault("TEGULA_VERIFY", "1")
+os.environ.setdefault("ENCELADUS_VERIFY", "1")
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
@@ -30,7 +30,7 @@ def load_example(stem: str) -> ModuleType:
     """Imports `examples/<stem>.py`, for example `load_example("01_vector_add")`."""
     mod = _examples.get(stem)
     if mod is None:
-        name = f"tegula_example_{stem}"
+        name = f"enceladus_example_{stem}"
         spec = importlib.util.spec_from_file_location(name, EXAMPLES / f"{stem}.py")
         assert spec is not None and spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
@@ -43,7 +43,7 @@ def load_example(stem: str) -> ModuleType:
 def mode_available(mode: str) -> bool:
     if mode == "interpret":
         return True
-    from tegula.runtime import jit
+    from enceladus.runtime import jit
 
     return jit.COMPILED_AVAILABLE
 
@@ -59,15 +59,15 @@ def mode(request: pytest.FixtureRequest) -> str:
 @contextlib.contextmanager
 def execution_mode(mode: str) -> Iterator[None]:
     """Runs launches inside the block in `mode` ("interpret" or "compiled")."""
-    old = os.environ.get("TEGULA_INTERPRET")
-    os.environ["TEGULA_INTERPRET"] = "1" if mode == "interpret" else "0"
+    old = os.environ.get("ENCELADUS_INTERPRET")
+    os.environ["ENCELADUS_INTERPRET"] = "1" if mode == "interpret" else "0"
     try:
         yield
     finally:
         if old is None:
-            del os.environ["TEGULA_INTERPRET"]
+            del os.environ["ENCELADUS_INTERPRET"]
         else:
-            os.environ["TEGULA_INTERPRET"] = old
+            os.environ["ENCELADUS_INTERPRET"] = old
 
 
 # (atol, rtol) by output dtype. Kernels compute in fp32 and round once to the output dtype,
