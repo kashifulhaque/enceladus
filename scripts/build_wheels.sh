@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Builds the macosx_15_0_arm64 release wheels for CPython 3.11, 3.12, and 3.13, checks
+# Builds the macosx_15_0_arm64 release wheels for CPython 3.11 to 3.14, checks
 # their metadata, and runs the quickstart against each installed wheel, outside the
 # source tree.
 #
 # Usage: scripts/build_wheels.sh [OUT_DIR]   (OUT_DIR defaults to dist/)
 #
-# Each wheel is version-specific (cp311, cp312, cp313). nanobind's stable-ABI mode
+# Each wheel is version-specific (cp311 to cp314). nanobind's stable-ABI mode
 # isn't used; docs/progress.md records why.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$(mkdir -p "${1:-$ROOT/dist}" && cd "${1:-$ROOT/dist}" && pwd)"
-PYTHONS=(3.11 3.12 3.13)
+PYTHONS=(3.11 3.12 3.13 3.14)
 
 cd "$ROOT"
 for py in "${PYTHONS[@]}"; do
@@ -27,7 +27,7 @@ from email.parser import Parser
 from pathlib import Path
 
 out = Path(sys.argv[1])
-for tag in ("cp311-cp311", "cp312-cp312", "cp313-cp313"):
+for tag in ("cp311-cp311", "cp312-cp312", "cp313-cp313", "cp314-cp314"):
     wheels = sorted(out.glob(f"enceladus-*-{tag}-macosx_15_0_arm64.whl"))
     assert wheels, f"no {tag} wheel in {out}"
     whl = wheels[-1]

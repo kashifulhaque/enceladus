@@ -10,6 +10,22 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = ["numpy>=1.26", "ml_dtypes>=0.4"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Compilers",
+]
+
+[project.urls]
+Homepage = "https://github.com/kashifulhaque/enceladus"
+Documentation = "https://github.com/kashifulhaque/enceladus/blob/main/docs/guide/index.md"
+Issues = "https://github.com/kashifulhaque/enceladus/issues"
 
 [project.optional-dependencies]
 torch = ["torch>=2.5"]
@@ -21,6 +37,7 @@ dev = ["pytest>=8", "ruff>=0.6", "torch>=2.5", "mlx>=0.20"]
 [tool.scikit-build]
 wheel.packages = ["src/enceladus"]
 wheel.exclude = ["enceladus/_C/*.mm", "enceladus/_C/*.h"]
+sdist.exclude = [".claude/", ".github/", "docs/research/", "benchmarks/results/"]
 cmake.build-type = "Release"
 minimum-version = "0.10"
 build-dir = "build/{wheel_tag}"
