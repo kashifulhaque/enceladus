@@ -34,7 +34,15 @@ struct Device : Handle {
 };
 struct Queue : Handle {
     using Handle::Handle;
+    void *sink = nullptr;  // log sink of a logging queue, or null
+    ~Queue() {
+        if (sink) fr_log_sink_free(sink);
+    }
 };
+
+static void append_line(void *ctx, const char *msg, size_t len) {
+    static_cast<std::vector<std::string> *>(ctx)->emplace_back(msg, len);
+}
 struct Library : Handle {
     using Handle::Handle;
 };
@@ -54,7 +62,8 @@ struct LaunchPlan {
 struct Stream {
     void *s = nullptr;
     int flush_every = 64;
-    nb::object queue;  // keeps the queue alive
+    nb::object queue;         // keeps the queue alive
+    nb::object log_sentinel;  // keeps the sentinel pipeline alive
     ~Stream() { fr_stream_free(s); }
 };
 
@@ -324,7 +333,29 @@ NB_MODULE(_C, m) {
             return out;
         });
 
-    nb::class_<Queue>(m, "Queue").def_prop_ro("handle", &Queue::addr);
+    nb::class_<Queue>(m, "Queue")
+        .def_prop_ro("handle", &Queue::addr)
+        .def_prop_ro("logging", [](Queue &q) { return q.sink != nullptr; })
+        .def("drain_logs",
+             [](Queue &q) {
+                 std::vector<std::string> out;
+                 if (q.sink) fr_log_sink_drain(q.sink, append_line, &out);
+                 return out;
+             },
+             "Returns and removes the shader log messages collected so far.")
+        .def_prop_ro("log_sentinels",
+                     [](Queue &q) -> uint64_t {
+                         return q.sink ? fr_log_sink_sentinels(q.sink) : 0;
+                     })
+        .def(
+            "wait_log_sentinels",
+            [](Queue &q, uint64_t count, double timeout) {
+                if (!q.sink) return false;
+                nb::gil_scoped_release nogil;
+                return fr_log_sink_wait_sentinels(q.sink, count, timeout) != 0;
+            },
+            nb::arg("count"), nb::arg("timeout"),
+            "Waits until the queue has received `count` sentinel messages in total.");
     nb::class_<Library>(m, "Library").def_prop_ro("handle", &Library::addr);
 
     nb::class_<Pipeline>(m, "Pipeline")
@@ -418,6 +449,15 @@ NB_MODULE(_C, m) {
             nb::arg("pipeline"), nb::arg("plan"), nb::arg("bufs"), nb::arg("offsets").none(),
             nb::arg("scalars"), nb::arg("grid"), nb::arg("tg"))
         .def("flush", [](Stream &s) { fr_stream_flush(s.s); })
+        .def(
+            "set_log_sentinel",
+            [](Stream &s, nb::object pso) {
+                s.log_sentinel = pso;
+                fr_stream_set_log_sentinel(s.s, nb::cast<Pipeline *>(pso)->p);
+            },
+            nb::arg("pipeline"))
+        .def("mark_logging", [](Stream &s) { fr_stream_mark_logging(s.s); })
+        .def_prop_ro("log_sentinels", [](Stream &s) { return fr_stream_log_sentinels(s.s); })
         .def("sync",
              [](Stream &s) {
                  std::unique_ptr<char[]> err(new char[FR_ERR_LEN]);
@@ -470,6 +510,29 @@ NB_MODULE(_C, m) {
         return new Device(d);
     });
     m.def("new_queue", [](Device &d) { return new Queue(fr_queue_new(d.p)); });
+    m.def(
+        "new_logging_queue",
+        [](Device &d, uint64_t buffer_size, const std::string &sentinel) {
+            char err[1024];
+            void *sink = nullptr;
+            void *q = fr_queue_new_logging(d.p, buffer_size, sentinel.c_str(), &sink, err,
+                                           sizeof err);
+            if (!q) throw MetalError(std::string("can't create a logging queue: ") + err);
+            auto *out = new Queue(q);
+            out->sink = sink;
+            return out;
+        },
+        nb::arg("device"), nb::arg("buffer_size"), nb::arg("sentinel"),
+        "Returns a command queue whose MTLLogState collects shader log messages.");
+    m.def(
+        "capture_start",
+        [](Device &d, const std::string &path) {
+            char err[2048];
+            if (fr_capture_start(d.p, path.c_str(), err, sizeof err))
+                throw MetalError(std::string("GPU capture failed to start: ") + err);
+        },
+        nb::arg("device"), nb::arg("path"));
+    m.def("capture_stop", [] { fr_capture_stop(); });
 
     m.def(
         "compile",

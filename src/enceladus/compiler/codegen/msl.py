@@ -17,6 +17,7 @@ import math
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from enceladus.compiler import ir
 from enceladus.compiler import layout as L
@@ -160,18 +161,38 @@ class KernelArg:
 
 @dataclass
 class GeneratedKernel:
+    """The generated MSL for one kernel, plus what compiling and launching it needs.
+
+    Attributes:
+        language_version: The lowest MSL version the source needs, as (major, minor).
+        enable_logging: Whether the source logs with `os_log` (`tl.device_print`), so it
+            must compile with `MTLCompileOptions.enableLogging`.
+        asserts: One dict per `tl.device_assert` (`message`, `file`, `line`, `col`), in
+            the order of their indices in the error buffer.
+        assert_buffer_index: The `[[buffer(i)]]` index of the error buffer, or None when
+            the kernel has no asserts.
+        report: What codegen decided, for `kernel.explain`: layout conversions and
+            threadgroup memory requests.
+        plan: The `LayoutPlan` the source was generated from.
+        dot_backend: "mpp" if some `tl.dot` lowers to Metal 4 `matmul2d`, "simdgroup" if
+            every `tl.dot` uses `simdgroup_matrix`, and None for a kernel without `tl.dot`.
+        dot_fallbacks: Why each `tl.dot` that `dot_backend="mpp"` asked for uses
+            `simdgroup` instead.
+    """
+
     name: str
     source: str
     args: list[KernelArg]
     num_warps: int
     threadgroup_memory: int
     warnings: list[str] = field(default_factory=list)
-    # The MSL language version the kernel needs, or None for the default (3.2).
-    language_version: tuple[int, int] | None = None
-    # "mpp" if some `tl.dot` lowers to Metal 4 `matmul2d`, "simdgroup" if every `tl.dot`
-    # uses `simdgroup_matrix`, and None for a kernel without `tl.dot`.
+    language_version: tuple[int, int] = (3, 2)
+    enable_logging: bool = False
+    asserts: list[dict[str, Any]] = field(default_factory=list)
+    assert_buffer_index: int | None = None
+    report: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    plan: Any = None
     dot_backend: str | None = None
-    # Why each `tl.dot` that `dot_backend="mpp"` asked for uses `simdgroup` instead.
     dot_fallbacks: list[str] = field(default_factory=list)
 
 
@@ -198,11 +219,16 @@ class _Codegen:
         self.loc: Loc | None = None
         self.descs: dict[int, object] = {}  # descriptor value -> DescInfo
         self._frag_elem: dict[str, str] = {}  # simdgroup_matrix array -> element type
+        # Requirements that the source places on compilation; see GeneratedKernel.
+        self.language_version: tuple[int, int] = (3, 2)
+        self.enable_logging = False
+        self.asserts: list[dict] = []
+        self.report: dict[str, list[dict]] = {"conversions": [], "threadgroup": []}
+        self.cur_op: str | None = None
         from enceladus.compiler.codegen.dot import find_direct_operands, use_counts
 
         self.direct: set[int] = find_direct_operands(module, plan)
         self.uses: dict[int, int] = use_counts(module)
-        self.language_version: tuple[int, int] | None = None
         self.includes: list[str] = []  # headers after <metal_stdlib>, in request order
         self.mpp = None
         if module.attrs.get("dot_backend") == "mpp":
@@ -215,13 +241,12 @@ class _Codegen:
     def err(self, msg: str) -> CompilationError:
         return CompilationError(msg, self.loc)
 
-    def ctype(self, t: ir.Type) -> str:
-        return ctype(t, self.off_t)
-
     def require_language_version(self, version: tuple[int, int]) -> None:
         """Raises the kernel's MSL language version to at least `version`."""
-        if self.language_version is None or version > self.language_version:
-            self.language_version = version
+        self.language_version = max(self.language_version, tuple(version))
+
+    def ctype(self, t: ir.Type) -> str:
+        return ctype(t, self.off_t)
 
     def require_include(self, header: str) -> None:
         """Adds `#include header` after `<metal_stdlib>`, once."""
@@ -349,6 +374,7 @@ class _Codegen:
         return name, consts
 
     def use_tg(self, nbytes: int) -> None:
+        self.report["threadgroup"].append({"loc": self.loc, "op": self.cur_op, "bytes": nbytes})
         if nbytes > self.tg_bytes:
             self.tg_bytes = nbytes
             self.tg_loc = self.loc
@@ -570,6 +596,13 @@ class _Codegen:
         if t.uniform is not None:
             return Tile(lay, uniform=t.uniform, base=t.base, root=t.root)
         m = L.reg_map(t.layout, lay)
+        src_op = v.defining_op
+        rec = {
+            "loc": self.loc, "value_loc": src_op.loc if src_op is not None else None,
+            "value": v, "src": t.layout, "dst": lay,
+            "kind": "registers" if m is not None else "threadgroup", "bytes": 0,
+        }  # fmt: skip
+        self.report["conversions"].append(rec)
         name = self.declare(v.type, lay, "cv")
         if m is not None:
             for r, sr in enumerate(m):
@@ -588,7 +621,10 @@ class _Codegen:
             strides.append(acc)
             acc *= inner if d == len(shape) - 1 else shape[d]
         strides = tuple(reversed(strides))
+        rec["bytes"] = acc * eb
+        saved_op, self.cur_op = self.cur_op, "convert_layout"
         self.use_tg(acc * eb)
+        self.cur_op = saved_op
         src_flat, src_c = self.flat(t.layout, strides)
         dst_flat, dst_c = self.flat(lay, strides)
         own = self.owner(t.layout)
@@ -606,9 +642,12 @@ class _Codegen:
     # ---- ops ----
 
     def block(self, block: ir.Block) -> None:
+        saved = self.cur_op
         for op in block.ops:
             self.loc = op.loc or self.loc
+            self.cur_op = op.name
             self.op(op)
+        self.cur_op = saved
 
     def op(self, op: ir.Op) -> None:
         if self.mpp is not None and id(op) in self.mpp.handled:
@@ -905,6 +944,18 @@ class _Codegen:
 
     op_atomic_cas = op_atomic_rmw
 
+    # ---- debugging ----
+
+    def op_print(self, op: ir.Op) -> None:
+        from enceladus.compiler.codegen.debug import emit_print
+
+        emit_print(self, op)
+
+    def op_assert(self, op: ir.Op) -> None:
+        from enceladus.compiler.codegen.debug import emit_assert
+
+        emit_assert(self, op)
+
     def helper(self, key: str, code: str) -> None:
         """Adds a helper function that the kernel needs, once, after the prelude."""
         self.__dict__.setdefault("helpers", {}).setdefault(key, code)
@@ -932,6 +983,13 @@ class _Codegen:
             )
         kname = self.names.reserve(self.m.name)
         self.block(body)
+        assert_index = len(args) if self.asserts else None
+        if assert_index is not None and assert_index >= 31:
+            raise CompilationError(
+                "tl.device_assert needs one buffer slot for its error buffer, and this kernel "
+                "uses all 31 for its runtime arguments; pass fewer arguments or unset "
+                "ENCELADUS_DEBUG", func.loc,
+            )  # fmt: skip
         for a in args:
             a.written = a.name in self.written
         out = Emitter()
@@ -950,6 +1008,10 @@ class _Codegen:
                 params.append(f"device {q}{ct}* {a.name} [[buffer({a.index})]]")
             else:
                 params.append(f"constant {ct}& {a.name} [[buffer({a.index})]]")
+        if assert_index is not None:
+            from enceladus.compiler.codegen.debug import ASSERT_BUFFER
+
+            params.append(f"device atomic_uint* {ASSERT_BUFFER} [[buffer({assert_index})]]")
         params += [
             "uint3 pid [[threadgroup_position_in_grid]]",
             "uint3 npid [[threadgroups_per_grid]]",
@@ -969,11 +1031,17 @@ class _Codegen:
                 out.line(code)
             out.lines(self.e.text())
         out.line("}")
-        gen = GeneratedKernel(kname, out.text(), args, self.nw, self.tg_bytes, self.warnings,
-                              self.language_version)  # fmt: skip
+        gen = GeneratedKernel(
+            kname, out.text(), args, self.nw, self.tg_bytes, self.warnings,
+            language_version=self.language_version, enable_logging=self.enable_logging,
+            asserts=self.asserts, assert_buffer_index=assert_index, report=self.report,
+            plan=self.plan,
+        )  # fmt: skip
         if any(op.name == "dot" for op in self.m.walk()):
             gen.dot_backend = "mpp" if self.mpp is not None and self.mpp.loops else "simdgroup"
             gen.dot_fallbacks = list(self.mpp.fallbacks) if self.mpp is not None else []
+            if self.mpp is not None:
+                self.m.attrs["dot_backend"] = gen.dot_backend  # for `kernel.explain`
         return gen
 
 

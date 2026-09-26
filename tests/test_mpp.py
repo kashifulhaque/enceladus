@@ -145,7 +145,7 @@ def test_ineligible_kernels_fall_back_to_simdgroup(rng, caplog, monkeypatch, tmp
     assert any(reason in r.getMessage() and "simdgroup" in r.getMessage()
                for r in caplog.records)  # fmt: skip
     ck = _ineligible.warmup(a, b, c0, c0, m, n, k, **meta, dot_backend="mpp")
-    assert ck.dot_backend == "simdgroup" and ck.language_version is None
+    assert ck.dot_backend == "simdgroup" and ck.language_version == (3, 2)
     assert "matmul2d" not in ck.msl and "simdgroup_multiply_accumulate" in ck.msl
 
 

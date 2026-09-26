@@ -51,6 +51,8 @@ from enceladus.language.ops import (
     cdiv,
     clamp,
     cumsum,
+    device_assert,
+    device_print,
     dot,
     expand_dims,
     fma,
@@ -89,5 +91,5 @@ __all__ = [
     "static_range", "store", "sum", "tanh", "trans", "uint8", "uint16", "uint32", "uint64",
     "where", "zeros", "zeros_like",
     "associative_scan", "atomic_add", "atomic_and", "atomic_cas", "atomic_max", "atomic_min",
-    "atomic_or", "atomic_xchg", "atomic_xor", "cumsum",
+    "atomic_or", "atomic_xchg", "atomic_xor", "cumsum", "device_assert", "device_print",
 ]  # fmt: skip
