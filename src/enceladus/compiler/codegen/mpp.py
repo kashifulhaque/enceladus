@@ -15,7 +15,9 @@ A `tl.dot` is eligible when all of the following hold:
 - Both operands are tensor descriptor loads (optionally through `tl.trans`) inside the
   loop, used only by the `tl.dot`, from descriptors created outside the loop, at offsets
   that are provably non-negative.
-- `matmul2d` supports the operand and accumulator types.
+- `matmul2d` supports the operand and accumulator types, the tile is 16 to 128 in both
+  dimensions, and the kernel uses at most 8 SIMD groups: the range that gave correct
+  results on macOS 27.
 - After the loop, the result reaches exactly one `desc_store` through elementwise ops
   only. Their other operands must be computable per element: constants, scalars,
   `arange`, broadcasts, pointer-tile loads, and descriptor loads in the same block.
@@ -56,6 +58,7 @@ _MODE = "mpp::tensor_ops::matmul2d_descriptor::mode::"
 # tile over 1 or 2 SIMD groups returns wrong results, even in Apple's own
 # `op.run(A, B, C)` form, and an 8x8 tile doesn't compile.
 MIN_TILE, MAX_TILE = 16, 128
+MAX_WARPS = 8  # the largest execution_simdgroups count that was validated
 
 
 class _Ineligible(Exception):
@@ -112,7 +115,7 @@ def plan_mpp(module: ir.Module) -> MppPlan:
         if op.name != "dot":
             continue
         try:
-            ml, skip = _analyze(op, users)
+            ml, skip = _analyze(op, users, int(module.attrs.get("num_warps", 4)))
         except _Ineligible as e:
             log.debug("enceladus: %s: the tl.dot at %s uses the simdgroup backend: %s",
                       module.name, op.loc, e)  # fmt: skip
@@ -300,7 +303,7 @@ def _dynamic_k(loop: ir.Op, dot: ir.Op, a: _Operand, b: _Operand, body: ir.Block
     return True
 
 
-def _analyze(dot: ir.Op, users) -> tuple[MppLoop, set[int]]:
+def _analyze(dot: ir.Op, users, num_warps: int) -> tuple[MppLoop, set[int]]:
     body = dot.parent
     region = body.parent if body is not None else None
     loop = region.parent if region is not None else None
@@ -321,6 +324,9 @@ def _analyze(dot: ir.Op, users) -> tuple[MppLoop, set[int]]:
     if not (MIN_TILE <= bm <= MAX_TILE and MIN_TILE <= bn <= MAX_TILE):
         raise _Ineligible(f"the {bm}x{bn} tile is outside the {MIN_TILE}-{MAX_TILE} range "
                           "that Enceladus validates for matmul2d")  # fmt: skip
+    if num_warps > MAX_WARPS:
+        raise _Ineligible(f"num_warps={num_warps} is more than the {MAX_WARPS} SIMD groups that "
+                          "Enceladus validates for matmul2d")  # fmt: skip
     in_t, acc_t = a.type.elem.name, dot.result.type.elem.name
     if (in_t, acc_t) not in TYPES:
         raise _Ineligible(f"matmul2d doesn't support {in_t} operands with a {acc_t} accumulator")

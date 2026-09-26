@@ -1000,3 +1000,168 @@ out of the in-memory specialization key.
   elementwise ops over them) are rematerialized at each use and aren't listed.
 - The `// file.py:LINE` source comments that the plan's M2 section schedules for
   `ENCELADUS_DEBUG=1` aren't emitted.
+
+## M8: Metal 4 matmul2d backend
+
+### What was built
+
+- **`dot_backend` option.** `kernel[grid](..., dot_backend=...)`, `warmup`, `explain`,
+  and `enceladus.Config(dot_backend=...)` take `"auto"`, `"simdgroup"`, or `"mpp"`. The
+  option is part of the in-process specialization key, and the resolved backend is part
+  of the disk-cache key. `runtime/dot_backend.py` resolves it: `"auto"` picks `"mpp"` on
+  Apple10 and later GPUs and `"simdgroup"` on earlier ones. `"mpp"` needs
+  `supportsFamily(Metal4)`, macOS 26 or later, and a probe kernel that compiles and
+  returns the right 16 x 16 product. The probe runs once per process under the lock of
+  the `simdgroup_matrix` layout probe, because both launch on the shared stream from
+  autotuning's compile threads. On a device that fails the probe, `"mpp"` falls back to
+  `"simdgroup"` with a debug log.
+- **Eligibility** (`compiler/codegen/mpp.py`, `plan_mpp`). A `tl.dot` lowers to
+  `matmul2d` when all of the following hold. Otherwise it falls back to `simdgroup`, and
+  the `enceladus` logger records the reason at debug level, such as "the accumulator
+  doesn't start from zeros" or "the tl.dot result feeds `reduce`, which isn't an
+  elementwise op in the loop's block".
+  - It sits directly in a `for` loop, and its accumulator is loop-carried, starts from
+    `tl.zeros`, and is used only as `acc = tl.dot(a, b, acc)`.
+  - Both operands are descriptor loads, optionally through `tl.trans`, used only by the
+    dot, from descriptors created outside the loop, at offsets that a small analysis
+    proves non-negative: program IDs, non-negative constants, loop counters with a
+    non-negative start and a positive step, and sums and products of those.
+  - The operand and accumulator types are a `matmul2d` combination: FP16 to FP32 or
+    FP16, FP32 to FP32, or BF16 to FP32 or BF16.
+  - The tile is 16 to 128 in both dimensions, and the kernel uses at most 8 SIMD groups
+    (see the known gaps).
+  - After the loop, the result reaches exactly one `desc_store` through elementwise ops in
+    the loop's block. Their other operands must be computable per element: constants,
+    scalars, `arange`, `expand_dims`, `broadcast`, `trans`, elementwise ops, pointer-tile
+    loads, and descriptor loads in the same block, with no memory write between those
+    loads and the store.
+- **Codegen.** An eligible kernel gets `#include <metal_tensor>` and the MPP header, and
+  it requests MSL 4.0 through M9's `require_language_version`, which takes the maximum
+  over features, so `tl.device_print` in an MPP kernel compiles with 4.0 and logging.
+  Codegen builds one `tensor_inline` per operand from the descriptor's pointer, with
+  extents innermost first (`(K, M)` for a row-major M x K operand) and the descriptor's
+  row stride. Transposed operands set the descriptor's `transpose_left` or
+  `transpose_right` flag. The op is
+  `matmul2d<matmul2d_descriptor(BM, BN, K, ...), execution_simdgroups<num_warps>>`, and
+  its destination is a cooperative tensor of the accumulator type.
+  - A loop `for k in range(0, K, BK)` whose body is only the dot and scalar offset math,
+    where `K` is the K extent of both descriptors, becomes one `run` over the whole K
+    range with `tensor_ops::dynamic_length_v<int>` and `mode::multiply`.
+  - Any other eligible loop, such as one that carries another value, keeps its structure
+    and runs one `mode::multiply_accumulate` step of BK per iteration into a zeroed
+    cooperative tensor.
+  - Each `run` sits behind a threadgroup-uniform test that its slices start inside their
+    tensors; otherwise the tile stays zero. `matmul2d` bounds-checks the rest.
+  - The epilogue walks `get_capacity()` elements, skips those that fail
+    `is_valid_element(i)`, gets (column, row) from `get_multidimensional_index(i)`,
+    computes each elementwise op for that element as MSL locals, and stores with the
+    descriptor's bounds check. Epilogue ops that nothing else uses emit no other code, so
+    the fused example's bias load and its layout exchange disappear.
+  - Generated code refers to library names only through `metal::` and `mpp::`
+    qualifiers, which a user variable can't hide, and every local comes from `NameGen`,
+    so `RESERVED` needs no new names. Kernels without an MPP dot keep byte-identical MSL.
+- **Metadata for `explain`.** `GeneratedKernel` and `CompiledKernel` carry `dot_backend`
+  ("mpp", "simdgroup", or None) and `dot_fallbacks` (the reasons), and both persist in
+  `meta.json`. `build_module` sets the `dot_backend` module attribute to the resolved
+  backend, codegen resets it to "simdgroup" when no dot qualifies, and `kernel.explain`
+  lists the fallback reasons.
+- **PyTorch path.** `torch.mps.compile_shader` compiles with MSL 4.0, and MPP kernels run
+  through it unchanged. A kernel that needs a later version takes the synchronized native
+  path instead.
+- **Autotuning.** `matmul_configs` adds three `dot_backend="mpp"` configs (64 x 64,
+  64 x 32, and 32 x 32, with 4 SIMD groups) for every dtype. On a device without
+  `matmul2d`, they compile with `simdgroup`. Autotuning already compiles candidates in
+  parallel. A cold MPP compile took 202 ms, and the same kernel in a second process took
+  6.9 ms from Enceladus's and Metal's disk caches.
+- `examples/04_matmul.py` (`matmul_desc`) and `examples/07_matmul_fused.py` take a
+  `dot_backend` argument. `benchmarks/bench_matmul.py` times the simdgroup, MPP, and
+  tuned kernels and both fused variants in interleaved rounds.
+
+### Benchmarks
+
+Preliminary: another agent shared the GPU, and MLX's own FP16 numbers varied from 4.4 to
+5.8 TFLOPS at 4096³ between runs. The following table comes from one process that
+alternated the three kernels for four rounds of 10 runs, with the 64 x 64 x 32
+configuration and 4 SIMD groups. Values are TFLOPS as the minimum (median) time;
+Enceladus uses GPU timestamps and MLX the wall clock. Each cell lists two runs.
+
+| Shape, dtype | simdgroup | mpp | MLX |
+|---|---|---|---|
+| 4096³ FP16 | 5.64 (5.50), 5.61 (5.38) | 5.91 (5.74), 5.84 (5.69) | 5.81 (5.55), 5.72 (5.58) |
+| 4096³ FP32 | 4.88 (4.75), 4.96 (4.79) | 4.89 (3.88), 4.49 (3.85) | 4.94 (4.86), 5.00 (4.89) |
+| 2000³ FP16 | 4.66 (4.44), 4.82 (4.43) | 5.76 (5.26), 5.64 (5.31) | 5.38 (5.09), 5.31 (5.02) |
+| 2000³ FP32 | 4.37 (4.05), 4.37 (4.09) | 5.07 (4.78), 5.07 (4.72) | 4.77 (4.50), 4.79 (4.55) |
+
+- **The FP16 4096³ target (5.9 TFLOPS) is at the edge.** Across five interleaved runs, the
+  MPP minimum measured 5.84-5.97 TFLOPS (3 of 5 at 5.9 or more) and the median
+  5.69-5.89. In the same process, a kernel in the form of the research's
+  `matmul_mpp.metal` measured 5.99 (5.91) against 5.97 (5.89) for the generated one, so
+  codegen costs nothing measurable. The research's 6.19 didn't reproduce in this session.
+- MPP beats `simdgroup` by 3-6% in FP16 at 4096³ and by 15-25% at 2000³. The tuned
+  kernels reach 3.7-4.3 TFLOPS at 513³ (32 x 32 MPP) against 1.7-1.9 for the fixed
+  simdgroup configuration and 2.3-2.5 for the tuned one in M5.
+- **FP32 `matmul2d` is bimodal at 4096³.** Its minimum matches `simdgroup`, but its median
+  runs 20% slower, and a sweep of tile shapes and manual K steps (16, 32, and 64) found
+  nothing faster than `simdgroup` there. Tuning picks `simdgroup` for FP32 at 4096³ and
+  MPP at 2000³ and 513³.
+- The fused bias-plus-GELU epilogue on MPP runs within 1% of plain MPP matmul (6.00
+  against 5.97 TFLOPS minimum in one interleaved run).
+
+### Tests
+
+The suite runs 676 tests, with 18 skipped, in about 6.3 s. `tests/test_mpp.py` adds 23
+cases and skips when the device fails the probe:
+
+- A differential test of the matmul and fused-epilogue examples on `dot_backend="mpp"`
+  over an aligned and a ragged shape, FP16 and FP32, and both modes. It asserts that the
+  MSL contains `matmul2d` and no `simdgroup_multiply_accumulate`, and that the kernel
+  needs MSL 4.0.
+- Transposed A, transposed B, and a loop that must stay a loop (manual K steps), with a
+  ragged K and an epilogue that reads a descriptor and a masked pointer tile.
+- A fallback test: an accumulator that starts from a loaded tile, and a result that
+  feeds `tl.sum`. Both give correct results, log the reason, and generate
+  `simdgroup_matrix` code without `matmul2d`.
+- A disk-cache reload that must restore MSL 4.0, and a launch on PyTorch MPS tensors that
+  must take the `compile_shader` path.
+
+Mutations of the slice order, the transpose flag, the epilogue's row and column, the
+broadcast index map, the multiply-accumulate mode, the zero-start check, and the cached
+language version each fail at least one test.
+
+### Deviations from the plan
+
+- **Explicit `"mpp"` never raises.** An ineligible kernel or an unsupported device falls
+  back to `simdgroup` with a debug log, as `"auto"` does.
+- **Tiles are limited to 16-128 and 8 SIMD groups.** The plan sets no limit. See the
+  known gaps.
+- **Epilogue operands are recomputed per element.** Operands such as the bias load are
+  computed for each cooperative-tensor element from its coordinates, instead of being
+  loaded into a second cooperative tensor with `load()`, which needs a tensor view of the
+  operand. Loads that only the epilogue uses emit no other code.
+- **FP32 MPP configs stay in `matmul_configs`.** They lose at 4096³ but win at 2000³ and
+  513³, and tuning measures each shape.
+- **Runtime files changed.** `jit.py`, `compile.py`, `launcher.py`, and `autotuner.py`
+  gained the `dot_backend` plumbing, and `compiler/explain.py` gained one line per
+  fallback reason.
+
+### Known gaps
+
+- **`matmul2d` returns wrong results for some large tiles.** On macOS 27, a tile with a
+  256-row or 256-column dimension over 1 or 2 SIMD groups (256 x 8 over 1, 8 x 256 over
+  1, 32 x 256 over 2) gave wrong results, including in the research's `op.run(A, B, C)`
+  form, and an 8 x 8 tile didn't compile. Eligibility therefore requires 16-128 in both
+  dimensions and at most 8 SIMD groups. A sweep of every power-of-two tile from 16 to 128
+  over 1-8 SIMD groups, in FP16 and FP32, on both the whole-K and manual-K paths, gave
+  correct results. 16 and 32 SIMD groups weren't tested.
+- The 5.9 TFLOPS target is met in some runs only (see the benchmarks). The Apple10
+  default (`"auto"` picks `"mpp"`) is untested, because no M5 device was available.
+- The layout pass still assigns `simdgroup_matrix` layouts, and checks the SIMD-group
+  split, for a dot that lowers to MPP. So an MPP-eligible tile that `simdgroup` can't
+  split (for example 16 x 16 over 8 SIMD groups) raises the `simdgroup` error, and
+  `kernel.explain` lists `simdgroup_matrix` layouts for those values.
+- Integer `tl.dot` still raises in the frontend; `matmul2d`'s `int8` combinations aren't
+  wired up.
+- An epilogue that needs anything other than elementwise ops, such as a row reduction for
+  a fused softmax, falls back to `simdgroup`. Cooperative-tensor reductions
+  (`reduce_rows`) and `get_left_input_cooperative_tensor` for attention aren't used.
+- `relaxed_precision` stays off; it measured no difference in the research.
