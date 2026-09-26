@@ -4,11 +4,17 @@ Each SIMD group owns an SM x SN strip of the accumulator, made of TM x TN 8x8
 fragments (`layout.simd_acc`). For each K step of 8, it loads TM fragments of A and TN
 fragments of B, then runs TM x TN `simdgroup_multiply_accumulate` calls.
 
-Operands come from one of two sources:
+Operands come from one of three sources:
 
 - *Direct*: a `desc_load` (optionally through `trans`) used only by the `dot`, from a
   descriptor whose innermost stride is 1. Fragments load straight from device memory;
   no threadgroup memory, no barriers. This matches `best_matmul.metal`.
+- *Register* (left operand only): a tile already in the dot's register operand layout
+  (`layout.dot_operand_a`), or one that a register remap puts there. Its registers become
+  the A fragments through `thread_elements()`. With WN = 1, an accumulator is in that
+  layout, so `tl.dot(p.to(tl.float16), v, acc)` after `p = f(tl.dot(q, k))` needs no
+  data movement. A load that feeds only the left operand of dots in a nested loop is
+  loaded once in this layout and stays in registers (see `passes.layouts`).
 - *Staged*: any other tile. It's written to threadgroup memory with rows padded by 16
   bytes, then fragments load from there.
 
@@ -24,8 +30,8 @@ from typing import TYPE_CHECKING
 
 from enceladus.compiler import ir
 from enceladus.compiler import layout as L
-from enceladus.compiler.codegen.msl import BARRIER, CTYPES, Tile, _add
-from enceladus.compiler.passes.layouts import ANCHORED
+from enceladus.compiler.codegen.msl import BARRIER, CTYPES, Tile, _add, is_float
+from enceladus.compiler.passes.layouts import ANCHORED, LayoutPlan
 
 if TYPE_CHECKING:
     from enceladus.compiler.codegen.msl import _Codegen
@@ -49,23 +55,51 @@ def use_counts(module: ir.Module) -> dict[int, int]:
     return uses
 
 
-def find_direct_operands(module: ir.Module) -> set[int]:
-    """Returns ids of `desc_load` and `trans` values that dots read from device memory."""
+def find_direct_operands(module: ir.Module, plan: LayoutPlan) -> set[int]:
+    """Returns ids of `desc_load` and `trans` values that dots read from device memory.
+
+    A left operand loaded outside the dot's loop stays in registers instead (see
+    `passes.layouts.hoisted_a_operands`), and a right operand that `stages_b` picks goes
+    through threadgroup memory, so neither is direct.
+    """
     uses = use_counts(module)
     out: set[int] = set()
+
+    def direct(v: ir.Value) -> bool:
+        src = v.defining_op
+        if src is not None and src.name == "trans" and uses.get(id(v)) == 1:
+            inner = src.operands[0].defining_op
+            if inner is not None and inner.name == "desc_load" and \
+                    uses.get(id(src.operands[0])) == 1:  # fmt: skip
+                out.update((id(v), id(src.operands[0])))
+                return True
+        elif src is not None and src.name == "desc_load" and uses.get(id(v)) == 1:
+            out.add(id(v))
+            return True
+        return False
+
     for op in module.walk():
         if op.name != "dot":
             continue
-        for v in op.operands[:2]:
-            src = v.defining_op
-            if src is not None and src.name == "trans" and uses.get(id(v)) == 1:
-                inner = src.operands[0].defining_op
-                if inner is not None and inner.name == "desc_load" and \
-                        uses.get(id(src.operands[0])) == 1:  # fmt: skip
-                    out.update((id(v), id(src.operands[0])))
-            elif src is not None and src.name == "desc_load" and uses.get(id(v)) == 1:
-                out.add(id(v))
+        a, b = op.operands[:2]
+        a_direct = id(a) not in plan.hoisted and direct(a)
+        if not stages_b(plan, op, a_direct):
+            direct(b)
     return out
+
+
+def stages_b(plan: LayoutPlan, dot: ir.Op, a_direct: bool) -> bool:
+    """Returns whether `dot` stages a right operand that it could read from device memory.
+
+    When A comes from registers or threadgroup memory and several SIMD-group rows need the
+    same B fragments (WM > 1), loading B once per threadgroup into threadgroup memory beats
+    loading it from device memory in every SIMD group. In flash attention, staging K and V
+    measured 4.1 against 4.9 TFLOPS at head dimension 128 and 5.1 against 5.3 at 64. A
+    matmul whose operands both load directly keeps direct loads, which measured faster in
+    FP16 (M4).
+    """
+    g = L.frag_grid(plan.layout_of(dot.result))
+    return not a_direct and g is not None and g[2] > 1
 
 
 @dataclass
@@ -128,13 +162,16 @@ def emit_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
         cg._assign(out, acc_in, lay.num_regs)
 
     da, db = _operand(cg, a), _operand(cg, b)
-    # Staged operands go to threadgroup memory: A as BM x BK, B as BK x BN.
+    ra = _register_a(cg, a, bm, bk, wm, wn, in_t) if da is None else None
+    # Staged operands go to threadgroup memory: A as BM x BK, B as BK x BN. Staging a
+    # transposed operand untransposed and loading its fragments transposed measured 2-3%
+    # slower in flash attention, so every operand stages in its logical orientation.
     eb = a.type.elem.dtype.itemsize
     pad = 16 // eb
     lda, ldb = bk + pad, bn + pad
     staged = []
     off = 0
-    if da is None:
+    if da is None and ra is None:
         staged.append((a, off, lda))
         off += -(-bm * lda * eb // 16) * 16
     if db is None:
@@ -156,30 +193,61 @@ def emit_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
                     cg.e.line(f"{name}[{_add(flat, consts[r])}] = {in_t}({t.get(r)});")
         cg.e.line(BARRIER)
 
-    def a_src(i: str, checked: bool) -> str:
-        """Returns the statement that loads A fragment i at K offset kk."""
+    def a_src(i: str, checked: bool, kc: int | None) -> str:
+        """Returns the statement that loads A fragment i at K offset kk (fragment kc)."""
+        if ra is not None:
+            return f"fa[{i}] = {ra}[{i}][{kc}];"
         if da is None:
             name, ld = tg_names[id(a)]
             return f"simdgroup_load(fa[{i}], {name} + ({_add(sr, i + ' * 8')}) * {ld} + kk, {ld});"
         return _direct_load(da, f"fa[{i}]", _add(sr, f"{i} * 8"), "kk", checked, fm, fn)
 
-    def b_src(j: str, checked: bool) -> str:
+    def b_src(j: str, checked: bool, frag: str) -> str:
+        """Returns the statement that loads B fragment j at K offset kk into `frag`."""
         if db is None:
             name, ld = tg_names[id(b)]
-            return f"simdgroup_load(fb[{j}], {name} + kk * {ld} + {_add(sc, j + ' * 8')}, {ld});"
-        return _direct_load(db, f"fb[{j}]", "kk", _add(sc, f"{j} * 8"), checked, fm, fn)
+            return f"simdgroup_load({frag}, {name} + kk * {ld} + {_add(sc, j + ' * 8')}, {ld});"
+        return _direct_load(db, frag, "kk", _add(sc, f"{j} * 8"), checked, fm, fn)
+
+    # Loading every B fragment of a K step before the MMAs keeps TN fragments live. When
+    # they and the accumulator exceed 48 registers per thread, load and use one fragment at
+    # a time: FP32 attention at head dimension 128 (TN = 16) spilled and ran at 0.35
+    # TFLOPS the first way and 4.3 this way. Below the threshold, which includes every
+    # matmul configuration, loading all of them first measured the same or faster.
+    out_eb, in_eb = op.result.type.elem.dtype.itemsize, a.type.elem.dtype.itemsize
+    one_b = tm * tn * 2 * out_eb // 4 + tn * 2 * in_eb // 4 > 48
+
+    def mma_step(checked: bool, kc: int | None) -> None:
+        if one_b:
+            cg.e.line(f"simdgroup_matrix<{in_t}, 8, 8> fa[{tm}], fb;")
+            cg.e.line(f"for (int i = 0; i < {tm}; ++i) {a_src('i', checked, kc)}")
+            with cg.e.block(f"for (int j = 0; j < {tn}; ++j)"):
+                cg.e.line(b_src("j", checked, "fb"))
+                cg.e.line(f"for (int i = 0; i < {tm}; ++i) simdgroup_multiply_accumulate("
+                          f"{d}[i][j], fa[i], fb, {d}[i][j]);")  # fmt: skip
+            return
+        cg.e.line(f"simdgroup_matrix<{in_t}, 8, 8> fa[{tm}], fb[{tn}];")
+        cg.e.line(f"for (int i = 0; i < {tm}; ++i) {a_src('i', checked, kc)}")
+        cg.e.line(f"for (int j = 0; j < {tn}; ++j) {b_src('j', checked, 'fb[j]')}")
+        cg.e.line(f"for (int i = 0; i < {tm}; ++i)")
+        cg.e.line(f"  for (int j = 0; j < {tn}; ++j) simdgroup_multiply_accumulate("
+                  f"{d}[i][j], fa[i], fb[j], {d}[i][j]);")  # fmt: skip
 
     def mma_loop(checked: bool) -> None:
+        if ra is not None:
+            # Register fragments stay in registers only under constant indices, and Metal
+            # doesn't always unroll a 16-step loop: indexing them with `kk / 8` spilled
+            # them to the stack and halved attention throughput at head dimension 128.
+            for kc in range(bk // 8):
+                with cg.e.block(""):
+                    cg.e.line(f"const int kk = {kc * 8};")
+                    mma_step(checked, kc)
+            return
         # Small loops, as in the reference kernel: Metal unrolls them itself. Fully
         # unrolled straight-line loads and MMAs measured 12-15% slower.
         cg.e.line("#pragma unroll")
         with cg.e.block(f"for (int kk = 0; kk < {bk}; kk += 8)"):
-            cg.e.line(f"simdgroup_matrix<{in_t}, 8, 8> fa[{tm}], fb[{tn}];")
-            cg.e.line(f"for (int i = 0; i < {tm}; ++i) {a_src('i', checked)}")
-            cg.e.line(f"for (int j = 0; j < {tn}; ++j) {b_src('j', checked)}")
-            cg.e.line(f"for (int i = 0; i < {tm}; ++i)")
-            cg.e.line(f"  for (int j = 0; j < {tn}; ++j) simdgroup_multiply_accumulate("
-                      f"{d}[i][j], fa[i], fb[j], {d}[i][j]);")  # fmt: skip
+            mma_step(checked, None)
 
     conds = [x for x in (_in_bounds(da, bm, bk), _in_bounds(db, bk, bn)) if x]
     if not conds:
@@ -190,6 +258,31 @@ def emit_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
         with cg.e.block("else"):
             mma_loop(True)
     return out
+
+
+def _register_a(cg: _Codegen, a: ir.Value, bm: int, bk: int, wm: int, wn: int,
+                in_t: str) -> str | None:  # fmt: skip
+    """Returns a `simdgroup_matrix` array [TM][BK / 8] that holds A, or None to stage A.
+
+    A qualifies when it's cheap (rematerialized in the operand layout) or when its layout
+    reaches the operand layout by a register remap. Anything else would need a
+    threadgroup exchange, which costs as much as staging, so it's staged.
+    """
+    lay = L.dot_operand_a(bm, bk, wm, wn)
+    nat = cg.plan.natural(a)
+    if nat is not None and nat != lay and L.reg_map(nat, lay) is None:
+        return None
+    t = cg.mat(a, lay)
+    tm, kc = bm // wm // 8, bk // 8
+    if t.frag == (tm, kc) and cg._frag_elem.get(t.name) == in_t:
+        return t.name
+    name = cg.fresh("ra")
+    cg.e.line(f"simdgroup_matrix<{in_t}, 8, 8> {name}[{tm}][{kc}];")
+    lkc = kc.bit_length() - 1
+    for r in range(lay.num_regs):
+        i, j, e = r >> (1 + lkc), (r >> 1) & (kc - 1), r & 1
+        cg.e.line(f"{name}[{i}][{j}].thread_elements()[{e}] = {in_t}({t.get(r)});")
+    return name
 
 
 def _can_clobber(cg: _Codegen, c: ir.Value, dot: ir.Op) -> bool:
@@ -268,12 +361,40 @@ def _block_coords(cg: _Codegen, desc: DescInfo, offsets: list[str], lay: L.BitLa
 def emit_desc_load(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
     desc = cg.descs[id(op.operands[0])]
     offsets = [cg.s(v) for v in op.operands[1:]]
+    if L.frag_grid(lay) is not None and is_float(desc.elem):
+        return _desc_load_frags(cg, desc, offsets, lay, op.result.name_hint)
     arr = cg.declare(op.result.type, lay, op.result.name_hint)
     zero = f"{CTYPES[desc.elem.name]}(0)"
     for r in range(lay.num_regs):
         _, cond, elem = _block_coords(cg, desc, offsets, lay, r)
         cg.e.line(f"{arr}[{r}] = ({cond}) ? {desc.base}[{elem}] : {zero};")
     return Tile(lay, arr)
+
+
+def _desc_load_frags(cg: _Codegen, desc: DescInfo, offsets: list[str], lay: L.BitLayout,
+                     hint: str | None) -> Tile:  # fmt: skip
+    """Loads a descriptor block in an accumulator layout as `simdgroup_matrix` fragments.
+
+    Each fragment that fits in the tensor loads with one `simdgroup_load`; fragments that
+    straddle an edge load per lane and zero-fill.
+    """
+    tm, tn, wm, wn = L.frag_grid(lay)
+    bm, bn = lay.shape
+    sm, sn = bm // wm, bn // wn
+    lwm = wm.bit_length() - 1
+    sr = cg.pro(f"sr|{wm}|{sm}", "sr", "int", f"int(warp & {wm - 1}u) * {sm}") if wm > 1 else "0"
+    sc = cg.pro(f"sc|{lwm}|{sn}", "sc", "int", f"int(warp >> {lwm}) * {sn}") if wn > 1 else "0"
+    fm, fn = _frag_consts(cg)
+    ct = CTYPES[desc.elem.name]
+    name = cg.fresh(hint or "fr")
+    cg._frag_elem[name] = ct
+    cg.e.line(f"simdgroup_matrix<{ct}, 8, 8> {name}[{tm}][{tn}];")
+    d = _Direct(desc, offsets, False)
+    for i in range(tm):
+        for j in range(tn):
+            cg.e.line(_direct_load(d, f"{name}[{i}][{j}]", _add(sr, i * 8), _add(sc, j * 8),
+                                   True, fm, fn))  # fmt: skip
+    return Tile(lay, name, frag=(tm, tn))
 
 
 def emit_desc_store(cg: _Codegen, op: ir.Op) -> None:

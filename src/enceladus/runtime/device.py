@@ -100,16 +100,32 @@ kernel void probe(device const float* m [[buffer(0)]], device float* out [[buffe
 }
 """
 _simd_layout_ok: bool | None = None
+_simd_layout_lock = threading.Lock()
 
 
 def check_simdgroup_layout() -> None:
     """Verifies the `simdgroup_matrix` lane layout that `tl.dot` codegen assumes.
 
-    Metal leaves the layout unspecified. This runs once per process on first use.
+    Metal leaves the layout unspecified. This runs once per process on first use. The
+    autotuner compiles configurations from several threads, so the probe runs under a lock:
+    concurrent probes that launch and synchronize on the shared stream crash the process.
 
     Raises:
         enceladus.CompilationError: The device uses a different layout.
     """
+    with _simd_layout_lock:
+        _probe_simdgroup_layout()
+    if not _simd_layout_ok:
+        from enceladus.compiler.errors import CompilationError
+
+        raise CompilationError(
+            "this GPU's simdgroup_matrix lane layout differs from the one Enceladus's tl.dot "
+            "lowering assumes, so tl.dot can't run here. Please report the device name: "
+            f"{get_device().caps.name}"
+        )
+
+
+def _probe_simdgroup_layout() -> None:
     global _simd_layout_ok
     if _simd_layout_ok is None:
         import numpy as np
@@ -126,11 +142,3 @@ def check_simdgroup_layout() -> None:
         col = ((lane >> 1) & 4) + ((lane << 1) & 2)
         expect = np.stack([row * 8 + col, row * 8 + col + 1], axis=1).reshape(-1)
         _simd_layout_ok = bool(np.array_equal(out.numpy(), expect))
-    if not _simd_layout_ok:
-        from enceladus.compiler.errors import CompilationError
-
-        raise CompilationError(
-            "this GPU's simdgroup_matrix lane layout differs from the one Enceladus's tl.dot "
-            "lowering assumes, so tl.dot can't run here. Please report the device name: "
-            f"{get_device().caps.name}"
-        )

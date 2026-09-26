@@ -68,3 +68,47 @@ def matmul_configs(dtype: Any = "float16") -> list[Config]:
                          f"{dtype!r}")  # fmt: skip
     return [Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=nw, dot_warps=dw)
             for bm, bn, bk, nw, dw in shapes]  # fmt: skip
+
+
+# (BLOCK_M, BLOCK_N, num_warps) for flash attention. Every SIMD group owns whole query
+# rows (dot_warps=(num_warps, 1)), so the softmax row reductions stay inside SIMD groups
+# and the scores feed the second `tl.dot` from registers. The first two are MLX's
+# `steel_attention` shapes: 32 query rows over 4 SIMD groups, 16 or 32 keys per step.
+_ATTENTION = [
+    (32, 32, 4),  # 8 query rows per SIMD group
+    (32, 16, 4),
+    (64, 32, 8),
+    (64, 16, 8),
+]
+# 16 query rows per SIMD group. At head dimension 128, the accumulator, the scores, and
+# the query fragments no longer fit in registers, and these measured 10-25x slower.
+_ATTENTION_SMALL_HEAD = [
+    (64, 32, 4),
+    (64, 16, 4),
+    (128, 32, 8),
+]
+
+
+def attention_configs(dtype: Any = "float16", head_dim: int = 64) -> list[Config]:
+    """Returns the flash attention configurations to autotune over.
+
+    The configurations set `BLOCK_M`, `BLOCK_N`, `num_warps`, and `dot_warps` for
+    `examples/08_flash_attention.py`.
+
+    Args:
+        dtype: The query, key, and value dtype: float32, float16, or bfloat16.
+        head_dim: The head dimension: 16, 32, 64, or 128.
+
+    Raises:
+        ValueError: `dtype` or `head_dim` isn't supported.
+    """
+    name = _dtype_name(dtype)
+    if name not in _FP32_NAMES + _HALF_NAMES:
+        raise ValueError(f"attention_configs supports float32, float16, and bfloat16, but got "
+                         f"{dtype!r}")  # fmt: skip
+    if head_dim not in (16, 32, 64, 128):
+        raise ValueError(f"attention_configs supports head dimensions 16, 32, 64, and 128, "
+                         f"but got {head_dim}")  # fmt: skip
+    shapes = _ATTENTION + (_ATTENTION_SMALL_HEAD if head_dim <= 64 else [])
+    return [Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_warps=nw, dot_warps=(nw, 1))
+            for bm, bn, nw in shapes]  # fmt: skip

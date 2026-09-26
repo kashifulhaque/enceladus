@@ -546,3 +546,143 @@ skipped, in about 2 s. The tests cover the following:
 - A scan whose axis bits interleave SIMD-group and register bits exchanges through
   threadgroup memory once per run, with two barriers each. A 1D blocked tile of 1,024
   elements takes two exchanges.
+
+## M7: Flash attention
+
+### What was built
+
+- `examples/08_flash_attention.py`: a flash attention forward kernel in the style of
+  Triton's fused-attention tutorial. One program handles `BLOCK_M` query rows of one
+  (batch, head) pair and loops over key blocks with an online softmax (running maximum and
+  sum, `exp2` with the scale folded in) and an FP32 accumulator. It takes a softmax scale
+  and a `CAUSAL` constexpr, and handles sequence lengths that aren't block multiples. The
+  host wrappers are `attention` (fixed configuration) and `attention_tuned` (autotuned).
+- `enceladus.configs.attention_configs(dtype, head_dim)`: MLX's `steel_attention` shapes
+  (32 query rows over 4 SIMD groups, 16 or 32 keys per step), plus 64 rows over 8 SIMD
+  groups, plus 16-row strips for head dimensions of 64 or less. Every configuration sets
+  `dot_warps=(num_warps, 1)`.
+- `tl.dot` register operands (`codegen/dot.py`): a left operand in the dot's register
+  operand layout becomes the A fragments through `thread_elements()`.
+  `layout.dot_operand_a(BM, BK, WM, WN)` defines that layout; with WN = 1 it equals
+  `simd_acc(BM, BK, WM, 1)`, so `tl.dot(p.to(tl.float16), v, acc)` after
+  `p = exp2(tl.dot(q, tl.trans(k)) - m[:, None])` moves no data. A cheap operand is
+  rematerialized in that layout, and an operand that a register remap reaches is remapped.
+  Anything else, including an accumulator from a WN > 1 grid, is staged through
+  threadgroup memory as before.
+- Hoisted left operands (`passes/layouts.py`): a `load` or `desc_load` whose only uses are
+  left operands of dots in a nested loop gets the register operand layout, so the query
+  tile loads once, as `simdgroup_matrix` fragments, and stays in registers. The share per
+  thread must fit in 32 registers (`MAX_HOISTED_REGS`); larger operands keep the direct
+  path. The K loop of a dot with a register operand unrolls in the generated code, because
+  a register array indexed by `kk / 8` inside a loop that Metal didn't unroll spilled to
+  the stack and halved throughput at head dimension 128.
+- Staged right operands for shared B (`dot.stages_b`): when A comes from registers or
+  threadgroup memory and WM > 1, the dot stages B through threadgroup memory even when a
+  direct load is possible. All SIMD-group rows read the same K and V blocks, and one
+  cooperative load per threadgroup beats a device load per SIMD group. A matmul whose
+  operands both load directly keeps its direct path.
+- One B fragment at a time: when the accumulator and the TN live B fragments of a K step
+  exceed 48 registers per thread, the MMA step loads and uses one B fragment at a time.
+  Only FP32 dots with TN = 16 and TM = 1, or larger strips, cross the threshold; no matmul
+  configuration in `matmul_configs` does.
+- The accumulator row reduction needed no change: with WN = 1, `tl.max(s, 1)` and
+  `tl.sum(p, 1)` reduce in registers and then shuffle over lane bits 0 and 3, with no
+  threadgroup memory. `m[:, None]` broadcasts back into the accumulator layout by register
+  copies.
+- `benchmarks/bench_attention.py`, hooked into `benchmarks/run_all.py`.
+- A runtime fix, found while tuning: see the first known gap.
+
+### Benchmarks
+
+The following table comes from `benchmarks/bench_attention.py` with FP16 inputs of shape
+(1, 16, N, D) and the autotuned configuration. Enceladus uses GPU timestamps; MLX
+(`mx.fast.scaled_dot_product_attention`) uses the wall clock around a synchronized call.
+The two alternate in one process for three rounds of 10 runs. Values are TFLOPS as the
+best run (median of round medians), and the ratio is Enceladus time over MLX time.
+Other jobs shared the GPU during these runs, so treat the numbers as preliminary.
+
+| N, D | Causal | Config | Enceladus | MLX | Ratio |
+|---|---|---|---|---|---|
+| 2048, 64 | No | 64x32, 8 SIMD groups | 5.11 (4.88) | 5.17 (4.95) | 1.01x |
+| 2048, 64 | Yes | 32x32, 4 | 4.83 (4.66) | 4.77 (4.56) | 0.99x |
+| 2048, 128 | No | 32x32, 4 | 4.71 (4.57) | 5.10 (4.90) | 1.08x |
+| 2048, 128 | Yes | 64x32, 8 | 4.73 (4.49) | 4.84 (4.62) | 1.02x |
+| 4096, 64 | No | 64x32, 4 | 5.08 (5.00) | 5.31 (5.12) | 1.05x |
+| 4096, 64 | Yes | 32x32, 4 | 4.76 (4.59) | 5.08 (4.86) | 1.07x |
+| 4096, 128 | No | 64x32, 8 | 4.92 (4.74) | 5.09 (5.03) | 1.03x |
+| 4096, 128 | Yes | 64x32, 8 | 4.68 (4.53) | 4.95 (4.89) | 1.06x |
+
+Every case is within the 1.3x target. An earlier run gave 0.98-1.09x. The steps, measured
+at N = 2048 in FP16 with fixed configurations:
+
+| Step | D = 64 | D = 128 |
+|---|---|---|
+| M4 paths only (P staged, Q reloaded per iteration) | 4.22 | 3.83 |
+| P and Q from registers, K loop indexed by `kk / 8` | 4.34 | 2.47 |
+| Unrolled K loop for register operands | 5.09 (16-row strips) | 4.12 |
+| K and V staged through threadgroup memory | 5.23 | 4.99 |
+
+FP32 attention at D = 128 ran at 0.35 TFLOPS before the one-B-fragment rule and 4.3
+after it (N = 1024). The FP16 and FP32 4096³ matmul benchmarks are unchanged (5.58-5.71
+and 4.92-5.26 TFLOPS in one run).
+
+### Tests
+
+The suite runs 505 tests, with 18 skipped, in about 4.5 s. `tests/test_attention.py` adds
+the following tests:
+
+- A differential test of the example (compiled, interpreted, and NumPy) over 10 cases:
+  aligned and ragged sequence lengths (64, 100, 37), head dimensions 32, 64, and 128,
+  causal on and off, a non-default scale, FP16, FP32, and BF16, and configurations that
+  reach each operand path (8- and 16-row strips, staged and direct keys, one B fragment at
+  a time).
+- A register-operand test: an accumulator cast to FP16 feeds a second dot in a loop, with
+  a hoisted left operand and ragged sizes in every dimension. With `dot_warps=(4, 1)`, the
+  kernel allocates no staging buffer for the left operand; with `(2, 2)`, it stages it.
+- A row-reduction test: the row maximum of a dot result uses no threadgroup memory and no
+  barrier with WN = 1, and uses threadgroup memory with WN = 2.
+- A subprocess test that autotunes the attention kernel as the first `tl.dot` of a fresh
+  process, which crashed with a segmentation fault before the runtime fix.
+
+Mutations of the fragment index math, the register operand layout, the fragment loads,
+the staging rule, and the one-B-fragment loop each fail at least one test.
+
+### Deviations from the plan
+
+- **K and V are staged, not loaded directly.** The plan says to load K with a transposed
+  direct `simdgroup_load`. With A in registers, staging K and V through threadgroup memory
+  measured 3-21% faster, so `stages_b` stages them. The transposed direct load still serves
+  matmuls. Staging K untransposed and loading its fragments transposed from threadgroup
+  memory measured 2-3% slower than writing it transposed, so staging keeps its logical
+  orientation.
+- **The query tile stays in registers.** The plan doesn't mention it. Reloading Q from
+  device memory every iteration measured up to 16% slower, depending on the configuration.
+- **Loads and MMAs can interleave.** The one-B-fragment rule departs from the reference
+  kernel's loop shape, but only above the register threshold.
+- **The attention configurations include more than MLX's.** 64 query rows over 8 SIMD
+  groups won most tunings at D = 128.
+- **A runtime file changed.** `runtime/device.py` gained a lock (see the first known gap),
+  outside the files this milestone was meant to touch.
+
+### Known gaps
+
+- `check_simdgroup_layout` ran its probe kernel without a lock, so autotuning a dot kernel
+  as the first `tl.dot` of a process launched it from several compile threads at once and
+  crashed with a segmentation fault. It takes a lock. Earlier milestones missed it because
+  their tests and benchmarks compiled a dot before tuning.
+- Persisted autotuning results are keyed by the kernel's source hash, not the compiler
+  version, so a compiler change keeps old winners until you delete
+  `~/.cache/enceladus/autotune/<kernel-hash>/`.
+- Causal attention masks every key block. Skipping the mask for blocks entirely below the
+  diagonal, as Triton's tutorial does with two loops, isn't implemented; causal runs are
+  within 1-7% of MLX without it.
+- The register-operand path serves only left operands. A right operand in registers
+  (`tl.dot(a, acc)`) is staged.
+- 16-row strips at head dimension 128 spill (0.3-0.6 TFLOPS) and are left out of
+  `attention_configs`. FP32 attention reaches about 4.3 TFLOPS at D = 128 and 4.7 at 64;
+  MLX wasn't measured in FP32.
+- Staging B measured 5% faster than direct loads for the FP32 4096³ matmul in one run
+  (5.12 against 4.86 TFLOPS) and 3% slower in FP16. The matmul path keeps direct loads; a
+  dtype-aware rule is worth measuring in a later milestone.
+- Only the forward pass exists. Dropout, attention masks other than causal, grouped-query
+  attention, and query and key lengths that differ aren't supported by the example.

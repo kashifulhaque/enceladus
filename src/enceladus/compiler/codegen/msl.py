@@ -193,7 +193,7 @@ class _Codegen:
         self._frag_elem: dict[str, str] = {}  # simdgroup_matrix array -> element type
         from enceladus.compiler.codegen.dot import find_direct_operands, use_counts
 
-        self.direct: set[int] = find_direct_operands(module)
+        self.direct: set[int] = find_direct_operands(module, plan)
         self.uses: dict[int, int] = use_counts(module)
 
     # ---- helpers ----
