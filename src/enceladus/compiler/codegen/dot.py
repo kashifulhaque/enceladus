@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from enceladus.compiler import ir
 from enceladus.compiler import layout as L
 from enceladus.compiler.codegen.msl import BARRIER, CTYPES, Tile, _add
+from enceladus.compiler.passes.layouts import ANCHORED
 
 if TYPE_CHECKING:
     from enceladus.compiler.codegen.msl import _Codegen
@@ -103,9 +104,10 @@ def emit_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
     sc = cg.pro(f"sc|{lwm}|{sn}", "sc", "int", f"int(warp >> {lwm}) * {sn}") if wn > 1 else "0"
     fm, fn = _frag_consts(cg)
 
-    # Accumulator: start from `c`, in place when this dot is its only use.
+    # Accumulator: start from `c`, in place when this dot is its only use and nothing else
+    # reads its storage afterward.
     acc_in = cg.mat(c, lay)
-    if acc_in.frag == (tm, tn) and cg.uses.get(id(c)) == 1 and \
+    if acc_in.frag == (tm, tn) and cg.uses.get(id(c)) == 1 and _can_clobber(cg, c, op) and \
             acc_in.name and acc_in.frag and op.result.type == c.type:  # fmt: skip
         out = acc_in
         d = acc_in.name
@@ -190,13 +192,35 @@ def emit_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
     return out
 
 
+def _can_clobber(cg: _Codegen, c: ir.Value, dot: ir.Op) -> bool:
+    """Returns whether `dot` may overwrite the storage of its accumulator `c`.
+
+    `c` must own its storage, so it can't be a view of another tile. The dot must also run
+    at most once per definition of `c`: only `if` regions may sit between the block that
+    defines `c` and the dot. A loop in between would reuse the updated value on the next
+    iteration. The loop-carried `acc = tl.dot(a, b, acc)` pattern still qualifies, because
+    `acc` is an argument of the loop body block that holds the dot.
+    """
+    if cg.plan.classify(c) != ANCHORED:
+        return False
+    home = c.owner if isinstance(c.owner, ir.Block) else c.owner.parent
+    blk = dot.parent
+    while blk is not home:
+        region = blk.parent if blk is not None else None
+        parent = region.parent if region is not None else None
+        if parent is None or parent.name != "if":
+            return False
+        blk = parent.parent
+    return True
+
+
 def _in_bounds(dop: _Direct | None, rows: int, cols: int) -> str | None:
     """Returns the uniform condition that the whole logical rows x cols block is in bounds."""
     if dop is None:
         return None
     (o0, o1), (s0, s1) = dop.offsets, dop.desc.shape
     r0, r1 = (cols, rows) if dop.transposed else (rows, cols)
-    return f"({o0} + {r0} <= {s0} && {o1} + {r1} <= {s1})"
+    return f"({o0} >= 0 && {o1} >= 0 && {o0} + {r0} <= {s0} && {o1} + {r1} <= {s1})"
 
 
 def _direct_load(dop: _Direct, frag: str, row: str, col: str, checked: bool, fm: str,
@@ -205,10 +229,10 @@ def _direct_load(dop: _Direct, frag: str, row: str, col: str, checked: bool, fm:
     (o0, o1), (s0, s1), ld = dop.offsets, dop.desc.shape, dop.desc.strides[0]
     if dop.transposed:
         mrow, mcol = _add2(o0, col), _add2(o1, row)
-        rows_left, cols_left = f"{s1} - ({mcol})", f"{s0} - ({mrow})"
+        bounds = f"{mcol}, {s1}, {mrow}, {s0}"
     else:
         mrow, mcol = _add2(o0, row), _add2(o1, col)
-        rows_left, cols_left = f"{s0} - ({mrow})", f"{s1} - ({mcol})"
+        bounds = f"{mrow}, {s0}, {mcol}, {s1}"
     # Add each column term to the pointer separately: grouping them into one int sum
     # first, as in `p + r * ld + (c0 + j * 8)`, stops Metal from folding the constant
     # into the address and measured 17% slower.
@@ -218,7 +242,7 @@ def _direct_load(dop: _Direct, frag: str, row: str, col: str, checked: bool, fm:
         if not dop.transposed:
             return f"simdgroup_load({frag}, {ptr}, {ld});"
         return f"simdgroup_load({frag}, {ptr}, {ld}, ulong2(0, 0), true);"
-    return f"tg_load_frag({frag}, {ptr}, {ld}, {rows_left}, {cols_left}, {t}, {fm}, {fn});"
+    return f"tg_load_frag({frag}, {ptr}, {ld}, {bounds}, {t}, {fm}, {fn});"
 
 
 def _add2(a: str, b: str) -> str:
@@ -235,7 +259,7 @@ def _add2(a: str, b: str) -> str:
 def _block_coords(cg: _Codegen, desc: DescInfo, offsets: list[str], lay: L.BitLayout, r: int):
     """Returns (index expressions per dim, in-bounds condition, element offset) for register r."""
     idx = [_add2(o, cg.coord(lay, r, d)) for d, o in enumerate(offsets)]
-    cond = " && ".join(f"({x}) < {s}" for x, s in zip(idx, desc.shape, strict=True))
+    cond = " && ".join(f"({x}) >= 0 && ({x}) < {s}" for x, s in zip(idx, desc.shape, strict=True))
     elem = " + ".join(f"({x}) * {st}" if st != "1" else f"({x})"
                       for x, st in zip(idx, desc.strides, strict=True))  # fmt: skip
     return idx, cond, elem

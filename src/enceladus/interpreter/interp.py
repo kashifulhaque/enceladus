@@ -190,6 +190,13 @@ class ITile:
         return self.data.item()
 
     def __bool__(self) -> bool:
+        if self.data.ndim != 0:
+            # Python calls this for `if`, `not`, `and`, and `or`.
+            raise CompilationError(
+                f"a tile of shape {self.shape} has no single truth value. To choose values "
+                "elementwise, use tl.where(cond, x, y). To combine masks elementwise, use `&` "
+                "and `|` instead of `and` and `or`."
+            )
         return bool(self._scalar())
 
     def __index__(self) -> int:

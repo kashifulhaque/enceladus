@@ -269,6 +269,31 @@ def test_int_ops(mode, rng, op):
     check_kernel(run, (x, y), INT_OPS[op], modes=(mode,))
 
 
+@enceladus.jit
+def _cast_kernel(x_ptr, out_ptr, DT: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs).to(DT))
+
+
+# float16 overflows to inf from 65520, and 2**30 + 2**22 + 1 rounds to bfloat16 through
+# float32 in NumPy (ml_dtypes), which gives 2**30 rather than 2**30 + 2**23.
+CAST_VALUES = [65504, 65505, 65519, 65520, -65519, 2049, 2051, 2**30 + 2**22 + 1]
+
+
+@pytest.mark.parametrize("dst", [F16, BF16], ids=["f16", "bf16"])
+@pytest.mark.parametrize("src", [np.int64, np.uint64, np.int32])
+def test_int_to_half_casts(mode, src, dst):
+    x = np.array([abs(v) if src is np.uint64 else v for v in CAST_VALUES], src)
+
+    def run(x):
+        out = np.zeros(x.size, dst)
+        _cast_kernel[(1,)](x, out, DT=tl.float16 if dst is F16 else tl.bfloat16, BLOCK=8)
+        return out
+
+    with np.errstate(over="ignore"):
+        check_kernel(run, (x,), lambda x: x.astype(dst), modes=(mode,), atol=0, rtol=0)
+
+
 SHAPE_OPS = {
     "trans": lambda x: x.T, "T": lambda x: x.T, "reshape": lambda x: x.reshape(16, 8),
     "row_bcast": lambda x: x - x.max(1, keepdims=True),
@@ -345,6 +370,38 @@ def test_integer_division_truncates(mode):
         return q, (a - q * b).astype(np.int32)
 
     check_kernel(run, (a, b), ref, modes=(mode,))
+
+
+@enceladus.jit
+def _offsets_kernel(x_ptr, out_ptr, big, OP: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    if OP == "int64":  # 2**32 truncates to 0 in 32 bits.
+        p = (x_ptr - big) + offs.to(tl.int64)
+        p = p + (offs.to(tl.int64) * 0 + big)
+    elif OP == "uint32_sub":  # Negating in uint32 wraps around.
+        k = tl.program_id(0) + BLOCK
+        p = (x_ptr + k) - k.to(tl.uint32) + offs
+    elif OP == "int8_sub":  # -(-128) is -128 in int8.
+        k = (tl.program_id(0) - 128).to(tl.int8)
+        p = (x_ptr - 128) - k + offs
+    elif OP == "int16_sub":  # The same for a tile of int16 at -32768.
+        k = (offs * 0 + tl.program_id(0) - 32768).to(tl.int16)
+        p = (x_ptr - 32768 + offs) - k
+    else:  # Negating an int1 in int1 gives 1, not -1.
+        p = (x_ptr + 1) + offs - (offs >= 0)
+    tl.store(out_ptr + offs, tl.load(p))
+
+
+@pytest.mark.parametrize("op", ["int64", "uint32_sub", "int8_sub", "int16_sub", "bool_sub"])
+def test_pointer_offsets_keep_their_value(mode, op):
+    x = np.arange(32, dtype=np.float32)
+
+    def run(x):
+        out = np.zeros_like(x)
+        _offsets_kernel[(1,)](x, out, 1 << 32, OP=op, BLOCK=32)
+        return out
+
+    check_kernel(run, (x,), lambda x: x, modes=(mode,))
 
 
 @enceladus.jit
@@ -430,6 +487,102 @@ def test_control_flow(mode):
     assert any(op.name == "if" and len(op.results) == 2 for op in loop.walk())
 
 
+# `and` and `or` return an operand, as in Python. `x` is 42, read only when it's needed.
+BOOL_OPS = {
+    "and": lambda n, m, f, x: n and m, "or": lambda n, m, f, x: n or m,
+    "and_const": lambda n, m, f, x: n and 5, "or_const": lambda n, m, f, x: n or 5,
+    "const_left": lambda n, m, f, x: 0 or n, "chain": lambda n, m, f, x: n and m and 9,
+    "mixed": lambda n, m, f, x: n and (m + 1) * 2 or 11,
+    "lazy_load": lambda n, m, f, x: n or x,
+    "if_test": lambda n, m, f, x: 5 if (n and f) or not m else 6,
+}  # fmt: skip
+
+
+@enceladus.jit(do_not_specialize=["n", "m"])
+def _bool_op_kernel(out_ptr, x_ptr, n, m, f, OP: tl.constexpr):
+    if OP == "and":
+        r = n and m
+    elif OP == "or":
+        r = n or m
+    elif OP == "and_const":
+        r = n and 5
+    elif OP == "or_const":
+        r = n or 5
+    elif OP == "const_left":
+        r = 0 or n
+    elif OP == "chain":
+        r = n and m and 9
+    elif OP == "mixed":
+        r = n and (m + 1) * 2 or 11
+    elif OP == "lazy_load":
+        r = n or tl.load(x_ptr)
+    else:  # Only truth values matter here, so the operand types can differ.
+        r = 5 if (n and f) or not m else 6
+    tl.store(out_ptr, r)
+
+
+@pytest.mark.parametrize("op", list(BOOL_OPS))
+def test_bool_ops_return_operands(mode, op):
+    nm = np.array([[3, 7], [0, 7], [2, 0], [0, 0]], np.int32)
+
+    def run(nm):
+        x, outs = np.array([42], np.int32), [np.zeros(1, np.int32) for _ in nm]
+        for out, (n, m) in zip(outs, nm, strict=True):
+            _bool_op_kernel[(1,)](out, x, int(n), int(m), float(n) / 2, OP=op)
+        return np.concatenate(outs)
+
+    def ref(nm):
+        return np.array([BOOL_OPS[op](int(n), int(m), n / 2, 42) for n, m in nm], np.int32)
+
+    check_kernel(run, (nm,), ref, modes=(mode,))
+
+
+@enceladus.jit
+def _and_on_tile_kernel(x_ptr, BLOCK: tl.constexpr):
+    x = tl.load(x_ptr + tl.arange(0, BLOCK))
+    tl.store(x_ptr + tl.arange(0, BLOCK), x, mask=(x > 0) and (x < 1))  # error
+
+
+def test_and_on_tile_is_refused(mode):
+    with execution_mode(mode), pytest.raises(enceladus.CompilationError) as e:
+        _and_on_tile_kernel[(1,)](np.ones(16, np.float32), BLOCK=16)
+    msg = str(e.value)
+    assert "use `&`" in msg
+    assert "# error" in msg and __file__ in msg
+
+
+
+@enceladus.jit(do_not_specialize=["n"])
+def _guarded_bias_kernel(x_ptr, bias_ptr: tl.constexpr, out_ptr, n, HAS_BIAS: tl.constexpr,
+                         FORM: tl.constexpr, BLOCK: tl.constexpr):  # fmt: skip
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    if FORM == "and":
+        if n > 0 and HAS_BIAS:
+            x += tl.load(bias_ptr + offs)
+    elif FORM == "or":
+        if n <= 0 or not HAS_BIAS:
+            x += 1.0
+        else:
+            x += tl.load(bias_ptr + offs)
+    else:
+        x += tl.load(bias_ptr + offs) if n > 0 and HAS_BIAS else 1.0
+    tl.store(out_ptr + offs, x)
+
+
+@pytest.mark.parametrize("form", ["and", "or", "ifexp"])
+def test_constexpr_right_operand_skips_the_guarded_code(mode, form):
+    # With HAS_BIAS=False the test is decided at compile time, so the load from the
+    # `None` bias pointer must not be compiled.
+    def run(x):
+        out = np.empty_like(x)
+        _guarded_bias_kernel[(1,)](x, None, out, 3, HAS_BIAS=False, FORM=form, BLOCK=16)
+        return out
+
+    check_kernel(run, (np.arange(16, dtype=np.float32),),
+                 lambda x: x if form == "and" else x + 1, modes=(mode,))  # fmt: skip
+
+
 @enceladus.jit
 def _desc_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_b, stride_cm,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
@@ -472,6 +625,56 @@ def test_descriptor_matmul(mode, rng, dtype, mkn, trans_b):
 
     check_kernel(run, (randn(rng, (m, k), dtype), randn(rng, (k, n), dtype)), ref,
                  modes=(mode,), atol=1e-4 if dtype is F32 else None)  # fmt: skip
+
+
+# Argument names that generated code also uses: the register loop index `r`, the MMA
+# loop's `i`, `j`, `kk`, `fa`, and `fb`, the exchange buffer `buf`, the argmax tie flag
+# `tk`, and the kernel parameters `lane`, `warp`, and `pid`. The rest mean something to
+# MSL: `metal_stdlib` macros (`INT_MAX`, `M_SQRT2_F`, and `METAL_FUNC`) and an address
+# space (`ray_data`). MSL also forbids a kernel named `main`.
+@enceladus.jit
+def main(x_ptr, out_ptr, r, i, j, kk, fa, fb, buf, tk, lane, warp, pid, INT_MAX, M_SQRT2_F,
+         METAL_FUNC, ray_data, BLOCK: tl.constexpr):  # fmt: skip
+    offs = tl.arange(0, BLOCK)
+    y = tl.load(x_ptr + offs) + r + i + j + kk + fa + fb + buf + tk + lane + warp + pid
+    tl.store(out_ptr + offs, y + INT_MAX + M_SQRT2_F + METAL_FUNC + ray_data)
+
+
+@enceladus.jit
+def _reserved_names_dot_kernel(fa, fb, c_ptr, i, j, kk, BM: tl.constexpr, BN: tl.constexpr,
+                               BK: tl.constexpr):  # fmt: skip
+    pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+    a = tl.make_tensor_descriptor(fa, [i, kk], [kk, 1], [BM, BK])
+    b = tl.make_tensor_descriptor(fb, [kk, j], [j, 1], [BK, BN])
+    c = tl.make_tensor_descriptor(c_ptr, [i, j], [j, 1], [BM, BN])
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, kk, BK):
+        acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+    c.store([pid_m * BM, pid_n * BN], acc)
+
+
+@pytest.mark.parametrize("kind", ["elementwise", "dot"])
+def test_argument_names_dont_clash_with_generated_code(mode, rng, kind):
+    if kind == "elementwise":
+        scalars = [float(1 << k) for k in range(15)]  # Any clash changes the sum.
+
+        def run(x):
+            out = np.empty_like(x)
+            main[(1,)](x, out, *scalars, BLOCK=1024)  # 8 registers each
+            return out
+
+        check_kernel(run, (randn(rng, 1024, F32),), lambda x: x + sum(scalars), modes=(mode,))
+        return
+    m, n, k = 50, 40, 36
+
+    def run(a, b):
+        c = np.zeros((m, n), np.float32)
+        grid = (enceladus.cdiv(n, 32), enceladus.cdiv(m, 32))
+        _reserved_names_dot_kernel[grid](a, b, c, m, n, k, BM=32, BN=32, BK=16)
+        return c
+
+    check_kernel(run, (randn(rng, (m, k), F32), randn(rng, (k, n), F32)), lambda a, b: a @ b,
+                 modes=(mode,), atol=1e-4)  # fmt: skip
 
 
 @enceladus.jit

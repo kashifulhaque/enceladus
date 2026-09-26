@@ -69,13 +69,20 @@ class Config:
         return f"enceladus.Config({', '.join(parts)})"
 
     def to_json(self) -> dict[str, Any]:
+        """Returns the fields that identify this config. `pre_hook` can't be serialized."""
         return {"kwargs": self.kwargs, "num_warps": self.num_warps,
-                "dot_warps": list(self.dot_warps) if self.dot_warps else None}  # fmt: skip
+                "dot_warps": list(self.dot_warps) if self.dot_warps else None,
+                "dot_backend": self.dot_backend}  # fmt: skip
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Config:
+        """Rebuilds a config from `to_json` output, without its `pre_hook`."""
         dw = d.get("dot_warps")
-        return cls(dict(d["kwargs"]), d["num_warps"], tuple(dw) if dw else None)
+        return cls(dict(d["kwargs"]), d["num_warps"], tuple(dw) if dw else None,
+                   d.get("dot_backend", "auto"))  # fmt: skip
+
+    def _identity(self) -> str:
+        return json.dumps(self.to_json(), sort_keys=True)
 
 
 def _innermost(fn: Any):
@@ -148,6 +155,7 @@ class Autotuner:
             if k not in self.arg_names:
                 raise ValueError(f"@enceladus.autotune names unknown argument {k!r}")
         self.best: dict[str, Config] = {}
+        self._saved: dict[str, Config] = {}  # Results loaded from disk, not yet used.
         self.timings: dict[str, dict[str, float]] = {}
         self._loaded = False
         self._lock = threading.Lock()
@@ -167,7 +175,27 @@ class Autotuner:
         except (OSError, ValueError):
             return
         for k, v in data.items():
-            self.best.setdefault(k, Config.from_json(v))
+            try:
+                self._saved.setdefault(k, Config.from_json(v))
+            except (KeyError, TypeError, ValueError):
+                log.debug("ignoring malformed saved result %r for key %s", v, k)
+
+    def _from_saved(self, key: str, named: dict[str, Any]) -> Config | None:
+        """Returns the candidate config that matches the saved result for `key`, if any.
+
+        Matching against the candidates rather than `configs` keeps the config's `pre_hook`,
+        and finds configs that `early_config_prune` builds. A saved result that matches no
+        candidate is re-tuned.
+        """
+        saved = self._saved.pop(key, None)
+        if saved is None:
+            return None
+        ident = saved._identity()
+        cfg = next((c for c in self._candidates(named) if c._identity() == ident), None)
+        if cfg is None:
+            log.debug("ignoring saved result %s for key %s: it isn't a current candidate",
+                      saved, key)  # fmt: skip
+        return cfg
 
     def _save(self) -> None:
         p = self._path()
@@ -215,7 +243,10 @@ class Autotuner:
         cfg = self.best.get(key)
         if cfg is None:
             with self._lock:
-                cfg = self.best.get(key) or self._tune(key, args, kwargs, grid, named)
+                cfg = self.best.get(key) or self._from_saved(key, named)
+                if cfg is None:
+                    cfg = self._tune(key, args, kwargs, grid, named)
+                self.best[key] = cfg
         if cfg.pre_hook is not None:
             cfg.pre_hook(named)
         self.fn.run(*args, grid=grid, **kwargs, **cfg.kwargs, **cfg.launch_options())
@@ -285,7 +316,11 @@ class Autotuner:
                             **cfg.launch_options())  # fmt: skip
 
             get_device().stream.synchronize()
-            timings[i] = do_bench(launch, self.warmup_ms, self.rep)
+            try:
+                timings[i] = do_bench(launch, self.warmup_ms, self.rep)
+            except Exception as e:  # noqa: BLE001 - a config that fails to launch is skipped
+                errors[i] = e
+                warnings.warn(f"{self.jit.__name__}: skipping {cfg}: {e}", stacklevel=4)
         get_device().stream.synchronize()
         for n, v in saved.items():
             named_bench[n]._view()[...] = v
@@ -293,6 +328,12 @@ class Autotuner:
             t = named_bench[n]
             if isinstance(t, Tensor):
                 t._view()[...] = 0
+        if not timings:
+            first = next(iter(errors.values()))
+            raise RuntimeError(
+                f"every autotuning config of {self.jit.__name__} failed to compile or run; the "
+                f"first error was: {first}"
+            ) from first
         med = statistics.median(timings.values())
         valid = {i: t for i, t in timings.items() if t <= SPILL_FACTOR * med}
         for i in set(timings) - set(valid):

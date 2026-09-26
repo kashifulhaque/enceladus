@@ -27,21 +27,22 @@ static inline ulong tg_shfl_xor(ulong x, ushort m) {
 }
 
 // Loads an 8x8 fragment whose logical (row, col) lives at p[row * ld + col], or at
-// p[col * ld + row] when transposed. Fragments that fit load with simdgroup_load; the
-// test is uniform across the SIMD group. Straddling fragments fall back to per-lane
-// masked loads of the two elements each lane owns, (fm, fn) and (fm, fn + 1).
+// p[col * ld + row] when transposed. The fragment starts at logical (row0, col0) of a
+// rows x cols tensor, and elements outside it read as zero. Fragments that fit load with
+// simdgroup_load; the test is uniform across the SIMD group. Straddling fragments fall back
+// to per-lane masked loads of the two elements each lane owns, (fm, fn) and (fm, fn + 1).
 template <typename T, typename P>
-static inline void tg_load_frag(thread simdgroup_matrix<T, 8, 8>& f, P p, int ld,
-                                int rows_left, int cols_left, bool transpose, int fm, int fn) {
-  if (rows_left >= 8 && cols_left >= 8) {
+static inline void tg_load_frag(thread simdgroup_matrix<T, 8, 8>& f, P p, int ld, int row0,
+                                int rows, int col0, int cols, bool transpose, int fm, int fn) {
+  if (row0 >= 0 && col0 >= 0 && row0 + 8 <= rows && col0 + 8 <= cols) {
     simdgroup_load(f, p, ulong(ld), ulong2(0, 0), transpose);
     return;
   }
   thread auto& e = f.thread_elements();
-  const bool rok = fm < rows_left;
+  const bool rok = uint(row0 + fm) < uint(rows);
   for (int i = 0; i < 2; ++i) {
     const int c = fn + i;
-    const bool ok = rok && c < cols_left;
+    const bool ok = rok && uint(col0 + c) < uint(cols);
     e[i] = ok ? T(transpose ? p[c * ld + fm] : p[fm * ld + c]) : T(0);
   }
 }

@@ -299,7 +299,9 @@ class JITFunction:
         `dot_warps=(WM, WN)` arranges the SIMD groups of every `tl.dot` as a WM x WN grid.
         `num_stages` is accepted for Triton compatibility and has no effect.
         """
-        interpret = self.interpret if self.interpret is not None else _env_flag("ENCELADUS_INTERPRET")
+        interpret = self.interpret
+        if interpret is None:
+            interpret = _env_flag("ENCELADUS_INTERPRET")
         if not interpret:
             self._run_compiled(args, kwargs, grid, num_warps, dot_warps)
             return

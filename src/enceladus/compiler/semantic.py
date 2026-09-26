@@ -344,10 +344,16 @@ def _pointer_binary(b: ir.Builder, op: str, x: Any, y: Any) -> ir.Value:
     if isinstance(yd, float) or (isinstance(yd, core.dtype) and not yd.is_int()):
         raise CompilationError(f"a pointer offset must be an integer, but got {describe(y)}")
     off = to_value(b, y)
+    od = dtype_of(off)
+    if od.is_bool():
+        off = cast(b, off, core.int32)
+    elif op == "sub" and (od.primitive_bitwidth < 32 or od == core.uint32):
+        # Negate in a signed type that holds every value and its negation, so `p - x`
+        # can't wrap around, as `-(-128)` does in `int8`. `int32` stays as it is: negating
+        # its minimum moves the pointer by 2^31 elements, past what 32-bit offsets address.
+        off = cast(b, off, core.int64 if od == core.uint32 else core.int32)
     if op == "sub":
         off = b.create("unary", [off], [off.type], {"op": "neg"}).result
-    if dtype_of(off).is_bool():
-        off = cast(b, off, core.int32)
     shape = broadcast_shapes(_shape(x), _shape(off))
     xp = broadcast_to(b, x, shape)
     off = broadcast_to(b, off, shape)

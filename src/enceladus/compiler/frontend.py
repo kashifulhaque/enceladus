@@ -116,6 +116,13 @@ _PY_CMPOPS = {
     ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
 }  # fmt: skip
 
+# Scalar ops that are safe to run when their result isn't needed, so the right side of
+# `and` or `or` made only of them becomes a `select` instead of an `if`.
+_SPECULATABLE = frozenset(
+    ["const", "binary", "cmp", "unary", "cast", "bitcast", "select", "fma", "program_id",
+     "num_programs"]
+)  # fmt: skip
+
 _FORBIDDEN = {
     "While": "`while` loops aren't supported. Use `for i in range(...)` with a bound.",
     "Break": "`break` isn't supported. Use a mask, or restructure the loop bounds.",
@@ -177,6 +184,7 @@ class CodeGenerator(ast.NodeVisitor):
         self.ret_value: Any = None
         self.in_kernel = True
         self.scoped_out: dict[str, str] = {}
+        self.truth_context = False
 
     # ---- infrastructure ----
 
@@ -328,7 +336,7 @@ class CodeGenerator(ast.NodeVisitor):
             raise CompilationError(f"assertion failed: {msg}" if msg else "assertion failed")
 
     def visit_If(self, node: ast.If) -> None:
-        cond = core.unwrap(self.visit(node.test))
+        cond = self.visit_truth(node.test)
         if not isinstance(cond, ir.Value):
             self.visit_body(node.body if cond else node.orelse)
             return
@@ -677,8 +685,11 @@ class CodeGenerator(ast.NodeVisitor):
         return self.binop(node.op, self.visit(node.left), self.visit(node.right))
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:
-        v = core.unwrap(self.visit(node.operand))
         op = node.op
+        if isinstance(op, ast.Not):
+            v = self.visit_truth(node.operand)
+        else:
+            v = core.unwrap(self.visit(node.operand))
         if not isinstance(v, ir.Value):
             return {ast.USub: operator.neg, ast.UAdd: operator.pos, ast.Invert: operator.invert,
                     ast.Not: operator.not_}[type(op)](v)  # fmt: skip
@@ -691,25 +702,110 @@ class CodeGenerator(ast.NodeVisitor):
         return semantic.unary(self.b, "not", semantic.to_bool(self.b, v))
 
     def visit_BoolOp(self, node: ast.BoolOp) -> Any:
-        is_and = isinstance(node.op, ast.And)
-        acc: Any = _MISSING
-        for e in node.values:
-            v = core.unwrap(self.visit(e))
-            if not isinstance(v, ir.Value):
-                if acc is _MISSING or not isinstance(acc, ir.Value):
-                    if bool(v) != is_and:
-                        return v  # Short-circuit on a compile-time value.
-                    acc = v
-                    continue
-                if bool(v) == is_and:
-                    continue  # `x and True` is `x`.
-                return v
-            vb = semantic.to_bool(self.b, v)
-            if acc is _MISSING or not isinstance(acc, ir.Value):
-                acc = vb
-            else:
-                acc = semantic.binary(self.b, "and" if is_and else "or", acc, vb)
-        return acc
+        truth, self.truth_context = self.truth_context, False
+        return self.bool_chain(node.op, node.values, truth)
+
+    def visit_truth(self, node: ast.expr) -> Any:
+        """Visits an expression whose truth value is all that matters, such as an `if` test.
+
+        `and` and `or` chains then combine the truth values of their operands, so the
+        operands can have different types.
+        """
+        self.truth_context = isinstance(node, ast.BoolOp)  # Read by `visit_BoolOp`.
+        return core.unwrap(self.visit(node))
+
+    def bool_chain(self, op: ast.boolop, values: Sequence[ast.expr], truth: bool) -> Any:
+        """Emits `values[0] and values[1] and ...` (or `or`) with Python's semantics.
+
+        `a and b` is `a` when `a` is falsy and `b` otherwise; `a or b` is `a` when `a` is
+        truthy and `b` otherwise. The right side runs only when it's needed: a compile-time
+        left side folds, and a runtime one emits an `if` op, unless the right side is
+        cheap and has no side effects. With `truth`, operands become `int1` truth values.
+        """
+        is_and = isinstance(op, ast.And)
+        kw = "and" if is_and else "or"
+        node = values[0]
+        v = self.visit_truth(node) if truth else core.unwrap(self.visit(node))
+        if len(values) == 1:
+            return self._truth_value(v, kw) if truth and isinstance(v, ir.Value) else v
+        if not isinstance(v, ir.Value):
+            if bool(v) != is_and:
+                return v  # Short-circuits on a compile-time value.
+            return self.bool_chain(op, values[1:], truth)
+        saved = self.b.loc
+        self.b.loc = self.src.loc(node)
+        try:
+            v = self._truth_value(v, kw) if truth else self._bool_operand(v, kw)
+            cond = semantic.to_bool(self.b, v)
+        finally:
+            self.b.loc = saved
+        rest_blk = ir.Block()
+        with self.b.at(rest_blk):
+            rest = self.bool_chain(op, values[1:], truth)
+            speculatable = all(o.name in _SPECULATABLE for o in rest_blk.ops)
+            if (
+                not isinstance(rest, ir.Value)
+                and bool(rest) != is_and
+                and speculatable
+                and (truth or (v.type == ir.i1 and isinstance(rest, bool)))
+            ):
+                # A compile-time right side decides the result either way: `c and False`
+                # is falsy and `c or True` is truthy. Folding keeps code that the result
+                # guards, such as `if pid > 0 and HAS_BIAS:`, from being compiled.
+                return bool(rest)
+            if truth and not isinstance(rest, ir.Value):
+                rest = bool(rest)
+            if isinstance(rest, ir.Value):
+                rest = self._bool_operand(rest, kw)
+            rest = self._bool_rest(rest, v, kw)
+        x, y = (rest, v) if is_and else (v, rest)
+        if speculatable:
+            for o in rest_blk.ops:
+                self.b.block.append(o)
+            if v.type == ir.i1:
+                return semantic.binary(self.b, kw, v, rest)
+            return self.b.create("select", [cond, x, y], [v.type]).result
+        keep_blk = ir.Block()
+        then_blk, else_blk = (rest_blk, keep_blk) if is_and else (keep_blk, rest_blk)
+        (r,) = self._emit_if(cond, then_blk, else_blk, [(f"the result of `{kw}`", x, y)])
+        return r
+
+    def _bool_operand(self, v: ir.Value, kw: str) -> ir.Value:
+        if semantic.is_tile(v):
+            raise CompilationError(
+                f"`{kw}` on a tile isn't supported, because a tile has no single truth value. "
+                f"To combine masks elementwise, use `{'&' if kw == 'and' else '|'}` instead, "
+                "with parentheses around comparisons."
+            )
+        if not isinstance(v.type, ir.ScalarType):
+            raise CompilationError(
+                f"`{kw}` needs numeric scalar operands, but got {semantic.describe(v)}"
+            )
+        return v
+
+    def _truth_value(self, v: ir.Value, kw: str) -> ir.Value:
+        return semantic.to_bool(self.b, self._bool_operand(v, kw))
+
+    def _bool_rest(self, rest: Any, left: ir.Value, kw: str) -> ir.Value:
+        """Returns the right side of `and` or `or` as a value of the left side's type."""
+        t = left.type
+        if isinstance(rest, ir.Value):
+            if rest.type == t:
+                return rest
+        elif semantic.is_literal(rest):
+            # The literal must keep its value in the left side's type: `flag or 5` can't
+            # become `int1`, and `n or 2.5` can't become `int32`.
+            dt = t.dtype
+            if dt.is_floating():
+                return semantic.const(self.b, rest, dt)
+            lo, hi = semantic.int_range(dt)
+            if not isinstance(rest, float) and lo <= rest <= hi:
+                return semantic.const(self.b, rest, dt)
+        raise CompilationError(
+            f"`{kw}` returns one of its operands unchanged, so both need the same type, but "
+            f"got {t} and {semantic.describe(rest)}. Convert one operand with `.to(...)`, or "
+            "use tl.where to choose between values of different types."
+        )
 
     def visit_Compare(self, node: ast.Compare) -> Any:
         left = core.unwrap(self.visit(node.left))
@@ -733,7 +829,7 @@ class CodeGenerator(ast.NodeVisitor):
         return result
 
     def visit_IfExp(self, node: ast.IfExp) -> Any:
-        cond = core.unwrap(self.visit(node.test))
+        cond = self.visit_truth(node.test)
         if not isinstance(cond, ir.Value):
             return self.visit(node.body if cond else node.orelse)
         c = self._runtime_cond(cond, "a conditional expression")

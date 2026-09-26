@@ -71,9 +71,20 @@ def matmul_desc(a, b, c=None, bm: int = 64, bn: int = 64, bk: int = 32, num_warp
     return c
 
 
-matmul_desc_tuned = enceladus.autotune(configs=matmul_configs(), key=["M", "N", "K"])(
-    matmul_desc_kernel
-)
+def _configs_for_dtype(configs, named):
+    """Keeps the configs that `matmul_configs` lists for the dtype of `a`."""
+    allowed = matmul_configs(named["a_ptr"].dtype)
+    return [c for c in configs if c in allowed]
+
+
+# The float16 list is a superset of the float32 one. Pruning by dtype keeps the float32
+# spill-cliff shapes out of float32 tuning. The key includes the argument dtypes, so each
+# dtype is tuned separately.
+matmul_desc_tuned = enceladus.autotune(
+    configs=matmul_configs("float16"),
+    key=["M", "N", "K"],
+    prune_configs_by={"early_config_prune": _configs_for_dtype},
+)(matmul_desc_kernel)
 
 
 def matmul_tuned(a, b, c=None):

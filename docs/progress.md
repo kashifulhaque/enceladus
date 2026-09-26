@@ -364,3 +364,77 @@ The whole suite runs 390 tests, with 18 skipped, in 1.3 s.
   The reference kernel measured 4.95-5.09 in the same harness.
 - The recompilation warning can name a misleading argument when many launch
   configurations are in play; its hint is only a heuristic.
+
+## Fixes after M5
+
+An audit that compared compiled, interpreted, and NumPy results found several silent
+miscompiles and autotuning defects. Each fix has a regression test that fails on the
+previous code. The suite runs 476 tests, with 18 skipped, in about 1.7 s.
+
+### Miscompiles fixed
+
+- **Generated names shadowed user names.** A kernel argument named `r`, `i`, `j`, `kk`,
+  `fa`, `fb`, `buf`, or `tk` captured a local in the generated code. `RESERVED` in
+  `codegen/emitter.py` now lists every fixed identifier that codegen and the prelude emit.
+  It also lists every object-like macro in the `metal_stdlib` headers (such as `INT_MAX`
+  and `M_SQRT2_F`), the `ray_data`, `object_data`, and `threadgroup_imageblock` address
+  spaces, and `main`, which MSL forbids as a kernel name. Names that start with `METAL_`
+  or `TARGET_OS_` are escaped by prefix, because those macro families grow with the SDK.
+- **`tl.dot` overwrote an accumulator that a loop reads again.** `acc0 = tl.dot(a, b)`
+  followed by `tl.dot(a, b, acc0)` in a loop accumulated across iterations. In-place
+  updates now require that the accumulator owns its storage and that only `if` regions
+  sit between its definition and the dot. The loop-carried `acc = tl.dot(a, b, acc)`
+  pattern still updates in place.
+- **Descriptor accesses at negative offsets weren't masked.** Loads, stores, and direct
+  `dot` operands now check `index >= 0` as well as `index < shape`.
+- **64-bit pointer offsets were truncated to 32 bits.** A kernel that adds an `int64`,
+  `uint64`, or `uint32` offset to a pointer tile now uses `long` offsets for all its
+  pointer tiles. Generated MSL for every other kernel is unchanged. The `idx64` gap for
+  tensors of 2^31 bytes or more remains.
+- **`p - k` wrapped around for the smallest `int8` and `int16` values.** `-(-128)` is
+  -128 in `int8`, so the pointer moved the wrong way. Offsets narrower than 32 bits are
+  now negated in `int32`, and `uint32` offsets in `int64`.
+- **`and` and `or` returned booleans.** They now follow Python's semantics in compiled
+  mode, as in the interpreter: `a or b` is `a` when `a` is truthy, and the right side runs
+  only when needed. Both operands need the same type. On tiles, `and` and `or` raise an
+  error that suggests `&` and `|`. A compile-time right side that decides the result
+  folds, as it did before this change: `c and False` is `False` and `c or True` is `True`
+  in a test, or when `c` is a comparison. This keeps `if pid > 0 and HAS_BIAS:` with
+  `HAS_BIAS=False` from compiling a load through a `None` pointer.
+- **Wide integers converted to `half` and `bfloat` without an FP32 step.** `half(long)`
+  overflowed from 65505 instead of 65520. These casts now go through `float`, which
+  matches the interpreter and NumPy.
+
+### Autotuning fixes
+
+- `matmul_configs` recognizes NumPy scalar types such as `np.float32`, so FP32 tuning no
+  longer includes the excluded 32 x 32 strips. Unsupported dtypes raise `ValueError`.
+- `examples/04_matmul.py` prunes the config list by the dtype of `a`.
+- A result loaded from the disk cache maps back to the matching candidate, so it keeps
+  its `pre_hook`. The match happens at the first launch for its key, against the configs
+  that `early_config_prune` returns, so a prune function that builds new `Config` objects
+  still reuses saved results. A result that matches no candidate is re-tuned.
+- A config that fails at run time is skipped with a warning, like a compile failure.
+  This catches any exception, which is broader than Triton's list.
+
+### Benchmarks
+
+In an interleaved A/B run in one process, the FP32 4096³ matmul measured 4.83-4.89
+TFLOPS with the new bounds checks and 4.84-4.87 without them. The loop body is unchanged;
+only the per-step interior test, the edge-fragment helper, and the epilogue masks gained
+`>= 0` terms.
+
+### Known gaps
+
+- The GPU flushes FP32 denormals to zero, and the interpreter keeps them, so the two
+  modes differ for denormal inputs.
+- In the interpreter, `n and tile` returns the tile when `n` is truthy. Compiled mode
+  refuses it. `not tile` compiles to an elementwise not, and the interpreter raises.
+- `x[:, None] + y[None, :]` at shapes such as 2 x 512 is refused as needing more than 256
+  registers, because the broadcast view holds every copy in registers.
+- `p - k` for an `int32` `k` of -2^31 still wraps around. Negating it in `int64` would
+  move the pointer by 2^31 elements, which the `idx64` gap already rules out.
+- Adding a 0-d tile, such as `tl.full((), 4, tl.int32)`, to a scalar pointer is refused
+  with "can't broadcast a tile of shape () to a scalar". This predates the fixes.
+- If configs share an identity but have different `pre_hook`s, a saved result maps back
+  to the first of them, which might not be the one that won the benchmark.

@@ -71,6 +71,11 @@ def _loop_type_change(x_ptr, n, BLOCK: tl.constexpr):
 
 
 @enceladus.jit
+def _or_changes_type(x_ptr, n):
+    tl.store(x_ptr, n or 2.5)  # error
+
+
+@enceladus.jit
 def _returns_value(x_ptr):
     return tl.load(x_ptr)  # error
 
@@ -93,6 +98,7 @@ ERROR_CASES = [
     (_break_in_loop, {}, "`break` isn't supported"),
     (_if_on_tile, {"BLOCK": 64}, "tl.where"),
     (_loop_type_change, {"BLOCK": 64}, "loop-carried variable `acc`"),
+    (_or_changes_type, {}, "both need the same type"),
     (_returns_value, {}, "can't return values"),
     (_calls_recursive, {}, "recursion isn't supported"),
 ]

@@ -56,11 +56,29 @@ BARRIER = "threadgroup_barrier(mem_flags::mem_threadgroup);"
 MAX_REGS_WARN, MAX_REGS_ERROR = 128, 256
 
 
-def ctype(t: ir.Type) -> str:
+def ctype(t: ir.Type, offset_type: str = "int") -> str:
+    """Returns the C type of one element of `t`. Pointer tiles hold `offset_type` offsets."""
     e = ir.elem_of(t)
     if isinstance(e, ir.PointerType):
-        return "int"  # pointer tiles hold offsets
+        return offset_type
     return CTYPES[e.name]
+
+
+# Offset dtypes that don't fit in a 32-bit `int`.
+WIDE_OFFSETS = frozenset(["i64", "u64", "u32"])
+
+
+def offset_type(module: ir.Module) -> str:
+    """Returns the C type of pointer-tile offsets in `module`.
+
+    Offsets are `int` unless some pointer tile gets an offset that doesn't fit in 32 bits,
+    such as an `int64` one. Then every pointer tile in the kernel uses `long` offsets.
+    """
+    for op in module.walk():
+        if op.name == "addptr" and isinstance(op.result.type, ir.TileType):
+            if ir.elem_of(op.operands[1].type).name in WIDE_OFFSETS:
+                return "long"
+    return "int"
 
 
 def is_half(t: ir.ScalarType) -> bool:
@@ -157,6 +175,7 @@ class _Codegen:
         self.nw = plan.num_warps
         self.max_tg = max_tg_memory
         self.names = NameGen()
+        self.off_t = offset_type(module)
         self.e = Emitter()
         self.prologue: dict[str, tuple[str, str]] = {}  # key -> (name, code)
         self.sv: dict[int, str] = {}  # scalar value -> expression
@@ -181,6 +200,9 @@ class _Codegen:
 
     def err(self, msg: str) -> CompilationError:
         return CompilationError(msg, self.loc)
+
+    def ctype(self, t: ir.Type) -> str:
+        return ctype(t, self.off_t)
 
     def fresh(self, hint: str | None) -> str:
         return self.names.fresh(hint)
@@ -217,7 +239,10 @@ class _Codegen:
     def declare(self, t: ir.Type, lay: L.BitLayout, hint: str | None) -> str:
         name = self.fresh(hint)
         e = ir.elem_of(t)
-        nbytes = 4 if isinstance(e, ir.PointerType) else max(1, e.dtype.itemsize)
+        if isinstance(e, ir.PointerType):
+            nbytes = 8 if self.off_t == "long" else 4
+        else:
+            nbytes = max(1, e.dtype.itemsize)
         regs32 = lay.num_regs * max(1, nbytes // 4) if nbytes >= 4 else lay.num_regs
         if regs32 > MAX_REGS_ERROR:
             raise self.err(
@@ -226,7 +251,7 @@ class _Codegen:
             )
         if regs32 > MAX_REGS_WARN:
             self.warnings.append(f"{self.loc}: a tile uses {regs32} registers per thread")
-        self.e.line(f"{ctype(t)} {name}[{lay.num_regs}];")
+        self.e.line(f"{self.ctype(t)} {name}[{lay.num_regs}];")
         return name
 
     def declare_frag(self, t: ir.Type, lay: L.BitLayout, hint: str | None) -> Tile | None:
@@ -392,6 +417,12 @@ class _Codegen:
                 return f"{CTYPES[out.name]}({a})"
             if is_half(src) and is_half(out) or (is_half(src) and not is_float(out)):
                 return f"{CTYPES[out.name]}(float({a}))"
+            # Wide integers convert to half and bfloat through float, which matches the
+            # interpreter and NumPy. A direct `half(long)` gives infinity from 65505 instead
+            # of from 65520, and a direct `bfloat(int)` skips the float rounding step.
+            if is_half(out) and not is_float(src) and \
+                    src.dtype.primitive_bitwidth >= (32 if out.name == "bf16" else 64):  # fmt: skip
+                return f"{CTYPES[out.name]}(float({a}))"
             return f"{CTYPES[out.name]}({a})"
         if name == "bitcast":
             return f"as_type<{CTYPES[out.name]}>({args[0]})"
@@ -472,10 +503,16 @@ class _Codegen:
             o = off if isinstance(off, str) else None
             if isinstance(off, Tile) and off.uniform is not None:
                 o = off.uniform
+            # With `long` offsets, the offsets become 64-bit before any pointer arithmetic,
+            # so a `uint` offset can't wrap around at 2^32.
+            off_64 = ir.elem_of(types[1]).name in ("i64", "u64")
             if p.uniform is not None and o is not None:
-                u = o if p.uniform == "0" else f"({p.uniform} + {o})"
+                if p.uniform == "0":
+                    u = o if self.off_t == "int" or off_64 else f"long({o})"
+                else:
+                    u = f"({p.uniform} + {o})"
                 return Tile(lay, uniform=u, base=p.base, root=p.root)
-            if p.uniform == "0" and isinstance(off, Tile):
+            if p.uniform == "0" and isinstance(off, Tile) and (self.off_t == "int" or off_64):
                 return Tile(lay, off.name, base=p.base, root=p.root)
             arr = self.declare(op.result.type, lay, hint)
             og = (lambda r: o) if o is not None else off.get  # type: ignore[union-attr]
@@ -497,7 +534,7 @@ class _Codegen:
             args = [x if isinstance(x, str) else x.uniform for x in ins]
             e = self.expr(op, args, types)
             name = self.fresh(hint)
-            self.e.line(f"const {ctype(op.result.type)} {name} = {e};")
+            self.e.line(f"const {self.ctype(op.result.type)} {name} = {e};")
             return Tile(lay, uniform=name, base=base, root=root)
         arr = self.declare(op.result.type, lay, hint)
         args = [x if isinstance(x, str) else x.get("{r}") for x in ins]
@@ -514,8 +551,12 @@ class _Codegen:
             for r, sr in enumerate(m):
                 self.e.line(f"{name}[{r}] = {t.get(sr)};")
             return Tile(lay, name, base=t.base, root=t.root)
-        cty = ctype(v.type)
-        eb = 4 if cty == "int" else max(1, ir.elem_of(v.type).dtype.itemsize)
+        cty = self.ctype(v.type)
+        e = ir.elem_of(v.type)
+        if isinstance(e, ir.PointerType):
+            eb = 8 if cty == "long" else 4
+        else:
+            eb = max(1, e.dtype.itemsize)
         shape = lay.shape
         inner = shape[-1] + (16 // eb if shape[-1] >= 16 else 0)
         strides, acc = [], 1
@@ -741,7 +782,7 @@ class _Codegen:
                 if src.name in names and src.name != tgt.name:
                     tmp = self.fresh("tmp")
                     n = tgt.layout.num_regs
-                    self.e.line(f"{ctype_of_tile(tgt, targets, values)} {tmp}[{n}];")
+                    self.e.line(f"{self.ctype(values[targets.index(tgt)].type)} {tmp}[{n}];")
                     self._assign(Tile(tgt.layout, tmp), src, n)
                     src = Tile(tgt.layout, tmp)
                 staged.append((tgt, src))
@@ -888,11 +929,6 @@ def _body_ops(block: ir.Block) -> ir.Block:
     view = ir.Block()
     view.ops = block.ops[:-1]
     return view
-
-
-def ctype_of_tile(tgt: Tile, targets: list, values: list[ir.Value]) -> str:
-    i = targets.index(tgt)
-    return ctype(values[i].type)
 
 
 def generate(module: ir.Module, plan: LayoutPlan, max_tg_memory: int = 32768) -> GeneratedKernel:
