@@ -1,4 +1,4 @@
-"""Matmul TFLOPS against MLX and PyTorch MPS.
+"""Matmul TFLOPS for both `tl.dot` backends, against MLX and PyTorch MPS.
 
 Enceladus uses GPU timestamps. MLX and PyTorch use wall clock around a synchronized call
 (overhead is under 1% at 4096^3). Operands come from memory, never constants.
@@ -9,6 +9,7 @@ Run with `uv run python benchmarks/bench_matmul.py [--quick]`.
 from __future__ import annotations
 
 import importlib.util
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -65,43 +66,59 @@ def torch_ms(m, n, k, dtype):
     return wall_min(lambda: a @ b, torch.mps.synchronize)
 
 
+def interleaved(variants: dict, rounds: int = 3, rep: int = 10) -> dict[str, list[float]]:
+    """Times each variant `rounds` times in turn and returns all samples per variant.
+
+    Alternating the variants spreads GPU clock changes and other GPU users across them.
+    """
+    samples: dict[str, list[float]] = {name: [] for name in variants}
+    for _ in range(rounds):
+        for name, fn in variants.items():
+            samples[name] += do_bench(fn, rep=rep, return_mode="all")
+    return samples
+
+
+def row(label: str, dtype: str, cfg: str, flops: float, ms: list[float], extra: str = "") -> None:
+    best, med = min(ms), statistics.median(ms)
+    print(f"{label:<18}{dtype:<10}{cfg:<24}{flops / best / 1e9:8.2f}{flops / med / 1e9:8.2f}"
+          f"{extra}")  # fmt: skip
+
+
 def main() -> None:
     ex = load("04_matmul")
     fused = load("07_matmul_fused")
     shapes = SHAPES[:1] if "--quick" in sys.argv else SHAPES
     print(f"Device: {enceladus.get_device().caps.name}")
-    print(f"{'shape':<18}{'dtype':<10}{'config':<22}{'TFLOPS':>8}{'MLX':>8}{'torch':>8}")
+    print("TFLOPS as the minimum and median time over 3 interleaved rounds of 10 runs.")
+    print(f"{'shape':<18}{'dtype':<10}{'config':<24}{'TFLOPS':>8}{'median':>8}{'MLX':>8}"
+          f"{'torch':>8}")  # fmt: skip
     for m, n, k in shapes:
+        flops = 2 * m * n * k
         for dtype in ("float32", "float16", "bfloat16"):
             a, b = enceladus.randn(m, k, dtype=dtype), enceladus.randn(k, n, dtype=dtype)
             c = enceladus.empty((m, n), dtype)
             refs = [mlx_ms(m, n, k, dtype), torch_ms(m, n, k, dtype)]
             ref = "".join(f"{tflops(m, n, k, r):8.2f}" if r else f"{'n/a':>8}" for r in refs)
-            for bm, bn, bk, nw in ((64, 64, 32, 4),):
-                def run(bm=bm, bn=bn, bk=bk, nw=nw):
-                    ex.matmul_desc(a, b, c, bm, bn, bk, nw)
-
-                ms = do_bench(run, rep=10, return_mode="min")
-                cfg = f"{bm}x{bn}x{bk} w{nw}"
-                print(f"{f'{m}x{n}x{k}':<18}{dtype:<10}{cfg:<22}{tflops(m, n, k, ms):8.2f}{ref}")
             ex.matmul_tuned(a, b, c)  # tunes on first use
-
-            def run_tuned():
-                ex.matmul_tuned(a, b, c)
-
-            tms = do_bench(run_tuned, rep=10, return_mode="min")
             best = ex.matmul_desc_tuned.config_for(a, b, c, m, n, k, k, n, n)
-            tcfg = f"tuned {best.kwargs['BM']}x{best.kwargs['BN']} w{best.dot_warps}"
-            print(f"{'':<18}{dtype:<10}{tcfg:<22}{tflops(m, n, k, tms):8.2f}")
+            variants = {
+                "simdgroup 64x64x32 w4": lambda: ex.matmul_desc(a, b, c, 64, 64, 32, 4,
+                                                                 "simdgroup"),
+                "mpp 64x64 w4": lambda: ex.matmul_desc(a, b, c, 64, 64, 32, 4, "mpp"),
+                f"tuned {best.kwargs['BM']}x{best.kwargs['BN']} "
+                f"{'mpp' if best.dot_backend == 'mpp' else 'sg'} w{best.num_warps}":
+                    lambda: ex.matmul_tuned(a, b, c),
+            }  # fmt: skip
             if (m, n, k) == SHAPES[0] and dtype != "bfloat16":
                 bias = enceladus.randn(n, dtype=dtype)
-
-                def run_fused():
-                    fused.matmul_bias_gelu(a, b, bias, c)
-
-                fms = do_bench(run_fused, rep=10, return_mode="min")
-                print(f"{'':<18}{dtype:<10}{'+ bias + GELU':<22}{tflops(m, n, k, fms):8.2f}"
-                      f"  ({fms / ms - 1:+.1%} vs plain)")
+                for backend in ("simdgroup", "mpp"):
+                    variants[f"{backend} + bias + GELU"] = (
+                        lambda backend=backend: fused.matmul_bias_gelu(a, b, bias, c,
+                                                                       dot_backend=backend))
+            res = interleaved(variants)
+            label = f"{m}x{n}x{k}"
+            for i, (cfg, ms) in enumerate(res.items()):
+                row(label if i == 0 else "", dtype, cfg, flops, ms, ref if i == 0 else "")
 
 
 if __name__ == "__main__":

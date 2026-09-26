@@ -28,6 +28,16 @@ _HALF_ONLY = [
     (64, 64, 32, 4, (2, 2)),  # 32x32
     (128, 64, 32, 8, (4, 2)),  # 32x32
 ]
+# (BM, BN, BK, num_warps) for the Metal 4 `matmul2d` backend, measured on M4 Pro. 64x64
+# is the fastest at 4096^3 in FP16 and BF16 (3-6% over `simdgroup`); the smaller tiles
+# run ragged and small shapes, such as 513^3, about 2x faster than `simdgroup` in every
+# dtype. FP32 `matmul2d` measured 20-30% slower than `simdgroup` at 4096^3, and tuning
+# rejects it there. `dot_warps` applies if a kernel falls back to `simdgroup`.
+_MPP = [
+    (64, 64, 32, 4),
+    (64, 32, 32, 4),
+    (32, 32, 32, 4),
+]
 
 
 _FP32_NAMES = ("float32", "fp32", "f32")
@@ -51,6 +61,9 @@ def _dtype_name(dtype: Any) -> str:
 def matmul_configs(dtype: Any = "float16") -> list[Config]:
     """Returns the matmul configurations to autotune over for `dtype`.
 
+    The list includes `dot_backend="mpp"` configurations. On a device without Metal 4
+    `matmul2d`, they compile with the `simdgroup` backend.
+
     Args:
         dtype: The operand dtype: float32, float16, or bfloat16, as a tl dtype, a NumPy
             dtype or scalar type, a torch or MLX dtype, or a name such as `"float32"`.
@@ -66,8 +79,11 @@ def matmul_configs(dtype: Any = "float16") -> list[Config]:
     else:
         raise ValueError(f"matmul_configs supports float32, float16, and bfloat16, but got "
                          f"{dtype!r}")  # fmt: skip
-    return [Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=nw, dot_warps=dw)
-            for bm, bn, bk, nw, dw in shapes]  # fmt: skip
+    configs = [Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=nw, dot_warps=dw)
+               for bm, bn, bk, nw, dw in shapes]  # fmt: skip
+    return configs + [Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=nw,
+                             dot_warps=(min(nw, bm // 8), nw // min(nw, bm // 8)),
+                             dot_backend="mpp") for bm, bn, bk, nw in _MPP]  # fmt: skip
 
 
 # (BLOCK_M, BLOCK_N, num_warps) for flash attention. Every SIMD group owns whole query
