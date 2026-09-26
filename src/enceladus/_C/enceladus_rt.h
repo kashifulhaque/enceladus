@@ -34,6 +34,34 @@ void *fr_queue_new(void *dev);
 void fr_release(void *obj);
 void fr_retain(void *obj);
 
+// ---- Shader logging --------------------------------------------------------
+
+// Creates a command queue with an MTLLogState that collects `os_log` messages from
+// kernels compiled with logging enabled. *sink_out receives a log sink that owns the
+// collected messages; free it with fr_log_sink_free() after releasing the queue. A
+// message equal to `sentinel` isn't collected; it only counts as a sentinel (see
+// fr_stream_set_log_sentinel). Returns NULL with a message in err on failure.
+void *fr_queue_new_logging(void *dev, uint64_t buffer_size, const char *sentinel,
+                           void **sink_out, char *err, size_t errlen);
+// Calls fn(ctx, message, length) for each collected message, oldest first, and removes
+// them. Returns the number of messages delivered. Doesn't block.
+int fr_log_sink_drain(void *sink, void (*fn)(void *ctx, const char *msg, size_t len), void *ctx);
+// Returns the number of sentinel messages the sink has received.
+uint64_t fr_log_sink_sentinels(void *sink);
+// Waits until the sink has received at least `count` sentinels or `timeout_s` passes.
+// Returns 1 if the count was reached.
+int fr_log_sink_wait_sentinels(void *sink, uint64_t count, double timeout_s);
+void fr_log_sink_free(void *sink);
+
+// ---- GPU capture -----------------------------------------------------------
+
+// Starts capturing all GPU work on `dev` into a GPU trace document at `path`. Metal
+// refuses once the process has created a command queue with an MTLLogState.
+// Returns 0 on success, or nonzero with a message in err.
+int fr_capture_start(void *dev, const char *path, char *err, size_t errlen);
+// Stops the capture that fr_capture_start started.
+void fr_capture_stop(void);
+
 // ---- Compilation -----------------------------------------------------------
 
 enum { FR_MATH_SAFE = 0, FR_MATH_RELAXED = 1, FR_MATH_FAST = 2 };
@@ -113,6 +141,16 @@ void fr_stream_flush(void *stream);
 // command buffer since the previous sync failed.
 int fr_stream_sync(void *stream, char *err, size_t errlen);
 int fr_stream_pending(void *stream);
+// Shader log messages arrive after their command buffer completes, in order within a
+// command buffer but not across command buffers. With a sentinel pipeline set, the
+// stream ends each command buffer that holds a marked dispatch with one dispatch of the
+// sentinel kernel, which logs the queue's sentinel message. When the sink has counted
+// fr_stream_log_sentinels() sentinels, every earlier message has arrived.
+void fr_stream_set_log_sentinel(void *stream, void *pso);
+// Marks the open (or next) command buffer as holding a dispatch that logs.
+void fr_stream_mark_logging(void *stream);
+// Returns the number of sentinel dispatches the stream has committed.
+uint64_t fr_stream_log_sentinels(void *stream);
 // Flushes, then runs one dispatch in its own command buffer and waits. Writes
 // GPUStartTime and GPUEndTime in seconds. Returns 0 on success.
 int fr_stream_timed_run(void *stream, void *pso, const char *name, const fr_launch_plan *plan,

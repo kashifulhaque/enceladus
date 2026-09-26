@@ -61,3 +61,27 @@ def format_error(message: str, loc: Loc | None) -> str:
         caret = " " * max(0, loc.col - 1) + "^"
         out += f"\n{text}\n{caret}"
     return out
+
+
+class DeviceAssertionError(AssertionError):
+    """A `tl.device_assert` failed while a kernel ran.
+
+    The compiled path raises it when the stream synchronizes after the failing launch;
+    the interpreter raises it as soon as the assert fails.
+
+    Attributes:
+        message: The assert's message.
+        loc: The source location of the `tl.device_assert` call, or `None` if unknown.
+        program_id: The (x, y, z) program ID of the first failing program.
+    """
+
+    def __init__(self, message: str, loc: Loc | None, program_id: tuple[int, int, int]):
+        self.message = message
+        self.loc = loc
+        self.program_id = tuple(program_id)
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        pid = ", ".join(map(str, self.program_id))
+        what = f"device assertion failed in program ({pid})"
+        return format_error(f"{what}: {self.message}" if self.message else what, self.loc)

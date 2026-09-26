@@ -4,6 +4,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,6 +71,123 @@ void fr_retain(void *obj) {
 
 void fr_release(void *obj) {
     if (obj) CFRelease(obj);
+}
+
+// ---- Shader logging --------------------------------------------------------
+
+// Messages arrive on a Metal thread. The handler only appends to this sink, so it never
+// touches Python or the GIL; Python drains the sink after a stream sync.
+struct fr_log_sink_state {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    std::string sentinel;
+    uint64_t sentinels = 0;
+};
+
+using fr_log_sink_ref = std::shared_ptr<fr_log_sink_state>;
+
+void *fr_queue_new_logging(void *dev, uint64_t buffer_size, const char *sentinel,
+                           void **sink_out, char *err, size_t errlen) {
+    @autoreleasepool {
+        id<MTLDevice> d = BORROW(id<MTLDevice>, dev);
+        MTLLogStateDescriptor *ld = [MTLLogStateDescriptor new];
+        ld.level = MTLLogLevelDebug;
+        ld.bufferSize = (NSInteger)buffer_size;
+        NSError *e = nil;
+        id<MTLLogState> ls = [d newLogStateWithDescriptor:ld error:&e];
+        if (!ls) {
+            copy_str(e ? e.localizedDescription : @"newLogStateWithDescriptor failed", err,
+                     errlen);
+            return NULL;
+        }
+        fr_log_sink_ref sink = std::make_shared<fr_log_sink_state>();
+        sink->sentinel = sentinel ? sentinel : "";
+        [ls addLogHandler:^(NSString *subsystem, NSString *category, MTLLogLevel level,
+                            NSString *message) {
+          (void)subsystem;
+          (void)category;
+          (void)level;
+          std::string m = message ? message.UTF8String : "";
+          {
+              std::lock_guard<std::mutex> lock(sink->mu);
+              if (!sink->sentinel.empty() && m == sink->sentinel) {
+                  ++sink->sentinels;
+              } else {
+                  sink->lines.push_back(std::move(m));
+              }
+          }
+          sink->cv.notify_all();
+        }];
+        MTLCommandQueueDescriptor *qd = [MTLCommandQueueDescriptor new];
+        qd.logState = ls;
+        id<MTLCommandQueue> q = [d newCommandQueueWithDescriptor:qd];
+        if (!q) {
+            copy_str(@"newCommandQueueWithDescriptor failed", err, errlen);
+            return NULL;
+        }
+        *sink_out = new fr_log_sink_ref(sink);
+        return RETAIN(q);
+    }
+}
+
+int fr_log_sink_drain(void *sink, void (*fn)(void *ctx, const char *msg, size_t len), void *ctx) {
+    fr_log_sink_state &s = **(fr_log_sink_ref *)sink;
+    std::deque<std::string> out;
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        out.swap(s.lines);
+    }
+    for (auto &m : out) fn(ctx, m.data(), m.size());
+    return (int)out.size();
+}
+
+uint64_t fr_log_sink_sentinels(void *sink) {
+    fr_log_sink_state &s = **(fr_log_sink_ref *)sink;
+    std::lock_guard<std::mutex> lock(s.mu);
+    return s.sentinels;
+}
+
+int fr_log_sink_wait_sentinels(void *sink, uint64_t count, double timeout_s) {
+    fr_log_sink_state &s = **(fr_log_sink_ref *)sink;
+    std::unique_lock<std::mutex> lock(s.mu);
+    return s.cv.wait_for(lock, std::chrono::duration<double>(timeout_s),
+                         [&] { return s.sentinels >= count; })
+               ? 1
+               : 0;
+}
+
+void fr_log_sink_free(void *sink) { delete (fr_log_sink_ref *)sink; }
+
+// ---- GPU capture -----------------------------------------------------------
+
+int fr_capture_start(void *dev, const char *path, char *err, size_t errlen) {
+    @autoreleasepool {
+        MTLCaptureManager *m = [MTLCaptureManager sharedCaptureManager];
+        if (![m supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+            copy_str(@"this process can't write GPU trace documents; set MTL_CAPTURE_ENABLED=1 "
+                     @"in the environment before the process starts",
+                     err, errlen);
+            return 1;
+        }
+        MTLCaptureDescriptor *cd = [MTLCaptureDescriptor new];
+        cd.captureObject = BORROW(id<MTLDevice>, dev);
+        cd.destination = MTLCaptureDestinationGPUTraceDocument;
+        cd.outputURL = [NSURL fileURLWithPath:@(path)];
+        NSError *e = nil;
+        if (![m startCaptureWithDescriptor:cd error:&e]) {
+            copy_str(e ? e.localizedDescription : @"startCaptureWithDescriptor failed", err,
+                     errlen);
+            return 1;
+        }
+        return 0;
+    }
+}
+
+void fr_capture_stop(void) {
+    @autoreleasepool {
+        [[MTLCaptureManager sharedCaptureManager] stopCapture];
+    }
 }
 
 // ---- Compilation -----------------------------------------------------------
@@ -217,6 +339,9 @@ struct fr_stream {
     int pending = 0;
     std::vector<const char *> names;  // kernels in the open command buffer
     std::vector<fr_committed> committed;  // since the previous sync
+    id<MTLComputePipelineState> log_sentinel;  // see fr_stream_set_log_sentinel
+    bool log_marked = false;
+    uint64_t log_sentinels = 0;
 };
 
 void *fr_stream_new(void *queue) {
@@ -279,10 +404,27 @@ static std::string join_names(const std::vector<const char *> &names) {
     return out;
 }
 
+void fr_stream_set_log_sentinel(void *stream, void *pso) {
+    ((fr_stream *)stream)->log_sentinel = BORROW(id<MTLComputePipelineState>, pso);
+}
+
+void fr_stream_mark_logging(void *stream) { ((fr_stream *)stream)->log_marked = true; }
+
+uint64_t fr_stream_log_sentinels(void *stream) { return ((fr_stream *)stream)->log_sentinels; }
+
 void fr_stream_flush(void *stream) {
     fr_stream *s = (fr_stream *)stream;
     if (!s->enc) return;
     @autoreleasepool {
+        if (s->log_marked && s->log_sentinel) {
+            // The serial encoder runs this after every earlier dispatch, so its message
+            // is the last one this command buffer logs.
+            [s->enc setComputePipelineState:s->log_sentinel];
+            [s->enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            ++s->log_sentinels;
+        }
+        s->log_marked = false;
         [s->enc endEncoding];
         [s->cb encodeSignalEvent:s->event value:++s->next_value];
         [s->cb commit];
