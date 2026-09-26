@@ -12,7 +12,7 @@ PURE_OPS = frozenset(
     bitcast broadcast expand_dims reshape trans addptr make_desc""".split()
 )
 # Ops that are safe to delete when their results are unused.
-REMOVABLE_OPS = PURE_OPS | {"load", "dot", "reduce", "desc_load", "local_load"}
+REMOVABLE_OPS = PURE_OPS | {"load", "dot", "reduce", "scan", "desc_load", "local_load"}
 
 
 def _freeze(v: Any) -> Any:

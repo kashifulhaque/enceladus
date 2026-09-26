@@ -1116,3 +1116,335 @@ TILE_METHODS["sum"] = sum_
 TILE_METHODS["max"] = max_
 TILE_METHODS["min"] = min_
 TILE_METHODS["abs"] = abs_
+
+
+# ---------------------------------------------------------------------------
+# Atomics
+# ---------------------------------------------------------------------------
+
+_ATOMIC_BITWISE = ("and", "or", "xor")
+
+
+def _check_sem(sem: Any, scope: Any, fname: str) -> None:
+    """Accepts only relaxed ordering at GPU or threadgroup scope."""
+    sem, scope = core.unwrap(sem), core.unwrap(scope)
+    if sem not in (None, "relaxed"):
+        raise CompilationError(
+            f"tl.{fname} supports only relaxed memory ordering, but got sem={sem!r}. Metal "
+            'device atomics are relaxed; omit `sem` or pass sem="relaxed".'
+        )
+    if scope not in (None, "gpu", "cta"):
+        raise CompilationError(
+            f'tl.{fname} supports scope="gpu" and scope="cta", but got scope={scope!r}'
+        )
+
+
+def check_atomic_dtype(kind: str, dt: core.dtype, fname: str) -> None:
+    """Raises an error when no backend can run atomic `kind` on elements of `dt`.
+
+    `kind` is an `atomic_rmw` op (`add`, `max`, `min`, `xchg`, `and`, `or`, `xor`) or `cas`.
+    Both execution modes call this check, so a kernel that runs in the interpreter doesn't
+    fail on the GPU because of its dtype.
+    """
+    if dt.is_bool():
+        raise CompilationError(f"tl.{fname} doesn't support int1 (boolean) pointers")
+    if dt.is_floating() and kind in _ATOMIC_BITWISE:
+        raise CompilationError(f"tl.{fname} needs integer elements, but the pointer is {dt}")
+    if kind == "add" and dt in (core.float16, core.bfloat16):
+        raise CompilationError(
+            f"tl.{fname} doesn't support {dt} addition, because 16-bit float atomics lose "
+            "precision and have no hardware support. Accumulate in a float32 buffer instead, "
+            "and convert the result afterward."
+        )
+    if dt.primitive_bitwidth == 64 and not (dt is core.uint64 and kind in ("max", "min")):
+        raise CompilationError(
+            f"tl.{fname} doesn't support {dt}: Metal has 64-bit atomics only for uint64 "
+            "tl.atomic_max and tl.atomic_min, and those return no old value. Use 32-bit "
+            "elements, or uint64 max and min whose result you don't use."
+        )
+
+
+def _atomic_frontend(ctx, kind: str, pointer, operands: list[Any], mask, sem, scope,
+                     fname: str):  # fmt: skip
+    b = ctx.b
+    p = core.unwrap(pointer)
+    if not semantic.is_pointer(p):
+        raise CompilationError(f"tl.{fname} needs a pointer or pointer tile, but got {describe(p)}")
+    _check_sem(sem, scope, fname)
+    elem = ir.elem_of(p.type).elem.dtype
+    check_atomic_dtype(kind, elem, fname)
+    vals = []
+    for v in operands:
+        v = core.unwrap(v)
+        if semantic.is_pointer(v):
+            raise CompilationError(f"tl.{fname} can't take pointers as values")
+        vals.append(semantic.to_value(b, v, elem))
+    mask = core.unwrap(mask)
+    if mask is True:
+        mask = None
+    if mask is not None:
+        if not isinstance(mask, ir.Value):
+            raise CompilationError(f"`mask` must be a boolean tile, but got {describe(mask)}")
+        _check_mask_dtype(semantic.dtype_of(mask))
+    shape = ir.shape_of(p.type)
+    for v in [*vals, *([mask] if mask is not None else [])]:
+        shape = semantic.broadcast_shapes(shape, ir.shape_of(v.type))
+    ops = [semantic.broadcast_to(b, p, shape)] + [semantic.broadcast_to(b, v, shape) for v in vals]
+    if mask is not None:
+        ops.append(semantic.broadcast_to(b, mask, shape))
+    rtype = ir.with_elem(ops[0].type, ir.scalar(elem))
+    if kind == "cas":
+        return b.create("atomic_cas", ops, [rtype]).result
+    return b.create("atomic_rmw", ops, [rtype], {"op": kind}).result
+
+
+def _apply_atomic(kind: str, old: np.ndarray, val: np.ndarray, cmp: np.ndarray | None,
+                  dt: core.dtype) -> np.ndarray:  # fmt: skip
+    """Returns the values that an atomic writes, given the old values."""
+    if kind == "xchg":
+        return val
+    if kind == "cas":
+        bits = np.dtype(f"u{dt.itemsize}")
+        return np.where(old.view(bits) == cmp.view(bits), val, old)
+    if kind in _ATOMIC_BITWISE:
+        return {"and": np.bitwise_and, "or": np.bitwise_or, "xor": np.bitwise_xor}[kind](old, val)
+    if dt.is_floating():
+        a, v = old.astype(np.float32), val.astype(np.float32)
+        out = {"add": np.add, "max": np.fmax, "min": np.fmin}[kind](a, v)
+        return out.astype(dt.to_numpy())
+    return {"add": np.add, "max": np.maximum, "min": np.minimum}[kind](old, val)
+
+
+def _atomic_interp(kind: str, pointer, operands: list[Any], mask, sem, scope, fname: str):
+    if not isinstance(pointer, IPointer):
+        raise CompilationError(f"tl.{fname} needs a pointer, but got {pointer!r}")
+    _check_sem(sem, scope, fname)
+    dt = pointer.elem
+    check_atomic_dtype(kind, dt, fname)
+    vals = [I.to_tile(core.unwrap(v), dt).data for v in operands]
+    arrays = [pointer.offsets, *vals]
+    mask = core.unwrap(mask)
+    if mask is not None and mask is not True:
+        m = _itile(mask)
+        _check_mask_dtype(m.dtype)
+        arrays.append(m.data)
+    shape: tuple[int, ...] = ()
+    for a in arrays:
+        shape = semantic.broadcast_shapes(shape, a.shape)
+    bc = [np.broadcast_to(a, shape) for a in arrays]
+    offs = bc[0]
+    mb = bc[1 + len(vals)] if len(bc) > 1 + len(vals) else np.ones(shape, bool)
+    pointer.check_bounds(offs, mb, fname)
+    old = np.zeros(shape, dt.to_numpy())
+    o = offs[mb]
+    v = bc[len(vals)][mb]  # the stored value is the last operand
+    c = bc[1][mb] if kind == "cas" else None
+    flat = pointer.flat
+    if np.unique(o).size == o.size:
+        cur = np.array(flat[o])
+        old[mb] = cur
+        flat[o] = _apply_atomic(kind, cur, v, c, dt)
+    else:
+        # Colliding addresses apply one at a time, in row-major order.
+        got = np.empty(o.shape, dt.to_numpy())
+        for i in range(o.size):
+            cur = np.array(flat[o[i : i + 1]])
+            got[i] = cur[0]
+            ci = None if c is None else c[i : i + 1]
+            flat[o[i : i + 1]] = _apply_atomic(kind, cur, v[i : i + 1], ci, dt)
+        old[mb] = got
+    return ITile(old, dt)
+
+
+def _make_atomic(kind: str) -> core.Builtin:
+    fname = f"atomic_{kind}"
+
+    def interp(pointer, val, mask=None, sem=None, scope=None):
+        return _atomic_interp(kind, pointer, [val], mask, sem, scope, fname)
+
+    def frontend(ctx, pointer, val, mask=None, sem=None, scope=None):
+        return _atomic_frontend(ctx, kind, pointer, [val], mask, sem, scope, fname)
+
+    what = {"add": "adds `val` to", "max": "stores the maximum of `val` and",
+            "min": "stores the minimum of `val` and", "xchg": "stores `val` in",
+            "and": "stores the bitwise AND of `val` and",
+            "or": "stores the bitwise OR of `val` and",
+            "xor": "stores the bitwise XOR of `val` and"}[kind]  # fmt: skip
+    frontend.__doc__ = (
+        f"Atomically {what} each element that `pointer` points to, where `mask` is true.\n\n"
+        "Returns the values that memory held before the operation, or 0 where `mask` is "
+        "false. Memory ordering is relaxed. Float `max` and `min` ignore NaN operands, like "
+        "tl.maximum and tl.minimum.\n"
+    )
+    return builtin(interp=interp, name=fname)(frontend)
+
+
+atomic_add = _make_atomic("add")
+atomic_max = _make_atomic("max")
+atomic_min = _make_atomic("min")
+atomic_xchg = _make_atomic("xchg")
+atomic_and = _make_atomic("and")
+atomic_or = _make_atomic("or")
+atomic_xor = _make_atomic("xor")
+
+
+def _i_atomic_cas(pointer, cmp, val, sem=None, scope=None):
+    return _atomic_interp("cas", pointer, [cmp, val], None, sem, scope, "atomic_cas")
+
+
+@builtin(interp=_i_atomic_cas)
+def atomic_cas(ctx, pointer, cmp, val, sem=None, scope=None):
+    """Atomically stores `val` where memory equals `cmp`, and returns the old values.
+
+    The comparison is bitwise, so for floats `-0.0` doesn't match `0.0`, and a NaN matches
+    a NaN with the same bits. Memory ordering is relaxed.
+    """
+    return _atomic_frontend(ctx, "cas", pointer, [cmp, val], None, sem, scope, "atomic_cas")
+
+
+# ---------------------------------------------------------------------------
+# Scans
+# ---------------------------------------------------------------------------
+
+
+def _scan_axis(axis: Any, rank: int, fname: str) -> int:
+    if core.unwrap(axis) is None:
+        raise CompilationError(f"tl.{fname} needs an `axis`")
+    return _axis(axis, rank)
+
+
+def _check_combine_fn(fn: Any, fname: str) -> None:
+    from enceladus.compiler.frontend import is_jit_function
+
+    if not is_jit_function(fn):
+        raise CompilationError(
+            f"tl.{fname} needs a @enceladus.jit function as `combine_fn`. Plain Python "
+            "functions aren't accepted, because the kernel cache doesn't track their source."
+        )
+
+
+def _scan_frontend(ctx, inputs: list[Any], axis, reverse, fname: str, kind: str | None = None,
+                   combine_fn=None) -> list[ir.Value]:  # fmt: skip
+    b = ctx.b
+    vals = [_tile_value(ctx, x, fname) for x in inputs]
+    if any(semantic.is_pointer(v) for v in vals):
+        raise CompilationError(f"tl.{fname} can't scan pointers")
+    if kind == "sum":
+        vals = [semantic.cast(b, vals[0], _sum_input_dtype(semantic.dtype_of(vals[0])))]
+    shapes = {v.type.shape for v in vals}
+    if len(shapes) != 1:
+        raise CompilationError(f"tl.{fname} needs inputs of one shape, but got {sorted(shapes)}")
+    ax = _scan_axis(axis, len(vals[0].type.shape), fname)
+    rev = core.unwrap(reverse)
+    if not isinstance(rev, bool):
+        raise CompilationError(f"`reverse` must be a compile-time bool, but got {describe(rev)}")
+    elems = [v.type.elem for v in vals]
+    attrs: dict[str, Any] = {"axis": ax, "reverse": rev}
+    regions = []
+    if kind is not None:
+        attrs["kind"] = kind
+    else:
+        names = [f"a{i}" for i in range(len(elems))] + [f"b{i}" for i in range(len(elems))]
+        block = ir.Block(elems + elems, names)
+        with b.at(block):
+            res = ctx.call_function(combine_fn, list(block.args), {})
+            res = res if isinstance(res, tuple) else (res,)
+            if len(res) != len(vals):
+                raise CompilationError(
+                    f"combine_fn returns {len(res)} values for {len(vals)} inputs"
+                )
+            pairs = enumerate(zip(res, elems, strict=True))
+            b.create("yield", [ctx.materialize(r, e, f"result {i} of combine_fn")
+                               for i, (r, e) in pairs])  # fmt: skip
+        regions = [ir.Region(block)]
+    op = b.create("scan", vals, [v.type for v in vals], attrs, regions=regions)
+    return list(op.results)
+
+
+def _hillis_steele(xs: list[ITile], ax: int, combine) -> list[ITile]:
+    """Returns the inclusive scan of `xs` along `ax`, calling `combine(earlier, later)`."""
+    n = xs[0].shape[ax]
+    s = 1
+    while s < n:
+        lo, hi, head = ([slice(None)] * len(xs[0].shape) for _ in range(3))
+        lo[ax], hi[ax], head[ax] = slice(0, n - s), slice(s, n), slice(0, s)
+        res = combine(*[ITile(x.data[tuple(lo)], x.dtype) for x in xs],
+                      *[ITile(x.data[tuple(hi)], x.dtype) for x in xs])  # fmt: skip
+        res = res if isinstance(res, tuple) else (res,)
+        if len(res) != len(xs):
+            raise CompilationError(f"combine_fn returns {len(res)} values for {len(xs)} inputs")
+        xs = [ITile(np.concatenate([x.data[tuple(head)], I.to_tile(r, x.dtype).data], axis=ax),
+                    x.dtype) for x, r in zip(xs, res, strict=True)]  # fmt: skip
+        s *= 2
+    return xs
+
+
+def _i_cumsum(input, axis=0, reverse=False, dtype=None):
+    t = _itile(input)
+    if dtype is not None:
+        t = I.convert(t, _dtype(dtype))
+    t = I.convert(t, _sum_input_dtype(t.dtype))
+    ax = _scan_axis(axis, len(t.shape), "cumsum")
+    data = I.as_compute(t, t.dtype)
+    rev = bool(core.unwrap(reverse))
+    if rev:
+        data = np.flip(data, ax)
+    out = np.cumsum(data, axis=ax, dtype=data.dtype)
+    if rev:
+        out = np.flip(out, ax)
+    return I.wrap(out, t.dtype)
+
+
+@builtin(interp=_i_cumsum)
+def cumsum(ctx, input, axis=0, reverse=False, dtype=None):
+    """Returns the inclusive cumulative sum along `axis`.
+
+    With `reverse=True`, each element is the sum of itself and every later element.
+    Integers narrower than 32 bits, including `int1`, sum in 32 bits. `float16` and
+    `bfloat16` accumulate in `float32` and round each result back.
+    """
+    v = _tile_value(ctx, input, "cumsum")
+    if dtype is not None:
+        v = semantic.cast(ctx.b, v, _dtype(dtype))
+    return _scan_frontend(ctx, [v], axis, reverse, "cumsum", kind="sum")[0]
+
+
+def _i_associative_scan(input, axis, combine_fn, reverse=False):
+    _check_combine_fn(combine_fn, "associative_scan")
+    single = not isinstance(input, tuple)
+    xs = [_itile(x) for x in ((input,) if single else input)]
+    shapes = {x.shape for x in xs}
+    if len(shapes) != 1:
+        raise CompilationError(
+            f"tl.associative_scan needs inputs of one shape, but got {sorted(shapes)}"
+        )
+    ax = _scan_axis(axis, len(xs[0].shape), "associative_scan")
+    rev = bool(core.unwrap(reverse))
+    if rev:
+        xs = [ITile(np.flip(x.data, ax), x.dtype) for x in xs]
+    xs = _hillis_steele(xs, ax, combine_fn)
+    if rev:
+        xs = [ITile(np.flip(x.data, ax), x.dtype) for x in xs]
+    return xs[0] if single else tuple(xs)
+
+
+@builtin(interp=_i_associative_scan)
+def associative_scan(ctx, input, axis, combine_fn, reverse=False):
+    """Returns the inclusive scan of `input` along `axis` with `combine_fn`.
+
+    `input` can be a tile or a tuple of tiles of the same shape. `combine_fn` is a
+    @enceladus.jit function that takes `(a0, ..., b0, ...)`, where the `a` values come
+    from earlier elements, and returns the combined values. It must be associative, but
+    it doesn't need to be commutative. With `reverse=True`, the scan runs from the last
+    element to the first, and the `a` values come from later elements.
+    """
+    fn = core.unwrap(combine_fn)
+    _check_combine_fn(fn, "associative_scan")
+    single = not isinstance(core.unwrap(input), tuple)
+    inputs = [input] if single else list(core.unwrap(input))
+    outs = _scan_frontend(ctx, inputs, axis, reverse, "associative_scan", combine_fn=fn)
+    return outs[0] if single else tuple(outs)
+
+
+_method(cumsum)
+_method(associative_scan)

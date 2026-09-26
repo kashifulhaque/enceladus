@@ -438,3 +438,111 @@ only the per-step interior test, the edge-fragment helper, and the epilogue mask
   with "can't broadcast a tile of shape () to a scalar". This predates the fixes.
 - If configs share an identity but have different `pre_hook`s, a saved result maps back
   to the first of them, which might not be the one that won the benchmark.
+
+## M7: Atomics and scans
+
+This entry covers the atomics and scans parts of M7. Flash attention has its own entry.
+
+### What was built
+
+- Atomics: `tl.atomic_add`, `atomic_max`, `atomic_min`, `atomic_xchg`, `atomic_and`,
+  `atomic_or`, `atomic_xor`, and `atomic_cas` on pointers and pointer tiles. They take
+  masks (except `atomic_cas`, as in Triton) and return the old values, or 0 where the mask
+  is false. `sem` accepts only `None` and `"relaxed"`; `scope` accepts `None`, `"gpu"`, and
+  `"cta"`. Anything else raises an error.
+- Atomic lowering, in `compiler/codegen/atomic.py`:
+  - Native `atomic_int` and `atomic_uint` operations for 32-bit integers, and
+    `atomic_float` add and exchange for `float32`.
+  - Compare-and-swap loops on the aligned 32-bit word for everything else: `float32` max
+    and min, `atomic_cas` of every width, and 8-bit and 16-bit elements (including
+    `float16` and `bfloat16` max, min, and exchange). The loops compare bit patterns, so
+    they end even for NaNs. Float max and min ignore NaN operands, like `tl.maximum`.
+  - `uint64` max and min through `atomic_max_explicit` on `atomic_ulong`, only when the
+    result is unused and the device is Apple9 or later.
+  - Atomics run only in the owning thread of each element when the layout has broadcast
+    lane or SIMD-group bits. The owner then shares the old value, with `simd_shuffle` for
+    lane bits or through threadgroup memory for SIMD-group bits. A scalar atomic runs in
+    thread 0 and shares its old value through threadgroup memory.
+- Scans: `tl.cumsum(x, axis=0, reverse=False, dtype=None)` and
+  `tl.associative_scan(x, axis, combine_fn, reverse=False)`, including tuples of tiles.
+  `cumsum` sums integers narrower than 32 bits (and `int1`) in 32 bits, like `tl.sum`,
+  and accumulates `float16` and `bfloat16` in `float32`. The `combine_fn` needs to be
+  associative but not commutative. A reverse scan equals flip, scan, flip.
+- Scan lowering, in `compiler/codegen/scan.py`, handles any `BitLayout`. It walks the
+  axis bits from least to most significant in runs of one kind (register, lane, or SIMD
+  group), because layouts interleave them. For example, a 1D blocked tile of 1,024
+  elements has register, lane, SIMD-group, and register bits, in that order. Register
+  runs combine in sequence in each thread. Lane runs use `simd_prefix_exclusive_sum` for
+  a forward sum over all 32 lanes, and a Hillis-Steele scan with `simd_shuffle`
+  otherwise. SIMD-group runs, and any run above a SIMD-group run, exchange block totals
+  through threadgroup memory. Each element then applies `combine(prefix, value)`.
+- The layout pass gives scan results their first input's layout and gives atomic results
+  the layout of their value, else their pointer, like `store`.
+- Helper functions that only atomics and scans use, such as `tg_shfl_idx` and the
+  compare-and-swap loops, go into the kernel source only when the kernel uses them.
+- `examples/09_histogram.py` bins float data with `tl.atomic_add`, and
+  `examples/10_cumsum.py` computes row-wise cumulative sums over blocks of rows.
+
+### Benchmarks
+
+These preliminary numbers come from `benchmarks/bench_scan_atomics.py`, taken while other
+agents shared the GPU:
+
+- Row cumsum, 4096 x 4096 `float32`, one row per program: 0.56 ms, 239-240 GB/s at 4, 8,
+  and 16 SIMD groups. MLX `mx.cumsum(axis=1)` measured 193 GB/s by wall clock.
+- Histogram of 2^24 `float32` values: 31 GB/s with 64 bins and 63 GB/s with 4,096 bins.
+  Contention on few global counters limits it.
+
+### Tests
+
+`tests/test_atomics_scans.py` adds 96 test cases, and the suite runs 572 tests, with 18
+skipped, in about 2 s. The tests cover the following:
+
+- Every atomic operation against the interpreter and NumPy, on aligned and ragged sizes
+  with masks, across native paths, compare-and-swap loops (`float32` max, `atomic_cas`),
+  and 8-bit and 16-bit elements that neighbor elements that other threads update at the
+  same time.
+- Broadcast layouts (16 or 64 elements over 32 or 128 threads). The count per element
+  catches duplicate atomics, and a `tl.cumsum` of the old values catches non-owner
+  threads that hold stale old values. Removing either the predication or the sharing
+  fails the test.
+- Scalar atomics that hand out unique tickets, `uint64` max with colliding addresses, and
+  the errors for `float16` addition and for using a `uint64` max result.
+- `tl.cumsum` through the example in five dtypes (including `bfloat16` and `int64`, which
+  takes the generic lane scan), three shapes, and both directions.
+- `tl.associative_scan` along both axes of 2D tiles, forward and reverse, with `max` and
+  with a non-commutative tuple scan (composition of affine maps in `int32`). Swapping the
+  combine order fails these tests.
+- Scans over a `tl.dot` accumulator, whose lane bits are out of order, and over a
+  flattened transpose, which puts a SIMD-group bit below the lane bits.
+
+### Deviations from the plan
+
+- 64-bit atomics are limited to `uint64` max and min with an unused result. Metal on
+  this machine accepts only `atomic_max_explicit` and `atomic_min_explicit` on
+  `atomic_ulong`, which return nothing. There's no 64-bit compare-and-swap to emulate the
+  rest, so the frontend refuses them in both modes.
+- `combine_fn` must be a `@enceladus.jit` function, as in `tl.reduce` and Triton. Plain
+  Python functions are refused, because the kernel's dependency hash doesn't cover them
+  and a disk-cache entry could go stale.
+- `tl.atomic_and`, `atomic_or`, and `atomic_xor` were added. They cost nothing on the
+  native path.
+- `bfloat16` addition is refused with the same error as `float16` addition.
+- Codegen reads the device family for `uint64` atomics from `module.attrs["apple_family"]`,
+  falling back to the default device.
+
+### Known gaps
+
+- Emulated 8-bit and 16-bit atomics use a compare-and-swap loop on the surrounding
+  32-bit word. A plain store by another thread to a neighboring element of the same word
+  can be lost while the loop runs. The loop also reads up to 3 bytes past the last element
+  of a buffer whose size isn't a multiple of 4 bytes.
+- The interpreter applies colliding atomics in row-major order. The GPU order differs, so
+  old values at colliding addresses, and `float32` sums, can differ between modes.
+- The interpreter doesn't know whether a `uint64` max result is used, so only compiled
+  mode refuses using it.
+- There are no threadgroup-memory atomics, so a histogram can't privatize its counters
+  per threadgroup.
+- A scan whose axis bits interleave SIMD-group and register bits exchanges through
+  threadgroup memory once per run, with two barriers each. A 1D blocked tile of 1,024
+  elements takes two exchanges.
