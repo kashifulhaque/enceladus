@@ -1,0 +1,33 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Guides</p>
+  <h1>Benchmarks</h1>
+  <p class="lede">The following results compare Enceladus with MLX on one Apple M4 Pro (<code>applegpu_g16s</code>, 16-core GPU, Apple9 family). This GPU isn't Apple10, so <code>matmul2d</code> runs on the regular shader cores. Each bar shows Enceladus throughput relative to MLX in the same run.</p>
+</header>
+
+<section class="doc" id="benchmarks">
+  <div class="prose"><h2>Dispatch overhead</h2></div>
+  <div class="tiles">
+    <div class="tile"><b>3.41 <small>µs</small></b><span><code>@enceladus.jit</code> launch, sustained</span></div>
+    <div class="tile"><b>1.00 <small>µs</small></b><span>Native stream dispatch, sustained</span></div>
+    <div class="tile"><b>70.67 <small>µs</small></b><span>Synchronized round trip, raw <code>metal_kernel</code></span></div>
+    <div class="tile"><b>0.37 <small>ms</small></b><span>Compile time for the vector add, frontend to MSL</span></div>
+  </div>
+  <div class="prose"><h2>Throughput relative to MLX</h2></div>
+  <div class="bench" id="bench">
+    <div class="bench-head">
+      <div class="bench-key">
+        <span><i style="background:var(--pos)"></i>Enceladus faster</span>
+        <span><i style="background:var(--neg)"></i>MLX faster</span>
+      </div>
+    </div>
+    <div id="bench-rows"></div>
+    <p class="bnote">Enceladus times use GPU timestamps; MLX times use the wall clock. Values are the minimum over repeated runs; matmul uses 3 interleaved rounds of 10 runs. Matmul rows show the best Enceladus configuration for the shape. The 513³ bar is clipped at +60%. Source: <code>benchmarks/results/2026-09-26-applegpu_g16s-m9.md</code>.</p>
+  </div>
+  <div class="prose">
+    <h2>Read the numbers</h2>
+    <p>Two effects are worth knowing when you read these numbers. The <code>float32</code> <code>mpp</code> matmul at 4096³ is bimodal, with a median of 3.36 TFLOPS against a best of 5.35. The autotuner can pick a configuration within about 5% of the best, because each tuning run is short. To reproduce the results, run <code>uv run python benchmarks/run_all.py</code>.</p>
+  </div>
+</section>
+</main>
+<script type="module" src="/src/benchmarks.js"></script>

@@ -1,0 +1,50 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Concepts</p>
+  <h1>Memory and synchronization</h1>
+  <p class="lede">How kernels address memory with masks, pointer tiles, and tensor descriptors, and when their results become visible to the CPU and to other frameworks.</p>
+</header>
+
+<section class="doc prose" id="memory">
+  <h2>Masks</h2>
+  <p>A <em>mask</em> is a boolean tile, usually a comparison such as <code>offs &lt; n</code>. <code>tl.load</code> reads only where the mask is true and returns <code>other</code> elsewhere. <code>tl.store</code> and the atomics write only where it's true.</p>
+  <div class="callout"><b>Note</b><p>The GPU doesn't check bounds on pointer accesses. To find an out-of-bounds access, run the kernel in the interpreter, which raises <code>IndexError</code> with the kernel's line.</p></div>
+  <h2>Pointers and tensor descriptors</h2>
+  <p>Enceladus gives you two ways to address memory:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Approach</th><th>How it works</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td>Pointer tiles</td><td><code>x_ptr + offs</code> gives a tile of pointers. You compute every address and mask every access.</td><td>Elementwise ops, reductions, gathers, strided or transposed access</td></tr>
+      <tr><td>Tensor descriptors</td><td><code>tl.make_tensor_descriptor(ptr, shape, strides, block_shape)</code> loads and stores whole blocks at element offsets and checks its own bounds. The innermost stride must be 1.</td><td>Matrix multiplication and attention. <code>tl.dot</code> reads descriptor loads straight from device memory.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="codeblock"><div class="bar"><span class="file">descriptors</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">a = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, 1], [BM, BK])
+tile = a.load([pid_m * BM, k])          # zeros where the block leaves the array
+c.store([pid_m * BM, pid_n * BN], acc)  # skips elements outside the array</code></pre></div>
+</section>
+
+<section class="doc prose" id="streams">
+  <h2>Streams and synchronization</h2>
+  <p>Launches go to a <em>stream</em>, an ordered queue of GPU work like a CUDA stream. Kernels on the stream run in launch order, so each kernel sees the writes of the kernels before it. The stream submits a Metal command buffer every 64 launches, or sooner when the CPU needs results.</p>
+  <p>To wait for all launched work, call <code>enceladus.synchronize()</code>. A failed <code>tl.device_assert</code> or command buffer surfaces at the next synchronization as <code>enceladus.DeviceAssertionError</code> or <code>enceladus.MetalError</code>. The stream isn't thread-safe, so launch kernels from one thread at a time.</p>
+  <p>When a launch waits depends on the arrays that you pass, as the following table shows:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Array arguments</th><th>Where the kernel runs</th><th>When results are visible</th></tr></thead>
+    <tbody>
+      <tr><td><code>enceladus.Tensor</code> only</td><td>Enceladus's stream, asynchronously</td><td>After a sync. <code>Tensor.numpy()</code>, <code>tolist()</code>, <code>print()</code>, and <code>np.asarray()</code> sync for you.</td></tr>
+      <tr><td>NumPy arrays, alone or with tensors</td><td>Enceladus's stream; the launch waits</td><td>When the launch returns. With <code>enceladus.async_numpy(True)</code>, after <code>enceladus.synchronize()</code>.</td></tr>
+      <tr><td>PyTorch MPS tensors only</td><td>PyTorch's MPS stream, through <code>torch.mps.compile_shader</code></td><td>In order with surrounding PyTorch operations</td></tr>
+      <tr><td>MLX arrays</td><td>Enceladus's stream; inputs are evaluated first and the launch waits</td><td>When the launch returns</td></tr>
+      <tr><td>PyTorch tensors mixed with other kinds</td><td>Enceladus's stream, between syncs of both streams</td><td>When the launch returns</td></tr>
+    </tbody>
+  </table></div>
+  <p>A synchronized launch costs about 70-100 µs. To batch many launches over NumPy arrays, turn the wait off and synchronize once:</p>
+  <div class="codeblock"><div class="bar"><span class="file">async_numpy.py</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">x = np.zeros(10_000, np.float32)
+enceladus.async_numpy(True)
+for _ in range(100):
+inc_kernel[(enceladus.cdiv(x.size, 1024),)](x, x.size, BLOCK=1024)
+enceladus.synchronize()  # required before reading x
+enceladus.async_numpy(False)
+assert (x == 100).all()</code></pre></div>
+</section>
+</main>

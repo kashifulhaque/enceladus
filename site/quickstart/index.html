@@ -1,0 +1,200 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Get started</p>
+  <h1>Quickstart</h1>
+  <p class="lede">Install Enceladus, and then run a vector add, a row softmax, a matrix multiplication, and flash attention on your Mac's GPU.</p>
+</header>
+
+<section class="doc prose" id="install">
+  <h2>Install Enceladus</h2>
+  <p>To use Enceladus, you need the following:</p>
+  <ul class="tight">
+    <li>A Mac with Apple silicon (M1 or later).</li>
+    <li>macOS 15 or later.</li>
+    <li>Python 3.11 or later.</li>
+    <li><a href="https://docs.astral.sh/uv/">uv</a>, the Python package and project manager.</li>
+  </ul>
+  <p>To add Enceladus to your uv project, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv add enceladus</code></pre></div>
+  <p>If you plan to pass PyTorch tensors or MLX arrays to kernels, install the matching extra, for example <code>uv add "enceladus[torch]"</code> or <code>uv add "enceladus[mlx]"</code>.</p>
+  <p>To check that Enceladus finds your GPU, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python -c "import enceladus; print(enceladus.get_device())"</code></pre></div>
+  <p>The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">&lt;enceladus.Device Apple M4 Pro (applegpu_g16s)&gt;</code></pre></div>
+  <p>To build from source, clone the repository, run <code>uv sync</code>, and then run the tests with <code>uv run pytest -q</code>.</p>
+</section>
+
+<section class="doc prose" id="quickstart">
+  <h2>Run four kernels</h2>
+  <p>Each of the following programs is complete. Save one to a file and run it with <code>uv run python FILE.py</code>, where <code>FILE</code> is the name you chose.</p>
+
+  <div class="codeblock" data-tabs>
+    <div class="bar" role="tablist" aria-label="Quickstart examples">
+      <button class="tab" role="tab" aria-selected="true" data-panel="qs-add" data-caption="The grid launches &lt;code&gt;cdiv(98_432, 1024) = 97&lt;/code&gt; programs. The last one covers only 128 valid elements, and &lt;code&gt;mask&lt;/code&gt; keeps it in bounds.">Vector add</button>
+      <button class="tab" role="tab" aria-selected="false" data-panel="qs-softmax" data-caption="Tile dimensions must be powers of two, so 1,000-column rows use a 1,024-column block. Masked lanes load &lt;code&gt;-inf&lt;/code&gt;, which leaves the max unchanged and adds 0 to the sum.">Row softmax</button>
+      <button class="tab" role="tab" aria-selected="false" data-panel="qs-matmul" data-caption="&lt;code&gt;tl.dot&lt;/code&gt; reads descriptor loads straight from device memory and accumulates in &lt;code&gt;float32&lt;/code&gt;. Descriptors handle the ragged 1,000-row edge without masks.">Matmul</button>
+      <button class="tab" role="tab" aria-selected="false" data-panel="qs-attn" data-caption="Excerpt from &lt;code&gt;examples/08_flash_attention.py&lt;/code&gt;. The full example also has an autotuned version and a float64 NumPy reference.">Flash attention</button>
+      <span class="spacer"></span>
+      <button class="copy" type="button">Copy</button>
+    </div>
+<pre id="qs-add" role="tabpanel"><code class="language-python">import numpy as np
+
+import enceladus
+import enceladus.language as tl
+
+
+@enceladus.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+pid = tl.program_id(0)
+offs = pid * BLOCK + tl.arange(0, BLOCK)
+mask = offs &lt; n
+x = tl.load(x_ptr + offs, mask=mask)
+y = tl.load(y_ptr + offs, mask=mask)
+tl.store(out_ptr + offs, x + y, mask=mask)
+
+
+n = 98_432
+x = enceladus.randn(n, seed=0)
+y = enceladus.randn(n, seed=1)
+out = enceladus.empty_like(x)
+grid = (enceladus.cdiv(n, 1024),)
+add_kernel[grid](x, y, out, n, BLOCK=1024)
+
+np.testing.assert_allclose(out.numpy(), x.numpy() + y.numpy())
+print("vector add matches NumPy")</code></pre>
+<pre id="qs-softmax" role="tabpanel" hidden><code class="language-python">import numpy as np
+
+import enceladus
+import enceladus.language as tl
+
+
+@enceladus.jit
+def softmax_kernel(out_ptr, in_ptr, stride_in, stride_out, n_cols,
+               BLOCK: tl.constexpr):
+row = tl.program_id(0)
+cols = tl.arange(0, BLOCK)
+mask = cols &lt; n_cols
+x = tl.load(in_ptr + row * stride_in + cols, mask=mask, other=-float("inf"))
+x = x.to(tl.float32)
+x = x - tl.max(x, axis=0)
+num = tl.exp(x)
+tl.store(out_ptr + row * stride_out + cols, num / tl.sum(num, axis=0), mask=mask)
+
+
+x = np.random.default_rng(0).standard_normal((512, 1000), dtype=np.float32)
+out = np.empty_like(x)
+n_rows, n_cols = x.shape
+softmax_kernel[(n_rows,)](
+out, x, enceladus.element_strides(x)[0], enceladus.element_strides(out)[0], n_cols,
+BLOCK=enceladus.next_power_of_2(n_cols),
+)
+
+expected = np.exp(x - x.max(axis=1, keepdims=True))
+expected /= expected.sum(axis=1, keepdims=True)
+np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-6)
+print("softmax matches NumPy")</code></pre>
+<pre id="qs-matmul" role="tabpanel" hidden><code class="language-python">import numpy as np
+
+import enceladus
+import enceladus.language as tl
+
+
+@enceladus.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bk, stride_cm,
+              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+a = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, 1], [BM, BK])
+b = tl.make_tensor_descriptor(b_ptr, [K, N], [stride_bk, 1], [BK, BN])
+c = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [BM, BN])
+acc = tl.zeros((BM, BN), dtype=tl.float32)
+for k in range(0, K, BK):
+    acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+c.store([pid_m * BM, pid_n * BN], acc.to(c.dtype))
+
+
+M, N, K = 1000, 800, 600
+rng = np.random.default_rng(0)
+a = rng.standard_normal((M, K), dtype=np.float32)
+b = rng.standard_normal((K, N), dtype=np.float32)
+c = np.empty((M, N), np.float32)
+grid = (enceladus.cdiv(N, 64), enceladus.cdiv(M, 64))
+matmul_kernel[grid](a, b, c, M, N, K, K, N, N, BM=64, BN=64, BK=32, num_warps=4)
+
+np.testing.assert_allclose(c, a @ b, rtol=1e-4, atol=1e-3)
+print("matmul matches NumPy")</code></pre>
+<pre id="qs-attn" role="tabpanel" hidden><code class="language-python"># The kernel from examples/08_flash_attention.py: online softmax, float32 accumulator.
+@enceladus.jit
+def attention_kernel(q_ptr, k_ptr, v_ptr, o_ptr, sm_scale, N_CTX, stride_h, stride_m,
+                 HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                 CAUSAL: tl.constexpr):
+start_m = tl.program_id(0)
+base = tl.program_id(1) * stride_h
+q_desc = tl.make_tensor_descriptor(q_ptr + base, [N_CTX, HEAD_DIM], [stride_m, 1],
+                                   [BLOCK_M, HEAD_DIM])
+k_desc = tl.make_tensor_descriptor(k_ptr + base, [N_CTX, HEAD_DIM], [stride_m, 1],
+                                   [BLOCK_N, HEAD_DIM])
+v_desc = tl.make_tensor_descriptor(v_ptr + base, [N_CTX, HEAD_DIM], [stride_m, 1],
+                                   [BLOCK_N, HEAD_DIM])
+o_desc = tl.make_tensor_descriptor(o_ptr + base, [N_CTX, HEAD_DIM], [stride_m, 1],
+                                   [BLOCK_M, HEAD_DIM])
+offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+offs_n = tl.arange(0, BLOCK_N)
+m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+l_i = tl.zeros([BLOCK_M], tl.float32)
+acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+qk_scale = sm_scale * 1.4426950408889634  # log2(e), so the softmax can use exp2
+q = q_desc.load([start_m * BLOCK_M, 0])
+hi = N_CTX
+if CAUSAL:
+    hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
+for start_n in range(0, hi, BLOCK_N):
+    qk = tl.dot(q, tl.trans(k_desc.load([start_n, 0]))) * qk_scale
+    cols = start_n + offs_n
+    mask = cols[None, :] &lt; N_CTX
+    if CAUSAL:
+        mask = mask &amp; (offs_m[:, None] &gt;= cols[None, :])
+    qk = tl.where(mask, qk, float("-inf"))
+    m_ij = tl.maximum(m_i, tl.max(qk, 1))
+    p = tl.exp2(qk - m_ij[:, None])
+    alpha = tl.exp2(m_i - m_ij)
+    l_i = l_i * alpha + tl.sum(p, 1)
+    acc = acc * alpha[:, None]
+    acc = tl.dot(p.to(q_desc.dtype), v_desc.load([start_n, 0]), acc)
+    m_i = m_ij
+acc = acc / l_i[:, None]
+o_desc.store([start_m * BLOCK_M, 0], acc.to(o_desc.dtype))
+
+
+# Launch: one program per BLOCK_M query rows of each (batch, head) pair.
+# dot_warps=(num_warps, 1) gives each SIMD group whole rows, so row reductions stay local.
+grid = (enceladus.cdiv(n, 32), z * h)
+attention_kernel[grid](q, k, v, o, scale, n, n * d, d, HEAD_DIM=d, BLOCK_M=32,
+                   BLOCK_N=32, CAUSAL=causal, num_warps=4, dot_warps=(4, 1))</code></pre>
+    <div class="caption" data-tab-caption>The grid launches <code>cdiv(98_432, 1024) = 97</code> programs. The last one covers only 128 valid elements, and <code>mask</code> keeps it in bounds.</div>
+  </div>
+
+  <h2>How the vector add works</h2>
+  <p>The vector add shows the core ideas:</p>
+  <ul class="tight">
+    <li><code>tl.program_id(0)</code> returns the index of the current program. The grid launches enough programs to cover all <code>n</code> elements.</li>
+    <li><code>tl.arange(0, BLOCK)</code> creates a tile of 1,024 indices. <code>x_ptr + offs</code> is a tile of pointers.</li>
+    <li><code>mask</code> keeps the last program from reading or writing past the end of the arrays.</li>
+    <li><code>BLOCK: tl.constexpr</code> makes the block size a compile-time constant. Enceladus compiles one version of the kernel for each value you pass.</li>
+  </ul>
+  <p>The launch returns before the GPU finishes when every array argument is an <code>enceladus.Tensor</code>. <code>out.numpy()</code> waits for the result. A launch with NumPy arrays waits for the GPU before it returns, so the arrays hold the result right away.</p>
+
+  <h2>Run a kernel on the CPU</h2>
+  <p>Enceladus includes an interpreter that runs kernels on the CPU with NumPy, one program at a time. In the interpreter, you can use <code>print()</code> and <code>pdb</code> inside a kernel. To run the vector add in the interpreter, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">ENCELADUS_INTERPRET=1 uv run python add.py</code></pre></div>
+  <p>The interpreter is much slower than the GPU. Use it to debug a kernel and to check the compiled kernel's results.</p>
+
+  <h2>What's next</h2>
+  <ul class="tight">
+    <li>To learn how programs, tiles, and SIMD groups fit together, see <a href="/programming-model/">Programming model</a>.</li>
+    <li>To look up a <code>tl</code> function, see <a href="/reference/">Language reference</a>.</li>
+    <li>To make kernels faster, see <a href="/performance/">Performance</a>.</li>
+    <li>To use Enceladus with PyTorch or MLX, see <a href="/interop/">Framework interop</a>.</li>
+    <li>To port an existing Triton kernel, see <a href="/porting/">Porting from Triton</a>.</li>
+  </ul>
+</section>
+</main>

@@ -1,0 +1,68 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Guides</p>
+  <h1>Performance</h1>
+  <p class="lede">Measure kernels on the GPU, size blocks and SIMD groups, feed <code>tl.dot</code> from descriptors, choose a matmul backend, autotune, and launch asynchronously.</p>
+</header>
+
+<section class="doc prose" id="performance">
+  <h2>Measure on the GPU</h2>
+  <p>Time kernels with <code>enceladus.testing.do_bench(fn)</code>, which uses GPU timestamps and returns the median in milliseconds. The function must launch on <code>enceladus.Tensor</code> arguments, because a launch that synchronizes can't be timed. The GPU runs slowly for about 50 ms after it idles, so compare kernels in the same process.</p>
+
+  <h2>Size blocks and SIMD groups</h2>
+  <ul class="tight">
+    <li>Memory-bound kernels reach full bandwidth with blocks of 1,024-4,096 elements and 4-8 SIMD groups. On an M4 Pro, measured copy bandwidth is 238 GB/s.</li>
+    <li>Keep each tile within about 128 registers per thread. Registers per thread are roughly <code>elements * words_per_element / (32 * num_warps)</code>.</li>
+    <li><code>dot_warps=(WM, WN)</code> arranges the SIMD groups as a grid over each <code>tl.dot</code> result. Flash attention runs fastest with <code>dot_warps=(num_warps, 1)</code>.</li>
+  </ul>
+
+  <h2>Feed <code>tl.dot</code> from descriptors</h2>
+  <p>When a <code>tl.dot</code> operand is a descriptor load that nothing else uses, <code>tl.dot</code> reads fragments straight from device memory, with no threadgroup memory and no barriers. This path ran 7-15% faster than staging. Epilogues on the accumulator cost little: a fused bias and GELU runs within about 2-3% of a plain matmul.</p>
+
+  <h2>Choose a <code>tl.dot</code> backend</h2>
+  <p>Set <code>dot_backend</code> as a launch option, a <code>Config</code> field, or an argument to <code>warmup</code> and <code>explain</code>:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Value</th><th>Lowering</th><th>Requirements</th></tr></thead>
+    <tbody>
+      <tr><td><code>"simdgroup"</code></td><td><code>simdgroup_matrix</code> instructions</td><td>Any Apple GPU from M1. Works with any tile and epilogue.</td></tr>
+      <tr><td><code>"mpp"</code></td><td>Metal 4 <code>matmul2d</code> from Metal Performance Primitives</td><td>A Metal 4 GPU, macOS 26 or later, and an eligible loop. Ineligible dots fall back to <code>simdgroup</code>.</td></tr>
+      <tr><td><code>"auto"</code> (default)</td><td><code>mpp</code> on Apple10 (M5) and later, <code>simdgroup</code> on earlier GPUs</td><td>None</td></tr>
+    </tbody>
+  </table></div>
+  <p>A loop is eligible for <code>mpp</code> when the accumulator starts from <code>tl.zeros</code>, is updated only by <code>acc = tl.dot(a, b, acc)</code>, both operands are descriptor loads, the output tile is 16-128 in each dimension, and the result reaches a single descriptor store through elementwise ops only. <code>kernel.explain</code> names the reason for any fallback.</p>
+
+  <h2>Autotune</h2>
+  <p><code>@enceladus.autotune</code> compiles every candidate in parallel, times each one, and keeps the fastest per key values and argument dtypes. Results persist in <code>~/.cache/enceladus/autotune/</code>, keyed by kernel source, compiler version, and GPU. The grid must be a function of <code>meta</code>:</p>
+  <div class="codeblock"><div class="bar"><span class="file">autotune.py</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">from enceladus.configs import matmul_configs
+
+
+@enceladus.autotune(configs=matmul_configs("float16"), key=["M", "N", "K"])
+@enceladus.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bk, stride_cm,
+              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+a = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, 1], [BM, BK])
+b = tl.make_tensor_descriptor(b_ptr, [K, N], [stride_bk, 1], [BK, BN])
+c = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [BM, BN])
+acc = tl.zeros((BM, BN), dtype=tl.float32)
+for k in range(0, K, BK):
+    acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+c.store([pid_m * BM, pid_n * BN], acc.to(c.dtype))
+
+
+grid = lambda meta: (enceladus.cdiv(N, meta["BN"]), enceladus.cdiv(M, meta["BM"]))
+matmul_kernel[grid](a, b, c, M, N, K, K, N, N)
+print("chose", matmul_kernel.config_for(a, b, c, M, N, K, K, N, N))</code></pre></div>
+  <p>With <code>ENCELADUS_PRINT_AUTOTUNING=1</code>, the output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">enceladus: autotuning matmul_kernel [1024|1024|512|float16,float16,float16] chose enceladus.Config({'BM': 64, 'BN': 32, 'BK': 32}, num_warps=4, dot_warps=(4, 1), dot_backend='mpp') (0.186 ms)</code></pre></div>
+
+  <h2>Launch asynchronously</h2>
+  <p>An asynchronous launch costs about 3.4 µs of host time, and batching 64 launches per command buffer brings a small launch to about 1 µs of GPU cost. A synchronized launch costs 70-100 µs. For many small kernels, allocate with <code>enceladus.empty</code>, <code>zeros</code>, or <code>randn</code>, or wrap arrays with <code>enceladus.from_numpy</code>, so that launches never wait.</p>
+  <p>Other tips:</p>
+  <ul class="tight">
+    <li>Prefer <code>tl.exp2</code>, with <code>log2(e)</code> folded into the scale, over <code>tl.exp</code>.</li>
+    <li>Don't use <code>math_mode="fast"</code> for a softmax masked with <code>-inf</code>.</li>
+    <li>Call <code>kernel.warmup(*args, **constexprs)</code> to compile ahead of the first launch.</li>
+  </ul>
+</section>
+</main>

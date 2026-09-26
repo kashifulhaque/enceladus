@@ -1,0 +1,105 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Concepts</p>
+  <h1>Programming model</h1>
+  <p class="lede">How Enceladus runs a kernel: programs and the launch grid, how a tile spreads across SIMD groups, types, control flow, and compile-time specialization.</p>
+</header>
+
+<section class="doc" id="model">
+  <div class="prose">
+    <h2>Programs and the grid</h2>
+    <p>You launch a kernel by indexing it with a <em>grid</em> and calling the result: <code>kernel[grid](*args, BLOCK=1024, num_warps=4)</code>. The grid is a tuple of one to three non-negative integers, or a function that takes a dictionary of the arguments and returns that tuple. The GPU runs one <em>program</em> for each point of the grid, in no particular order.</p>
+    <p>Each program runs as one Metal threadgroup of <code>num_warps</code> SIMD groups, and each SIMD group has 32 threads. <code>num_warps</code> must be a power of two from 1 to 32, and the default is 4. The compiler spreads every tile across those threads.</p>
+  </div>
+
+  <div class="explorer" id="explorer">
+    <div class="explorer-head">
+      <h3>Where does each element live?</h3>
+      <div class="seg" role="group" aria-label="Program to show">
+        <button type="button" aria-pressed="true" data-pid="0">Program 0</button>
+        <button type="button" aria-pressed="false" data-pid="96">Program 96 (last)</button>
+      </div>
+    </div>
+    <p style="font-size:14.5px;color:var(--ink-2);margin:0 0 16px;max-width:62ch">The quickstart vector add with <code>n = 98_432</code>, <code>BLOCK=1024</code>, and <code>num_warps=4</code>. Each cell is one element of the <code>offs</code> tile, colored by the SIMD group that holds it. Point at a cell, or enter an index, to see the thread and register from the generated MSL.</p>
+    <div class="explorer-body">
+      <div>
+        <div class="tilegrid" id="tilegrid" aria-hidden="true"></div>
+        <div class="axis-note"><span>element 0</span><span>32 per row</span><span>element 1023</span></div>
+      </div>
+      <div class="readout">
+        <label for="elem-input">Tile element (0 to 1023)
+          <input id="elem-input" type="number" min="0" max="1023" value="517" inputmode="numeric">
+        </label>
+        <dl id="readout" aria-live="polite">
+          <dt>offs</dt><dd id="r-offs"></dd>
+          <dt>SIMD group</dt><dd id="r-warp"></dd>
+          <dt>Lane</dt><dd id="r-lane"></dd>
+          <dt>Register</dt><dd id="r-reg"></dd>
+          <dt>mask</dt><dd id="r-mask"></dd>
+        </dl>
+        <div class="msl-line" id="r-msl"></div>
+        <div class="legend">
+          <div><i style="--c:var(--w0)"></i>SIMD group 0</div>
+          <div><i style="--c:var(--w1)"></i>SIMD group 1</div>
+          <div><i style="--c:var(--w2)"></i>SIMD group 2</div>
+          <div><i style="--c:var(--w3)"></i>SIMD group 3</div>
+          <div><i class="m"></i>Masked off: <code>offs &gt;= n</code></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="prose">
+    <h2>Tiles</h2>
+    <p>Every operation in a kernel works on whole tiles. <code>x + y</code> adds two tiles elementwise, <code>tl.sum(x, axis=0)</code> reduces along an axis, and tiles follow NumPy's broadcasting rules. <code>x[:, None]</code> inserts a dimension. Tile shapes have the following rules:</p>
+    <ul class="tight">
+      <li>Every dimension must be a compile-time power of two from 1 to 65,536. To handle other lengths, round up with <code>enceladus.next_power_of_2</code> and mask the extra elements.</li>
+      <li>A tile must fit in registers. Above 128 32-bit registers per thread, Enceladus warns that the kernel might spill. Above 256, compilation fails with a suggestion to use smaller blocks or a larger <code>num_warps</code>.</li>
+      <li>Tiles are immutable. To change elements, build another tile with <code>tl.where</code>.</li>
+    </ul>
+    <p>A scalar, such as a kernel argument <code>n</code> or the result of <code>tl.program_id</code>, broadcasts to any tile shape.</p>
+
+    <h2>Types</h2>
+    <p>Enceladus supports <code>int1</code>, signed and unsigned integers from 8 to 64 bits, <code>float16</code>, <code>bfloat16</code>, and <code>float32</code>. It has no <code>float64</code>, FP8, or TF32. Arithmetic follows Triton's promotion rules:</p>
+    <ul class="tight">
+      <li>A Python literal takes the other operand's type if it fits. A float literal otherwise becomes <code>float32</code>.</li>
+      <li>Mixing an integer and a float gives the float type. Mixing <code>float16</code> and <code>bfloat16</code> gives <code>float32</code>.</li>
+      <li><code>/</code> on integers gives <code>float32</code>, and <code>//</code> needs integer operands.</li>
+      <li>16-bit float operations compute in <code>float32</code> and round each result back.</li>
+    </ul>
+
+    <h2>Control flow and helpers</h2>
+    <p>A kernel can use <code>if</code> and <code>else</code> on scalars, <code>for</code> loops over <code>range</code>, <code>tl.range</code>, or <code>tl.static_range</code>, and <code>and</code>, <code>or</code>, and <code>not</code> on scalars. On tiles, use <code>&amp;</code>, <code>|</code>, and <code>~</code>. A condition on constexprs is decided at compile time, and the other branch isn't compiled.</p>
+    <p>A kernel can call other <code>@enceladus.jit</code> functions, which the compiler inlines. Helpers can return values, including tuples. <code>while</code>, <code>break</code>, <code>continue</code>, early <code>return</code>, <code>try</code>, <code>with</code>, comprehensions, lambdas, and nested functions raise <code>enceladus.CompilationError</code>.</p>
+    <div class="codeblock"><div class="bar"><span class="file">gelu.py</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">@enceladus.jit
+def gelu(x):
+return 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
+
+
+@enceladus.jit
+def gelu_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+mask = offs &lt; n
+x = tl.load(x_ptr + offs, mask=mask)
+tl.store(out_ptr + offs, gelu(x), mask=mask)</code></pre></div>
+  </div>
+</section>
+
+<section class="doc prose" id="specialization">
+  <h2>Constexprs and specialization</h2>
+  <p>Enceladus compiles a separate <em>specialization</em> of a kernel for each combination of the following launch properties:</p>
+  <ul class="tight">
+    <li>The value of each parameter annotated as <code>tl.constexpr</code>: an integer, float, boolean, <code>tl</code> dtype, or <code>None</code>.</li>
+    <li>The type of each runtime argument. A Python <code>int</code> is <code>int32</code> if it fits in 32 bits and <code>int64</code> otherwise. A Python <code>float</code> is <code>float32</code>.</li>
+    <li>Whether each integer is divisible by 16 or equals 1, and whether each array's data is 16-byte aligned.</li>
+    <li>The launch options <code>num_warps</code>, <code>dot_warps</code>, and <code>dot_backend</code>, and the <code>ENCELADUS_DEBUG</code> variable.</li>
+  </ul>
+  <p>Each specialization takes a few milliseconds to compile and is cached in memory and on disk. If a kernel compiles more than 16 times in one process, Enceladus warns and names the argument that changed most often. For sizes that vary from launch to launch, add them to <code>do_not_specialize</code>:</p>
+  <div class="codeblock"><div class="bar"><span class="file">python</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">@enceladus.jit(do_not_specialize=["n"])
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+# The kernel body is unchanged.
+pass</code></pre></div>
+  <p><code>@enceladus.jit</code> also takes <code>interpret=True</code>, which runs every launch in the interpreter, and <code>math_mode="fast"</code>, which lets Metal assume that no value is infinite or NaN. The default, <code>"relaxed"</code>, keeps infinities and NaNs.</p>
+</section>
+</main>
+<script type="module" src="/src/explorer.js"></script>

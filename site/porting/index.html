@@ -1,0 +1,44 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Guides</p>
+  <h1>Porting from Triton</h1>
+  <p class="lede">Most Triton kernels port by changing the imports and the device. This page lists the steps, what differs, and the Triton features that Enceladus refuses.</p>
+</header>
+
+<section class="doc prose" id="porting">
+  <h2>Port a kernel</h2>
+  <p>To port a kernel, complete the following steps:</p>
+  <ol class="tight" style="padding-left:22px;color:var(--ink-2)">
+    <li>Replace <code>import triton.language as tl</code> with <code>import enceladus.language as tl</code>, and <code>@triton.jit</code> with <code>@enceladus.jit</code>.</li>
+    <li>Move tensors from <code>cuda</code> to <code>mps</code>.</li>
+    <li>Mask the M and N edges of the loads, because Enceladus doesn't check bounds on pointer accesses.</li>
+    <li>Replace <code>triton.cdiv</code> with <code>enceladus.cdiv</code>. Hints such as <code>num_stages</code> can stay; Enceladus ignores them.</li>
+    <li>Optional: Switch matmul loads to tensor descriptors, passing only the row strides.</li>
+  </ol>
+  <h2>What differs</h2>
+  <p>The following table lists what differs:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Area</th><th>Triton</th><th>Enceladus</th></tr></thead>
+    <tbody>
+      <tr><td><code>num_warps</code></td><td>Warps</td><td>SIMD groups of 32 threads, a power of two from 1 to 32</td></tr>
+      <tr><td>Program</td><td>CTA</td><td>Metal threadgroup with 32 KB of threadgroup memory</td></tr>
+      <tr><td>Types</td><td><code>fp64</code>, <code>fp8</code>, <code>tf32</code></td><td>No <code>float64</code>, FP8, or TF32. A <code>float32</code> dot runs in full <code>float32</code>.</td></tr>
+      <tr><td><code>tl.dot</code></td><td>Many dtypes, including integers</td><td>Same-dtype <code>float16</code>, <code>bfloat16</code>, or <code>float32</code> operands. K must be a multiple of 8.</td></tr>
+      <tr><td>Descriptors</td><td>Needs a host allocator</td><td>No allocator. The innermost stride must be 1.</td></tr>
+      <tr><td>Atomics</td><td>Full <code>sem</code> and <code>scope</code></td><td>Relaxed ordering only. No 16-bit float <code>atomic_add</code>; use a <code>float32</code> buffer.</td></tr>
+      <tr><td>New launch options</td><td>None</td><td><code>dot_warps=(WM, WN)</code> and <code>dot_backend</code></td></tr>
+      <tr><td>Inline assembly</td><td><code>tl.inline_asm_elementwise</code></td><td><code>enceladus.metal_kernel(source, name)</code> for hand-written MSL</td></tr>
+      <tr><td>Benchmarking</td><td><code>triton.testing.do_bench</code></td><td><code>enceladus.testing.do_bench</code></td></tr>
+    </tbody>
+  </table></div>
+  <h2>Unsupported features</h2>
+  <p>The following Triton features raise <code>CompilationError</code>:</p>
+  <ul class="tight">
+    <li>Block pointers: <code>tl.make_block_ptr</code>, <code>tl.advance</code>, <code>boundary_check</code>, and <code>padding_option</code>.</li>
+    <li><code>while</code>, <code>break</code>, and <code>continue</code>.</li>
+    <li><code>tl.multiple_of</code>, <code>tl.max_contiguous</code>, <code>tl.join</code>, <code>tl.split</code>, <code>tl.dot_scaled</code>, <code>tl.sort</code>, <code>tl.flip</code>, <code>tl.gather</code>, <code>tl.histogram</code>, <code>tl.rand</code>, and libdevice.</li>
+    <li><code>**</code> on runtime values. Use <code>tl.exp2</code> and <code>tl.log2</code>, or multiply.</li>
+    <li>Warp specialization, TMA, and clusters.</li>
+  </ul>
+</section>
+</main>

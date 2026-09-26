@@ -1,0 +1,35 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Guides</p>
+  <h1>Framework interop</h1>
+  <p class="lede">Kernels take each framework's arrays without copying them. Importing Enceladus doesn't import PyTorch or MLX. To allocate an output of the same kind and device as an input, call <code>enceladus.new_empty(like)</code>. To get strides in elements for any array type, call <code>enceladus.element_strides(x)</code>.</p>
+</header>
+
+<section class="doc prose" id="interop">
+  <h2>PyTorch</h2>
+  <ul class="tight">
+    <li>Tensors must be on the <code>mps</code> device. A CPU tensor raises <code>TypeError</code>.</li>
+    <li>When every array argument is an MPS tensor, the kernel runs on PyTorch's own stream through <code>torch.mps.compile_shader</code>, ordered with the surrounding PyTorch operations. This costs about 5 µs of host time per launch.</li>
+    <li>Mixed array kinds, and kernels that print or assert, take a synchronized path of about 100 µs and log a one-time warning.</li>
+  </ul>
+  <h2>MLX</h2>
+  <ul class="tight">
+    <li>Enceladus evaluates every argument with <code>mx.eval()</code> first, and the launch waits, at about 100 µs each.</li>
+    <li>Outputs must be freshly allocated buffers, such as <code>enceladus.new_empty(like)</code>. Don't write to lazy results, views, or arrays from <code>mx.broadcast_to</code>.</li>
+  </ul>
+  <h2>NumPy</h2>
+  <ul class="tight">
+    <li>Enceladus wraps the array's pages without copying. If Metal can't wrap them, Enceladus copies the array in and out.</li>
+    <li>Negative strides raise an error, so call <code>np.ascontiguousarray(x)</code> first. <code>float64</code> isn't supported.</li>
+  </ul>
+  <h2>DLPack</h2>
+  <p>An <code>enceladus.Tensor</code> exports with the Metal device type, so other frameworks can view the same memory:</p>
+  <div class="codeblock"><div class="bar"><span class="file">dlpack.py</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">t = enceladus.arange(8, dtype="float32")
+tt = torch.from_dlpack(t)  # a torch tensor on the mps device
+tt.mul_(10)
+torch.mps.synchronize()
+print(t.numpy())  # [ 0. 10. 20. 30. 40. 50. 60. 70.]
+m = mx.from_dlpack(t)  # an MLX array over the same buffer</code></pre></div>
+  <p>The export waits for pending Enceladus launches but orders nothing after that. Before another framework reads later results, call <code>enceladus.synchronize()</code>.</p>
+</section>
+</main>
