@@ -128,3 +128,111 @@ propagation; and flush-on-threshold with cross-batch dependencies.
   chains, and has no test.
 - In the interpreter, the loop variable is a Python `int`, so `//`, `%`, and overflow on
   it follow Python rules rather than `i32` rules.
+
+## M2: Layouts, codegen, and elementwise kernels
+
+### What was built
+
+- `compiler/layout.py`: `BitLayout` with `blocked`, `slice_layout`, `expand`, `broadcast`,
+  `permute`, `reshape`, `simd_acc`, and `reg_map`. `reg_map` finds, for each destination
+  register, the source register in the same thread that holds the same element, or
+  reports that the conversion must cross threads. It handles broadcasting, so one
+  function covers register remaps, broadcasts, and the "differ only in register order"
+  case.
+- `compiler/passes/`: `simplify` (CSE and DCE), `axis_info` (contiguity, divisibility in
+  bytes for pointers, and constancy), and `layouts` (layout assignment).
+- `compiler/codegen/`: the MSL emitter, prelude (`erf`, `sigmoid`, and shuffles for
+  `bfloat`, `bool`, and 64-bit types), `msl.py`, and `reduce.py`.
+- `runtime/compile.py`, `launcher.py`, and the compiled path in `jit.py`: a generated
+  argument binder, a per-kernel specialization cache, the disk cache,
+  `TEGULA_ALWAYS_COMPILE`, `TEGULA_DUMP`, `TEGULA_OVERRIDE_DIR`, `kernel.warmup()`, and
+  the recompilation warning.
+
+### Benchmarks
+
+| Measurement | Result | Target |
+|---|---|---|
+| Vector add, 256 MB per array, FP32 | 235 GB/s (MLX 225, wall clock) | 220 GB/s or more |
+| Vector add, 256 MB per array, FP16 | 239 GB/s (MLX 219, wall clock) | 220 GB/s or more |
+| Tegula compile time, vector add (frontend to MSL) | 0.32 ms | Under 5 ms |
+| `@tegula.jit` launch, sustained | 3.8 µs | 5 µs or less |
+
+### Tests
+
+Every M1 differential test now also runs compiled: 323 of 329 cases pass. The 6
+failures are the pointer-tile matmul, which needs `tl.dot` (M4). `tests/test_codegen.py`
+adds a layout conversion through threadgroup memory (checked against NumPy), the
+threadgroup-memory overflow error with its source line, reduce-then-broadcast with no
+conversion, deterministic MSL, and AxisInfo contiguity and order. `test_softmax` gained a
+case where whole lanes see only `other=-inf`.
+
+### Deviations from the plan
+
+- **Rematerialization happens in codegen instead of IR rewriting.** Layout assignment
+  classifies tile values as cheap, view, or anchored and fixes layouts only for anchored
+  values. Codegen emits cheap values lazily in whatever layout each use needs, memoized
+  per scope, and derives views from their input's registers. No `convert_layout` ops are
+  inserted into the IR; a use that needs a different layout gets a register remap or a
+  threadgroup exchange at that point.
+- **`lower_convert_layout`, `alloc_threadgroup_memory`, and `insert_barriers` live in
+  codegen.** All exchanges and reduction scratch share one threadgroup arena at offset
+  0, sized to the largest use. Every exchange writes behind a barrier and reads behind a
+  second one, which is the conservative scheme the plan allows. Overflow raises a
+  source-located `CompilationError`.
+- **No `strength_reduce` pass.** Metal's compiler strength-reduces division by constants
+  and hoists loop-invariant math. Revisit if profiles show integer division in hot loops.
+- **Scalar loads only.** The plan says to add vector loads after the tests pass. Vector
+  add already reaches 235 GB/s with scalar loads, so vectorization is deferred.
+- **Half-precision arithmetic computes in FP32 and rounds per op**, matching the
+  interpreter exactly (FP32 has enough precision that this equals correctly rounded
+  native FP16 and BF16 arithmetic).
+- **The disk cache key includes a hash of the compiler's source.** Without it, a
+  compiler change silently reused stale MSL from `~/.cache/tegula`, which happened once
+  while benchmarking.
+
+### Known gaps
+
+- `idx64`: pointer offsets are always `int`, so tensors of 2^31 bytes or more aren't
+  addressed correctly yet. No test covers it.
+- `multiple_of` and `max_contiguous` hints aren't implemented.
+
+## M3: Reductions and 2D tiles
+
+### What was built
+
+`codegen/reduce.py` lowers `sum`, `max`, `min`, `argmax`, `argmin`, and `tl.reduce` with a
+combine region (including tuple inputs). It reduces registers in-thread, then lanes with
+`simd_shuffle_xor` (or `simd_sum`, `simd_max`, and `simd_min` when all five lane bits
+reduce), then SIMD groups through one threadgroup exchange. FP16 and BF16 accumulate in
+FP32. `argmax` and `argmin` break ties toward the lower index. Only index bits whose
+basis points into the reduced axis take part, so broadcast lanes are never counted
+twice.
+
+### Benchmarks
+
+The following numbers come from `benchmarks/bench_softmax.py` and `bench_norms.py` at
+4096 x 4096. MLX and torch are wall clock, which adds about 0.1 ms.
+
+| Kernel | FP32 | FP16 | Target |
+|---|---|---|---|
+| Softmax, 8 SIMD groups | 242 GB/s (MLX 196, torch 170) | 247 GB/s (MLX 173, torch 153) | 215 GB/s or more |
+| LayerNorm, `examples/03`, BLOCK=1024 | 237 GB/s | 235 GB/s | 200 GB/s or more |
+| RMSNorm, `examples/06` | 241 GB/s | 249 GB/s | 200 GB/s or more |
+
+Row sums vary by 0.4% between 128 and 1,024 threads per threadgroup (267-268 GB/s),
+against a limit of 5%.
+
+### Tests
+
+The softmax, LayerNorm, and RMSNorm examples pass compiled and interpreted for FP32 and
+FP16, including 1,000 columns and fully masked lanes. Reductions over every op and dtype,
+Welford through a tuple `tl.reduce`, and argmax ties pass in both modes.
+
+### Known gaps
+
+- LayerNorm with BLOCK=4096 in FP16 reaches only 169 GB/s. The generated code has no
+  layout conversions; the kernel rereads each row three times with 16 registers per
+  thread. BLOCK=1024 meets the target.
+- A layout bug made loop-carried accumulators fall back to the FP32 default layout,
+  which cost an exchange per iteration. It's fixed: loop results now share their block
+  argument's layout, and elementwise ops prefer anchors that aren't loop-carried.

@@ -202,6 +202,9 @@ class _Assigner:
         if id(v) in p.loop_of:
             op = p.loop_of[id(v)]
             i = p.arg_index[id(v)]
+            arg = op.regions[0].block.args[1 + i]
+            if v is not arg:  # a loop result shares its block argument's layout
+                return self.resolve(arg)
             init = op.operands[3 + i]
             yielded = op.regions[0].block.ops[-1].operands[i]
             for cand in (init, yielded):
@@ -233,13 +236,17 @@ class _Assigner:
             return None
         if op.name in ELEMENTWISE:
             tiles = [x for x in op.operands if isinstance(x.type, ir.TileType)]
-            # Prefer operands with a layout of their own over views and cheap values.
-            for want in (ANCHORED, VIEW):
-                for x in tiles:
-                    if p.classify(x) == want:
-                        lay = self.resolve(x)
-                        if lay is not None:
-                            return lay
+            # Prefer operands with a layout of their own, then loop-carried values (whose
+            # layout may depend on this op), then views.
+            def rank(x: ir.Value) -> int:
+                k = p.classify(x)
+                return 0 if k == ANCHORED and id(x) not in p.loop_of else 1 if k == ANCHORED \
+                    else 2 if k == VIEW else 3
+            for x in sorted(tiles, key=rank):
+                if rank(x) < 3:
+                    lay = self.resolve(x)
+                    if lay is not None:
+                        return lay
             return None
         if op.name == "dot":
             raise CompilationError("tl.dot lowering arrives in M4", op.loc)

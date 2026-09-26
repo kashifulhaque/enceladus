@@ -46,6 +46,19 @@ def os_build() -> str:
     return f"{platform.mac_ver()[0]} ({build})"
 
 
+@cache
+def compiler_hash() -> str:
+    """Returns a hash of the compiler's own source, so compiler changes invalidate caches."""
+    root = Path(__file__).resolve().parents[1]
+    h = hashlib.sha256()
+    files = sorted((root / "compiler").rglob("*.py")) + sorted((root / "compiler").rglob("*.metal"))
+    files += [root / "language" / "ops.py", root / "language" / "core.py"]
+    for f in files:
+        h.update(f.relative_to(root).as_posix().encode())
+        h.update(f.read_bytes())
+    return h.hexdigest()
+
+
 def stable_hash(*parts: Any) -> str:
     """Returns a SHA-256 hex digest of the `repr` of `parts`, which must be deterministic."""
     h = hashlib.sha256()

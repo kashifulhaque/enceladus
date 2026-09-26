@@ -34,7 +34,7 @@ def _key(fn: JITFunction, spec: Specialization, num_warps: int) -> str:
     caps = get_device().caps
     return cache.stable_hash(
         fn.cache_key, spec.key(num_warps, fn.math_mode), tegula.__version__,
-        cache.os_build(), caps.architecture,
+        cache.compiler_hash(), cache.os_build(), caps.architecture,
     )  # fmt: skip
 
 
