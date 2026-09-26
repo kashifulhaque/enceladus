@@ -4,7 +4,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "enceladus"
-version = "0.1.0.dev0"
+# CI publishes MAJOR.MINOR.<commits on main>; change MAJOR.MINOR here to start a series.
+version = "0.1.0"
 description = "A Triton-like tile language for Apple GPUs that compiles Python kernels to Metal"
 readme = "README.md"
 requires-python = ">=3.11"

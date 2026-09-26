@@ -1,6 +1,12 @@
 """Enceladus: a Triton-like tile language for Apple GPUs."""
 
-__version__ = "0.1.0.dev0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    # CI sets the published version in pyproject.toml, so read it from the metadata.
+    __version__ = version("enceladus")
+except PackageNotFoundError:  # running from a source tree that isn't installed
+    __version__ = "0.0.0"
 
 # --- runtime (M0) ---
 from enceladus._C import MetalError

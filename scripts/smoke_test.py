@@ -2,10 +2,12 @@
 
 The kernel runs in interpreter mode, so the check works on CI runners whose GPU can't
 run compiled kernels. Run it from outside the source tree so that `import enceladus`
-resolves to the installed wheel.
+resolves to the installed wheel. If you pass a version, the check also confirms that
+the wheel reports it.
 """
 
 import os
+import sys
 
 os.environ["ENCELADUS_INTERPRET"] = "1"
 
@@ -28,6 +30,9 @@ x = np.arange(1000, dtype=np.float32)
 out = np.empty_like(x)
 add_kernel[(enceladus.cdiv(x.size, 256),)](x, x, out, x.size, BLOCK=256)
 np.testing.assert_array_equal(out, 2 * x)
+if len(sys.argv) > 1:
+    got, want = enceladus.__version__, sys.argv[1]
+    assert got == want, f"the wheel reports version {got}, not {want}"
 assert "site-packages" in enceladus.__file__, f"imported from the source tree: {enceladus.__file__}"
 print(f"enceladus {enceladus.__version__} from {enceladus.__file__}: OK "
       f"(Metal device created: {device._device is not None})")  # fmt: skip
