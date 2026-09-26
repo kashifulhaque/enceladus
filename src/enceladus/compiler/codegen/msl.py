@@ -174,6 +174,10 @@ class GeneratedKernel:
         report: What codegen decided, for `kernel.explain`: layout conversions and
             threadgroup memory requests.
         plan: The `LayoutPlan` the source was generated from.
+        dot_backend: "mpp" if some `tl.dot` lowers to Metal 4 `matmul2d`, "simdgroup" if
+            every `tl.dot` uses `simdgroup_matrix`, and None for a kernel without `tl.dot`.
+        dot_fallbacks: Why each `tl.dot` that `dot_backend="mpp"` asked for uses
+            `simdgroup` instead.
     """
 
     name: str
@@ -188,6 +192,8 @@ class GeneratedKernel:
     assert_buffer_index: int | None = None
     report: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     plan: Any = None
+    dot_backend: str | None = None
+    dot_fallbacks: list[str] = field(default_factory=list)
 
 
 class _Codegen:
@@ -223,6 +229,12 @@ class _Codegen:
 
         self.direct: set[int] = find_direct_operands(module, plan)
         self.uses: dict[int, int] = use_counts(module)
+        self.includes: list[str] = []  # headers after <metal_stdlib>, in request order
+        self.mpp = None
+        if module.attrs.get("dot_backend") == "mpp":
+            from enceladus.compiler.codegen.mpp import plan_mpp
+
+            self.mpp = plan_mpp(module)
 
     # ---- helpers ----
 
@@ -235,6 +247,11 @@ class _Codegen:
 
     def ctype(self, t: ir.Type) -> str:
         return ctype(t, self.off_t)
+
+    def require_include(self, header: str) -> None:
+        """Adds `#include header` after `<metal_stdlib>`, once."""
+        if header not in self.includes:
+            self.includes.append(header)
 
     def fresh(self, hint: str | None) -> str:
         return self.names.fresh(hint)
@@ -633,6 +650,11 @@ class _Codegen:
         self.cur_op = saved
 
     def op(self, op: ir.Op) -> None:
+        if self.mpp is not None and id(op) in self.mpp.handled:
+            from enceladus.compiler.codegen.mpp import emit
+
+            emit(self, op)
+            return
         name = op.name
         res = op.results[0] if len(op.results) == 1 else None
         if res is not None and isinstance(res.type, ir.TileType) and name not in (
@@ -972,6 +994,8 @@ class _Codegen:
             a.written = a.name in self.written
         out = Emitter()
         out.line("#include <metal_stdlib>")
+        for h in self.includes:
+            out.line(f"#include {h}")
         out.line("using namespace metal;")
         out.lines(PRELUDE)
         for code in self.__dict__.get("helpers", {}).values():
@@ -1007,12 +1031,18 @@ class _Codegen:
                 out.line(code)
             out.lines(self.e.text())
         out.line("}")
-        return GeneratedKernel(
+        gen = GeneratedKernel(
             kname, out.text(), args, self.nw, self.tg_bytes, self.warnings,
             language_version=self.language_version, enable_logging=self.enable_logging,
             asserts=self.asserts, assert_buffer_index=assert_index, report=self.report,
             plan=self.plan,
         )  # fmt: skip
+        if any(op.name == "dot" for op in self.m.walk()):
+            gen.dot_backend = "mpp" if self.mpp is not None and self.mpp.loops else "simdgroup"
+            gen.dot_fallbacks = list(self.mpp.fallbacks) if self.mpp is not None else []
+            if self.mpp is not None:
+                self.m.attrs["dot_backend"] = gen.dot_backend  # for `kernel.explain`
+        return gen
 
 
 def _add(expr: str, c: int) -> str:

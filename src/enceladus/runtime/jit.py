@@ -305,17 +305,20 @@ class JITFunction:
                         self.math_mode)  # fmt: skip
 
     def run(self, *args: Any, grid: Any, num_warps: int = 4, num_stages: int | None = None,
-            dot_warps: tuple[int, int] | None = None, **kwargs: Any) -> None:  # fmt: skip
+            dot_warps: tuple[int, int] | None = None, dot_backend: str = "auto",
+            **kwargs: Any) -> None:  # fmt: skip
         """Launches the kernel.
 
         `dot_warps=(WM, WN)` arranges the SIMD groups of every `tl.dot` as a WM x WN grid.
-        `num_stages` is accepted for Triton compatibility and has no effect.
+        `dot_backend` selects the `tl.dot` lowering: "auto" (the default), "simdgroup", or
+        "mpp" (Metal 4 `matmul2d`); see `enceladus.runtime.dot_backend`. `num_stages` is
+        accepted for Triton compatibility and has no effect.
         """
         interpret = self.interpret
         if interpret is None:
             interpret = _env_flag("ENCELADUS_INTERPRET")
         if not interpret:
-            self._run_compiled(args, kwargs, grid, num_warps, dot_warps)
+            self._run_compiled(args, kwargs, grid, num_warps, dot_warps, dot_backend)
             return
         if num_warps not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
@@ -358,7 +361,8 @@ class JITFunction:
         return b
 
     def _run_compiled(self, args: tuple, kwargs: dict, grid: Any, num_warps: int,
-                      dot_warps: tuple[int, int] | None = None) -> None:  # fmt: skip
+                      dot_warps: tuple[int, int] | None = None,
+                      dot_backend: str = "auto") -> None:  # fmt: skip
         binder = self._binder()
         try:
             runtime, consts = binder(*args, **kwargs)
@@ -367,10 +371,11 @@ class JITFunction:
         # List comprehensions: this runs on every launch, and generators cost more.
         key = (tuple([_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)]),
                tuple([core.unwrap(c) for c in consts]), num_warps, dot_warps,
-               _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
+               dot_backend, _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
         ck = self._compiled.get(key)
         if ck is None:
-            ck = self._compile_for(runtime, consts, num_warps, key, dot_warps)
+            ck = self._compile_for(runtime, consts, num_warps, key, dot_warps,
+                                   dot_backend=dot_backend)
         if callable(grid):
             meta = dict(zip(self._rt_names, runtime, strict=True))
             meta.update(zip(self._ce_names, (core.unwrap(c) for c in consts), strict=True))
@@ -382,15 +387,19 @@ class JITFunction:
         ck.launch(grid, runtime)
 
     def _compile_for(self, runtime: tuple, consts: tuple, num_warps: int, key: tuple,
-                     dot_warps: tuple[int, int] | None = None, record: bool = True):  # fmt: skip
+                     dot_warps: tuple[int, int] | None = None, record: bool = True,
+                     dot_backend: str = "auto"):  # fmt: skip
         if num_warps not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
+        from enceladus.runtime import dot_backend as backends
         from enceladus.runtime.compile import compile_specialization
+
+        backends.check(dot_backend)
 
         bound = dict(zip(self._rt_names, runtime, strict=True))
         bound.update(zip(self._ce_names, consts, strict=True))
         spec = self.specialize(bound)
-        ck = compile_specialization(self, spec, num_warps, dot_warps)
+        ck = compile_specialization(self, spec, num_warps, dot_warps, dot_backend)
         self._compiled[key] = ck
         if not record:  # autotuning compiles many configs on purpose
             return ck
@@ -400,8 +409,8 @@ class JITFunction:
         return ck
 
     def warmup(self, *args: Any, grid: Any = None, num_warps: int = 4,
-               dot_warps: tuple[int, int] | None = None, _record: bool = True,
-               **kwargs: Any):  # fmt: skip
+               dot_warps: tuple[int, int] | None = None, dot_backend: str = "auto",
+               _record: bool = True, **kwargs: Any):  # fmt: skip
         """Compiles the kernel for these arguments without launching it.
 
         Returns:
@@ -411,12 +420,14 @@ class JITFunction:
         runtime, consts = binder(*args, **kwargs)
         key = (tuple(_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)),
                tuple(core.unwrap(c) for c in consts), num_warps, dot_warps,
-               _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
+               dot_backend, _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
         return self._compiled.get(key) or self._compile_for(runtime, consts, num_warps, key,
-                                                            dot_warps, _record)  # fmt: skip
+                                                            dot_warps, _record,
+                                                            dot_backend)  # fmt: skip
 
     def explain(self, *args: Any, grid: Any = None, num_warps: int = 4,
-                dot_warps: tuple[int, int] | None = None, **kwargs: Any) -> str:  # fmt: skip
+                dot_warps: tuple[int, int] | None = None, dot_backend: str = "auto",
+                **kwargs: Any) -> str:  # fmt: skip
         """Prints and returns what the compiler decided for these arguments.
 
         The report lists each tile's layout and register estimate, the layout
@@ -429,12 +440,14 @@ class JITFunction:
             grid: The launch grid, shown in the report's header.
             num_warps: SIMD groups per program.
             dot_warps: The `(WM, WN)` SIMD-group grid for `tl.dot`.
+            dot_backend: The `tl.dot` backend: "auto", "simdgroup", or "mpp".
             **kwargs: Keyword launch arguments, including constexprs.
 
         Returns:
             The report text.
         """
         from enceladus.compiler.explain import explain_kernel
+        from enceladus.runtime import dot_backend as backends
         from enceladus.runtime.compile import build_module
         from enceladus.runtime.device import get_device
 
@@ -442,7 +455,8 @@ class JITFunction:
             raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
         bound = self.bind(args, kwargs)
         g = _resolve_grid(grid, bound) if grid is not None else None
-        module = build_module(self, self.specialize(bound), num_warps, dot_warps)
+        module = build_module(self, self.specialize(bound), num_warps, dot_warps,
+                              backend=backends.resolve(dot_backend))  # fmt: skip
         text = explain_kernel(module, get_device().caps.max_threadgroup_memory, g)
         print(text)
         return text

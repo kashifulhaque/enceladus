@@ -63,14 +63,18 @@ def matmul_desc_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bk, strid
     c.store([pid_m * BM, pid_n * BN], acc.to(c.dtype))
 
 
-def matmul_desc(a, b, c=None, bm: int = 64, bn: int = 64, bk: int = 32, num_warps: int = 4):
-    """Returns `a @ b` in the input dtype. `a`, `b`, and `c` must be row-major."""
+def matmul_desc(a, b, c=None, bm: int = 64, bn: int = 64, bk: int = 32, num_warps: int = 4,
+                dot_backend: str = "auto"):  # fmt: skip
+    """Returns `a @ b` in the input dtype. `a`, `b`, and `c` must be row-major.
+
+    `dot_backend="mpp"` runs the loop as one Metal 4 `matmul2d` op.
+    """
     (m, k), (_, n) = a.shape, b.shape
     if c is None:
         c = enceladus.new_empty(a, (m, n))
     grid = (enceladus.cdiv(n, bn), enceladus.cdiv(m, bm))
     matmul_desc_kernel[grid](a, b, c, m, n, k, k, n, n, BM=bm, BN=bn, BK=bk,
-                             num_warps=num_warps)  # fmt: skip
+                             num_warps=num_warps, dot_backend=dot_backend)  # fmt: skip
     return c
 
 

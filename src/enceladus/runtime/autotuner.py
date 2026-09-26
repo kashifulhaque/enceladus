@@ -39,7 +39,8 @@ class Config:
         kwargs: Constexpr values, for example `{"BM": 64, "BN": 64, "BK": 32}`.
         num_warps: SIMD groups per threadgroup.
         dot_warps: The (WM, WN) grid of SIMD groups for `tl.dot`, or None for the default.
-        dot_backend: "auto" or "simdgroup". ("mpp" arrives in M8.)
+        dot_backend: The `tl.dot` lowering: "auto", "simdgroup", or "mpp" (Metal 4
+            `matmul2d`).
         pre_hook: Called with the bound arguments before each launch of this config.
     """
 
@@ -50,9 +51,9 @@ class Config:
     pre_hook: Callable[[dict[str, Any]], None] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        if self.dot_backend not in ("auto", "simdgroup"):
-            raise ValueError(f"dot_backend {self.dot_backend!r} isn't available; use 'auto' or "
-                             "'simdgroup'")  # fmt: skip
+        if self.dot_backend not in ("auto", "simdgroup", "mpp"):
+            raise ValueError(f"dot_backend must be 'auto', 'simdgroup', or 'mpp', not "
+                             f"{self.dot_backend!r}")  # fmt: skip
         if self.dot_warps is not None:
             self.dot_warps = tuple(self.dot_warps)
 
@@ -60,12 +61,16 @@ class Config:
         opts: dict[str, Any] = {"num_warps": self.num_warps}
         if self.dot_warps is not None:
             opts["dot_warps"] = self.dot_warps
+        if self.dot_backend != "auto":
+            opts["dot_backend"] = self.dot_backend
         return opts
 
     def __str__(self) -> str:
         parts = [repr(self.kwargs), f"num_warps={self.num_warps}"]
         if self.dot_warps is not None:
             parts.append(f"dot_warps={self.dot_warps}")
+        if self.dot_backend != "auto":
+            parts.append(f"dot_backend={self.dot_backend!r}")
         return f"enceladus.Config({', '.join(parts)})"
 
     def to_json(self) -> dict[str, Any]:

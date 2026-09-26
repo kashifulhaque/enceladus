@@ -32,6 +32,8 @@ from enceladus.runtime.interop import as_kernel_arg
 from enceladus.runtime.tensor import Tensor
 
 MAX_GRID = (1 << 32) - 1
+# The MSL language version that `torch.mps.compile_shader` compiles with (torch 2.14).
+TORCH_LANGUAGE_VERSION = (4, 0)
 
 log = logging.getLogger("enceladus")
 
@@ -215,6 +217,10 @@ class CompiledKernel:
         asserts: The kernel's `tl.device_assert` calls, as dicts with `message`, `file`,
             `line`, and `col`, indexed as in the error buffer.
         assert_buffer_index: The buffer index of the error buffer, or None.
+        dot_backend: The `tl.dot` backend the kernel uses ("mpp" or "simdgroup"), or None
+            if it has no `tl.dot`.
+        dot_fallbacks: Why each `tl.dot` that `dot_backend="mpp"` asked for uses
+            `simdgroup` instead.
     """
 
     name: str
@@ -231,6 +237,8 @@ class CompiledKernel:
     enable_logging: bool = False
     asserts: list[dict[str, Any]] = field(default_factory=list)
     assert_buffer_index: int | None = None
+    dot_backend: str | None = None
+    dot_fallbacks: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._ptr_idx = [i for i, a in enumerate(self.args) if a.is_pointer]
@@ -328,6 +336,9 @@ class CompiledKernel:
             for i in self._ptr_idx:
                 interop.torch_np_dtype(values[i])  # refuses CPU and float64 tensors
             tl = self._torch
+            if tl is None and self.language_version > TORCH_LANGUAGE_VERSION:
+                tl = self._torch = (f"it needs MSL {self.language_version}, and compile_shader "
+                                    "compiles with MSL 4.0")  # fmt: skip
             if tl is None:
                 types = [None if a.is_pointer else a.dtype for a in self.args]
                 tl = make_torch_launch(self.msl, self.name, self.math_mode, types, checked=True)

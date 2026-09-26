@@ -116,6 +116,8 @@ def explain_kernel(module: ir.Module, max_threadgroup_memory: int = 32768,
             wm, wn = dot_warps(bm, bn, nw, op.loc, plan.dot_warps)
             add(f"  {_where(op.loc)}  {bm}x{bn}x{bk} (MxNxK), SIMD-group grid {wm}x{wn}"
                 f"{_source(op.loc)}")  # fmt: skip
+        for reason in gen.dot_fallbacks:  # dots that dot_backend="mpp" couldn't lower
+            add(f"  uses simdgroup instead of mpp: {reason}")
 
     add("")
     add("Tiles (layout; registers per thread):")
