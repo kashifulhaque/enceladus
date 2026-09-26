@@ -1394,3 +1394,37 @@ what's wrong in terms of the kernel's code, and says what to do.
 - `tl.dot` backend fallback reasons, which `kernel.explain` shows, still name IR ops.
 - Most `tl.*` argument errors were reviewed by reading them; the test suite triggers
   about 55 of the 342 raise sites.
+
+## Benchmarks and acceptance after M9
+
+The full suite ran with no other GPU work on the machine. The report is in
+`benchmarks/results/2026-09-26-applegpu_g16s-m9.md`; the M5 report for the same date is
+unchanged.
+
+### Acceptance status
+
+| Milestone | Criterion | Result |
+|---|---|---|
+| M6 | Examples run on torch MPS and MLX, including offset views | Met (tests) |
+| M6 | 200 iterations of torch write, Enceladus read, torch read | Met (test) |
+| M6 | Sustained torch-path launch of 5 µs or less | Borderline: 5.10 µs min, 5.17 µs median; M6 measured 4.89-5.03 µs |
+| M7 | FP16 attention within 1.3x of MLX at head dims 64 and 128 | Met: 0.97x-1.08x, causal and not |
+| M7 | Histogram and cumulative-sum examples pass differential tests | Met |
+| M8 | FP16 `mpp` matmul of 5.9 TFLOPS or more at 4096³ | Not met in this run: 5.70 min (MLX 5.77); M8 measured 5.84-5.97 across 5 runs |
+| M8 | Fused epilogue works on `mpp`; ineligible kernels fall back | Met (tests) |
+| M9 | Printing, asserts, `explain`, capture, error pass, docs, wheels | Met; capture traces weren't opened in Xcode |
+
+### Notes
+
+- A second `bench_matmul.py` run right after the suite measured FP16 `mpp` at 5.13
+  TFLOPS and MLX at 4.49, so the GPU was throttling. Compare `mpp` with MLX in the same
+  run rather than with the absolute target. In both runs, `mpp` was within 2% of MLX or
+  faster.
+- FP32 `mpp` at 4096³ is bimodal: 5.35 TFLOPS min but a 3.36 median, and 3.60 with the
+  bias and GELU epilogue. The FP16 and BF16 `mpp` results are stable.
+- In this run, the autotuner picked a slower FP32 config at 4096³ (4.81 TFLOPS against
+  5.09 for the fixed simdgroup config). The tuning benchmark is short, so noise at tuning
+  time can pick a config within about 5% of the best.
+- `mpp` is the largest gain at small and ragged shapes: tuned 32 x 32 `mpp` reaches 3.75
+  (FP32) and 4.32 (FP16) TFLOPS at 513³, against 1.71 and 1.81 for simdgroup and 1.33 and
+  1.39 for MLX.
