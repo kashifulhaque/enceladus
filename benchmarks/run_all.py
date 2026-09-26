@@ -15,7 +15,7 @@ import enceladus
 
 HERE = Path(__file__).resolve().parent
 BENCHMARKS = ["bench_dispatch", "bench_elementwise", "bench_softmax", "bench_norms",
-              "bench_matmul"]  # fmt: skip
+              "bench_matmul", "bench_attention"]  # fmt: skip
 
 
 def main() -> None:

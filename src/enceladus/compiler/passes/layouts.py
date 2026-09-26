@@ -9,7 +9,10 @@ Tile values fall into three classes:
   value. Codegen derives it from its input's registers on demand.
 - *anchored*: everything else. It gets one layout, chosen from its anchors: `load` and
   `store` use `blocked` with the most contiguous dimension fastest, `reduce` uses the
-  slice of its input, and elementwise ops adopt an anchored operand's layout.
+  slice of its input, and elementwise ops adopt an anchored operand's layout. A load
+  that only feeds the left operand of `tl.dot`s inside a loop below it (the query tile of
+  attention) uses the dot's register operand layout, so it stays in registers across the
+  loop instead of being reloaded or restaged each iteration.
 
 Codegen converts between layouts where a use needs a different one; a conversion is free
 when `layout.reg_map` finds the data in the same thread.
@@ -50,6 +53,7 @@ class LayoutPlan:
     fixed: dict[int, L.BitLayout] = field(default_factory=dict)
     defining: dict[int, ir.Op] = field(default_factory=dict)
     loop_of: dict[int, ir.Op] = field(default_factory=dict)  # iter arg or result -> for op
+    hoisted: dict[int, ir.Op] = field(default_factory=dict)  # see `hoisted_a_operands`
     arg_index: dict[int, int] = field(default_factory=dict)  # iter arg or result -> index
 
     def default(self, t: ir.TileType, order: tuple[int, ...] | None = None) -> L.BitLayout:
@@ -126,11 +130,70 @@ def view_source_layout(op: ir.Op, dst: L.BitLayout) -> L.BitLayout:
     raise AssertionError(op.name)
 
 
+def crosses_loop(block: ir.Block, op: ir.Op) -> bool:
+    """Returns whether a `for` body lies between `block` and `op`, which `block` encloses."""
+    blk = op.parent
+    while blk is not None and blk is not block:
+        region = blk.parent
+        parent = region.parent if region is not None else None
+        if parent is None:
+            return False
+        if parent.name == "for":
+            return True
+        blk = parent.parent
+    return False
+
+
+# The most 32-bit registers per thread that a left operand may hold across a loop. The
+# flash attention query tile at head dimension 128 needs 16 in FP16 and 32 in FP32.
+MAX_HOISTED_REGS = 32
+
+
+def hoisted_a_operands(module: ir.Module, num_warps: int,
+                       override: tuple[int, int] | None = None) -> dict[int, ir.Op]:  # fmt: skip
+    """Returns the loads that stay in registers as the left operand of `tl.dot`s in a loop.
+
+    A `load` or `desc_load` qualifies when every use is the left operand of a `dot` inside
+    a `for` loop nested below the load, and its share per thread fits in
+    `MAX_HOISTED_REGS` registers. Loading it once, in the dot's register operand layout,
+    beats reloading it from device memory or restaging it through threadgroup memory on
+    every iteration.
+
+    Args:
+        module: The kernel.
+        num_warps: SIMD groups per threadgroup.
+        override: The `dot_warps` launch option, if any.
+
+    Returns:
+        A dict from the id of each qualifying value to the first `dot` that reads it.
+    """
+    users: dict[int, list[tuple[ir.Op, int]]] = {}
+    for op in module.walk():
+        for i, v in enumerate(op.operands):
+            users.setdefault(id(v), []).append((op, i))
+    out: dict[int, ir.Op] = {}
+    for op in module.walk():
+        if op.name not in ("load", "desc_load") or not isinstance(op.result.type, ir.TileType):
+            continue
+        us = users.get(id(op.result), [])
+        if not us or not all(u.name == "dot" and i == 0 and crosses_loop(op.parent, u)
+                             for u, i in us):  # fmt: skip
+            continue
+        dot = us[0][0]
+        (bm, bk), bn = op.result.type.shape, dot.result.type.shape[1]
+        wm, _ = dot_warps(bm, bn, num_warps, dot.loc, override)
+        if bk % 8 == 0 and bm * bk // (32 * wm) * elem_bytes(op.result.type) <= \
+                4 * MAX_HOISTED_REGS:  # fmt: skip
+            out[id(op.result)] = dot
+    return out
+
+
 class _Assigner:
     def __init__(self, module: ir.Module, num_warps: int, dot_warps=None) -> None:
         self.plan = LayoutPlan(num_warps, AxisAnalysis(module), dot_warps)
         self.in_progress: set[int] = set()
         self.module = module
+        self.plan.hoisted = hoisted_a_operands(module, num_warps, dot_warps)
 
     def run(self) -> LayoutPlan:
         self._classify_block(self.module.body)
@@ -217,6 +280,11 @@ class _Assigner:
         op = p.defining.get(id(v))
         if op is None:
             return None
+        if id(v) in p.hoisted:
+            dot = p.hoisted[id(v)]
+            bm, bk = t.shape
+            wm, wn = dot_warps(bm, dot.result.type.shape[1], p.num_warps, dot.loc, p.dot_warps)
+            return L.dot_operand_a(bm, bk, wm, wn)
         if op.name == "load":
             order = contiguous_order(p.axis.get(op.operands[0]))
             return p.default(t, order)

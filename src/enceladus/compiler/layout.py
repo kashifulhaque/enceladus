@@ -371,6 +371,19 @@ def simd_acc(bm: int, bn: int, wm: int, wn: int) -> BitLayout:
     return BitLayout((bm, bn), tuple(reg), lane, tuple(warp))
 
 
+def dot_operand_a(bm: int, bk: int, wm: int, wn: int) -> BitLayout:
+    """Returns the register layout of a BM x BK left `tl.dot` operand for a WM x WN grid.
+
+    SIMD-group row `w` holds rows `w * SM` to `(w + 1) * SM - 1` of the operand in every
+    column, as TM x (BK / 8) 8x8 fragments with the accumulator's lane pattern. The SIMD
+    groups of one row need the same fragments, so the WN SIMD-group bits are broadcast.
+    With WN = 1, this is `simd_acc(bm, bk, wm, 1)`: accumulator fragment (i, j) of a
+    BM x BK result is fragment (i, k = j) of a left operand, with no data movement.
+    """
+    base = simd_acc(bm, bk, wm, 1)
+    return BitLayout(base.shape, base.reg, base.lane, base.warp + (_zero(2),) * _log2(wn))
+
+
 # ---- conversions ----
 
 
