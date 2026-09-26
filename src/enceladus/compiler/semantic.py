@@ -162,7 +162,8 @@ def broadcast_shapes(a: Sequence[int], b: Sequence[int]) -> tuple[int, ...]:
         if x != y and x != 1 and y != 1:
             raise CompilationError(
                 f"can't broadcast shapes {a} and {b}: dimension {i} is {x} in one and {y} in "
-                "the other."
+                "the other. Make the shapes match, or add a dimension of size 1 with "
+                "`x[:, None]` or `x[None, :]`."
             )
         out.append(max(x, y))
     return tuple(out)
@@ -192,12 +193,42 @@ def check_shape(shape: Any, what: str) -> tuple[int, ...]:
     return shape
 
 
+def type_str(t: ir.Type) -> str:
+    """Describes an IR type in the terms of the `tl` language, for error messages.
+
+    For example, `tile<16xf32>` becomes "tl.float32 tile of shape (16,)".
+    """
+    if isinstance(t, ir.ScalarType):
+        return f"{t.dtype!r}"
+    if isinstance(t, ir.PointerType):
+        return f"pointer to {t.elem.dtype!r}"
+    if isinstance(t, ir.TileType):
+        e = t.elem
+        if isinstance(e, ir.PointerType):
+            return f"tile of pointers to {e.elem.dtype!r} of shape {t.shape}"
+        return f"{e.dtype!r} tile of shape {t.shape}"
+    if isinstance(t, ir.DescType):
+        return f"tensor descriptor of {t.elem.dtype!r} with block shape {t.block_shape}"
+    return str(t)
+
+
 def describe(x: Any) -> str:
-    """Describes a frontend value for an error message."""
+    """Describes a frontend or interpreter value for an error message."""
     if isinstance(x, ir.Value):
         name = f" `{x.name_hint}`" if x.name_hint else ""
-        return f"a runtime value{name} of type {x.type}"
-    return f"{type(x).__name__} {x!r}"
+        return f"a runtime value{name} of type {type_str(x.type)}"
+    kind = type(x).__name__
+    if kind == "ITile":  # an interpreter tile; this module can't import the interpreter
+        if not x.shape:
+            return f"a runtime value of type {x.dtype!r}"
+        return f"a runtime value of type {x.dtype!r} tile of shape {x.shape}"
+    if kind == "IPointer":
+        return f"a runtime value of type pointer to {x.elem!r}"
+    if kind == "IDesc":
+        return "a tensor descriptor"
+    if kind == "module":
+        return f"module `{x.__name__}`"
+    return f"{kind} {x!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +287,10 @@ def to_value(b: ir.Builder, x: Any, dt: core.dtype | None = None) -> ir.Value:
 def cast(b: ir.Builder, v: ir.Value, dt: core.dtype, bitcast: bool = False) -> ir.Value:
     """Converts `v` to element dtype `dt`. A bitcast reinterprets the bits instead."""
     if is_pointer(v):
-        raise CompilationError(f"can't convert a pointer ({v.type}) to {dt}")
+        raise CompilationError(
+            f"can't convert a {type_str(v.type)} to {dt!r}. Load the values with tl.load, "
+            "and then convert them."
+        )
     src = dtype_of(v)
     if src is dt:
         return v
@@ -338,11 +372,15 @@ def _pointer_binary(b: ir.Builder, op: str, x: Any, y: Any) -> ir.Value:
         x, y = y, x
     if op not in ("add", "sub") or is_pointer(y):
         raise CompilationError(
-            f"pointers support only `+` and `-` with an integer offset, not `{_OP_SYMBOL[op]}`"
+            f"pointers support only `+` and `-` with an integer offset, not "
+            f"`{_OP_SYMBOL[op]}`. Compute the offset first, as in `ptr + i * stride`."
         )
     yd = operand_dtype(y)
     if isinstance(yd, float) or (isinstance(yd, core.dtype) and not yd.is_int()):
-        raise CompilationError(f"a pointer offset must be an integer, but got {describe(y)}")
+        raise CompilationError(
+            f"a pointer offset must be an integer, but got {describe(y)}. Convert it with "
+            "`.to(tl.int32)`."
+        )
     off = to_value(b, y)
     od = dtype_of(off)
     if od.is_bool():

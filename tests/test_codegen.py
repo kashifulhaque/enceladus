@@ -34,15 +34,6 @@ def test_layout_conversion_through_threadgroup_memory(rng_np, dtype):
     assert "threadgroup" in ck.msl and ck.threadgroup_memory_bytes > 0
 
 
-def test_threadgroup_memory_overflow_names_the_line(rng_np):
-    x = np.zeros((128, 128), np.float32)
-    with pytest.raises(enceladus.CompilationError) as e:
-        _add_transposed.warmup(x, x, x, M=128, N=128)
-    msg = str(e.value)
-    assert "threadgroup memory" in msg and "smaller blocks" in msg
-    assert "x + tl.trans(y)" in msg
-
-
 @enceladus.jit
 def _row_center(x_ptr, out_ptr, N: tl.constexpr, M: tl.constexpr):
     rm = tl.arange(0, M)

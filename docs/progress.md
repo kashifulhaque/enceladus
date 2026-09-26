@@ -1293,3 +1293,104 @@ Python version.
 - The snippet checker's capture example leaves a small `.gputrace` bundle in the
   system's temporary directory on each run, and the autotuning example writes a result
   to `~/.cache/enceladus/autotune/`.
+
+## M9: Error-message pass
+
+This entry covers item 5 of M9: every user-facing error names the source line, says
+what's wrong in terms of the kernel's code, and says what to do.
+
+### What was reviewed
+
+- All 342 `raise` sites in `src/enceladus` (the compiler, the language builtins, the
+  interpreter, the runtime, and `configs.py`), and the 31 entries of the frontend's table
+  of unsupported Python constructs.
+- The messages that the test suite produces, collected with a `sys.monitoring` hook
+  during a full run, and the messages of about 65 common mistakes (a missing
+  `tl.constexpr`, `x[0]` on a tile, `print(x)`, a `tl.dot` with K = 4, a CPU torch
+  tensor, and others), each run compiled and in the interpreter.
+
+### What changed
+
+- **Wording.** About 130 messages changed, and 18 entries of the unsupported-construct
+  table gained a fix. Each message now ends with a concrete fix, such as "Rewrite the
+  recursion as a loop", "Use tl.device_print instead", or "Use a K block size of at
+  least 8". The rest already named the problem and the fix.
+- **User-level types.** `semantic.describe` and the new `semantic.type_str` print
+  `tl.float32 tile of shape (16,)` instead of the IR notation `tile<16xf32>`, and
+  interpreter values as their dtype and shape instead of a NumPy `repr`. Messages no
+  longer name IR ops, except the backend's "can't compile this operation (IR op `x`)"
+  refusals.
+- **Internal errors.** Broken compiler invariants raise `internal_error(...)`, which
+  keeps the source location and says that the bug is in Enceladus. A new safety net in
+  `_Codegen.run` and `compile_module` turns an `AssertionError`, `AttributeError`,
+  `IndexError`, `KeyError`, `TypeError`, or `ValueError` from a compiler bug into a
+  located `CompilationError` instead of a bare traceback. `ir.verify` errors say the same.
+- **Launch arguments.** The compiled launch path reported fast-binder internals, such as
+  `binder() missing 1 required positional argument`, and dropped the argument name for
+  bad values. Both launch paths now report `kernel: missing a required argument: 'B'`
+  and ``kernel: argument `x_ptr`: ...``, including for CPU torch tensors and float64 arrays
+  in the interpreter.
+- **Interpreter.** `ITile` refuses `x[i] = v`, `**`, `@`, iteration, and unpacking with
+  the compiler's messages. Iterating over a tile used to report "tiles support only
+  `None` and `:` in subscripts, but got 0".
+- Parse errors in `parse_function` now carry the `def` line.
+- `docs/guide/debugging.md` quotes the new wording of the missing-constexpr error.
+
+### Silent miscompiles and crashes fixed
+
+- **Constexprs that compare equal shared a compiled kernel.** The in-memory
+  specialization key held constexpr values, and `2 == 2.0` and `1 == True` in Python. A
+  launch with `S=2.0` after `S=2` reused the integer kernel: `(offs + 2147483647) * S`
+  gave `[-2, 0]` instead of the interpreter's `[4.29e9, -4.29e9]`. A launch of
+  `tl.arange(0, B)` with `B=16.0` after `B=16` ran instead of failing. The key now
+  includes each value's type (`jit._const_key`).
+- **A list constexpr crashed the compiled launch** with `TypeError: unhashable type:
+  'list'`. The interpreter accepted it. The compiled path now accepts it too, and other
+  unhashable constexprs, such as a dict, get an error that names the parameter.
+- **Device-assert locations went stale in the disk cache.** A debug build stores the file
+  and line of each `tl.device_assert`, but the cache key hashes only the kernel's source
+  text. The same kernel moved to another line or file reused the old entry and reported
+  the old location. The test suite showed this: another worktree's path appeared in a
+  `DeviceAssertionError`. Debug cache keys now include the `file:line` of the kernel and
+  its `@enceladus.jit` dependencies.
+
+### Tests
+
+- A new `tests/test_errors.py` (24 cases, about 0.5 s) replaces two duplicates in
+  `test_codegen.py` and `test_interpreter.py`:
+  - One parametrized table of nine common mistakes (a missing constexpr, a
+    non-power-of-two `arange`, a `while` loop, `and` on tiles, float16 `atomic_add`,
+    `**`, `print`, `tl.dot` with K = 4, and threadgroup memory overflow), run compiled
+    and, where the interpreter refuses the construct, in the interpreter without IR
+    verification. Each case asserts the `file:line`, the source line, and a phrase from
+    the fix.
+  - Four launch-argument mistakes, in both modes, asserting the kernel and argument names.
+  - Regressions for the three bugs in the preceding section and for the codegen safety
+    net. Each one failed with its fix reverted.
+- `uv run pytest -q`: 698 passed, 19 skipped, and 1 deselected in about 6 s.
+- `@enceladus.jit` sustained launch overhead: 3.35 µs minimum and 3.45 µs median, the
+  same as before the type-aware constexpr key.
+
+### Deviations from the plan
+
+- The change edits `language/ops.py` messages, so the compiler hash changes and each
+  kernel recompiles once.
+
+### Known gaps
+
+- The interpreter runs kernels as Python, so without `ENCELADUS_VERIFY=1` it accepts
+  `while`, `print`, early `return`, and helpers that aren't `@enceladus.jit`, and
+  reports Python's own `NameError`, `TypeError`, or `ZeroDivisionError` for some
+  mistakes. Those errors carry a traceback through the kernel line, not a
+  `CompilationError`.
+- The compiler accepts chained comparisons such as `0 < x < 1` and `not` on tiles
+  (elementwise), but the interpreter refuses them. This pass doesn't change what either
+  mode accepts.
+- The interpreter accepts `tl.dot` shapes that the compiler refuses (K not a multiple of
+  8, or a tile too small for `num_warps`).
+- The frontend turns a `TypeError`, `ValueError`, `KeyError`, or `AttributeError` raised
+  while it evaluates a line into "evaluating this line at compile time raised ...". A
+  compiler bug in a builtin handler looks like a user error there.
+- `tl.dot` backend fallback reasons, which `kernel.explain` shows, still name IR ops.
+- Most `tl.*` argument errors were reviewed by reading them; the test suite triggers
+  about 55 of the 342 raise sites.

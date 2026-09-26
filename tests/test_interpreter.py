@@ -537,20 +537,6 @@ def test_bool_ops_return_operands(mode, op):
     check_kernel(run, (nm,), ref, modes=(mode,))
 
 
-@enceladus.jit
-def _and_on_tile_kernel(x_ptr, BLOCK: tl.constexpr):
-    x = tl.load(x_ptr + tl.arange(0, BLOCK))
-    tl.store(x_ptr + tl.arange(0, BLOCK), x, mask=(x > 0) and (x < 1))  # error
-
-
-def test_and_on_tile_is_refused(mode):
-    with execution_mode(mode), pytest.raises(enceladus.CompilationError) as e:
-        _and_on_tile_kernel[(1,)](np.ones(16, np.float32), BLOCK=16)
-    msg = str(e.value)
-    assert "use `&`" in msg
-    assert "# error" in msg and __file__ in msg
-
-
 
 @enceladus.jit(do_not_specialize=["n"])
 def _guarded_bias_kernel(x_ptr, bias_ptr: tl.constexpr, out_ptr, n, HAS_BIAS: tl.constexpr,

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from enceladus.compiler import ir, semantic
-from enceladus.compiler.errors import CompilationError, Loc
+from enceladus.compiler.errors import CompilationError, Loc, internal_error
 from enceladus.language import core
 
 _MISSING = object()
@@ -55,13 +55,18 @@ def parse_function(fn: types.FunctionType) -> SourceInfo:
     except (OSError, TypeError) as e:
         raise CompilationError(
             f"can't read the source of `{fn.__name__}`. Define kernels in a file, not in an "
-            "interactive prompt."
+            "interactive prompt.",
+            Loc(fn.__code__.co_filename, fn.__code__.co_firstlineno, 1),
         ) from e
     indent = len(lines[0]) - len(lines[0].lstrip())
     tree = ast.parse(textwrap.dedent("".join(lines)))
     fdef = tree.body[0]
     if not isinstance(fdef, ast.FunctionDef):
-        raise CompilationError(f"`{fn.__name__}` must be a plain `def` function")
+        raise CompilationError(
+            f"`{fn.__name__}` must be a plain `def` function. Decorate a module-level `def` "
+            "with @enceladus.jit.",
+            Loc(fn.__code__.co_filename, first_line, 1),
+        )
     file = inspect.getsourcefile(fn) or fn.__code__.co_filename
     return SourceInfo(fdef, file, first_line, indent)
 
@@ -127,33 +132,36 @@ _FORBIDDEN = {
     "While": "`while` loops aren't supported. Use `for i in range(...)` with a bound.",
     "Break": "`break` isn't supported. Use a mask, or restructure the loop bounds.",
     "Continue": "`continue` isn't supported. Guard the rest of the loop body with an `if`.",
-    "Try": "`try` isn't supported in kernels.",
-    "TryStar": "`try` isn't supported in kernels.",
-    "With": "`with` isn't supported in kernels.",
-    "AsyncWith": "`with` isn't supported in kernels.",
-    "AsyncFor": "`async for` isn't supported in kernels.",
-    "Global": "`global` isn't supported in kernels.",
-    "Nonlocal": "`nonlocal` isn't supported in kernels.",
-    "Delete": "`del` isn't supported in kernels.",
+    "Try": "`try` isn't supported in kernels. Check for errors on the host before the launch.",
+    "TryStar": "`try` isn't supported in kernels. Check for errors on the host first.",
+    "With": "`with` isn't supported in kernels. Use the context manager around the launch.",
+    "AsyncWith": "`with` isn't supported in kernels. Use it around the launch instead.",
+    "AsyncFor": "`async for` isn't supported in kernels. Use `for i in range(...)`.",
+    "Global": "`global` isn't supported in kernels. Pass the value as a kernel argument.",
+    "Nonlocal": "`nonlocal` isn't supported in kernels. Pass the value as an argument.",
+    "Delete": "`del` isn't supported in kernels. Remove the statement.",
     "Import": "imports aren't supported inside kernels. Import at module level.",
     "ImportFrom": "imports aren't supported inside kernels. Import at module level.",
-    "ClassDef": "class definitions aren't supported inside kernels.",
+    "ClassDef": "class definitions aren't supported inside kernels. Define them at module level.",
     "FunctionDef": (
         "nested functions (closures) aren't supported. Define the helper at module level and "
         "decorate it with @enceladus.jit."
     ),
-    "AsyncFunctionDef": "nested functions aren't supported.",
+    "AsyncFunctionDef": (
+        "nested functions aren't supported. Define the helper at module level and decorate it "
+        "with @enceladus.jit."
+    ),
     "Lambda": "lambdas aren't supported. Define a module-level @enceladus.jit function instead.",
     "Raise": "`raise` isn't supported. Use tl.static_assert for compile-time checks.",
     "ListComp": "comprehensions aren't supported. Use tl.static_range to unroll a loop.",
-    "SetComp": "comprehensions aren't supported.",
-    "DictComp": "comprehensions aren't supported.",
-    "GeneratorExp": "generator expressions aren't supported.",
-    "Yield": "`yield` isn't supported in kernels.",
-    "YieldFrom": "`yield` isn't supported in kernels.",
-    "Await": "`await` isn't supported in kernels.",
-    "NamedExpr": "the `:=` operator isn't supported in kernels.",
-    "Match": "`match` isn't supported in kernels.",
+    "SetComp": "comprehensions aren't supported. Use tl.static_range to unroll a loop.",
+    "DictComp": "comprehensions aren't supported. Use tl.static_range to unroll a loop.",
+    "GeneratorExp": "generator expressions aren't supported. Use tl.static_range instead.",
+    "Yield": "`yield` isn't supported in kernels. Write results with tl.store.",
+    "YieldFrom": "`yield` isn't supported in kernels. Write results with tl.store.",
+    "Await": "`await` isn't supported in kernels. Await on the host, around the launch.",
+    "NamedExpr": "the `:=` operator isn't supported in kernels. Assign on a separate line.",
+    "Match": "`match` isn't supported in kernels. Use `if` and `elif` instead.",
     "Starred": "star expressions are supported only for compile-time tuples in calls.",
 }
 
@@ -198,7 +206,11 @@ class CodeGenerator(ast.NodeVisitor):
         except CompilationError as e:
             raise e.with_loc(self.b.loc) from None
         except (TypeError, ValueError, ArithmeticError, IndexError, KeyError, AttributeError) as e:
-            raise CompilationError(f"{type(e).__name__}: {e}", self.b.loc) from e
+            raise CompilationError(
+                f"evaluating this line at compile time raised {type(e).__name__}: {e}. Check "
+                "the compile-time values that it uses, such as tl.constexpr parameters.",
+                self.b.loc,
+            ) from e
         finally:
             self.b.loc = saved
 
@@ -235,11 +247,15 @@ class CodeGenerator(ast.NodeVisitor):
         """Inlines a call to a `@enceladus.jit` function and returns its result."""
         if any(f is fn for f in self.call_stack):
             chain = " -> ".join(f.__name__ for f in [*self.call_stack, fn])
-            raise CompilationError(f"recursion isn't supported: {chain}")
+            raise CompilationError(
+                f"recursion isn't supported: {chain}. Rewrite the recursion as a loop."
+            )
         try:
             bound = fn.signature.bind(*args, **kwargs)
         except TypeError as e:
-            raise CompilationError(f"bad arguments for `{fn.__name__}`: {e}") from None
+            raise CompilationError(
+                f"the arguments don't match the parameters of `{fn.__name__}`: {e}"
+            ) from None
         bound.apply_defaults()
         scope: dict[str, Any] = {}
         for p in fn.params:
@@ -247,7 +263,8 @@ class CodeGenerator(ast.NodeVisitor):
             if p.is_constexpr and isinstance(v, ir.Value):
                 raise CompilationError(
                     f"parameter `{p.name}` of `{fn.__name__}` is tl.constexpr, but the call "
-                    f"passes {semantic.describe(v)}"
+                    f"passes {semantic.describe(v)}. Pass a compile-time value, such as a "
+                    "literal or a tl.constexpr parameter of the caller."
                 )
             scope[p.name] = v
         saved = (self.fn, self.src, self.globals, self.scope, self.runtime_depth,
@@ -285,7 +302,10 @@ class CodeGenerator(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if not isinstance(node.target, ast.Name):
-            raise CompilationError("augmented assignment needs a plain variable name as target")
+            raise CompilationError(
+                "augmented assignment needs a plain variable name as its target, as in "
+                "`acc += x`. Tiles are immutable; build a new tile instead."
+            )
         cur = self.lookup(node.target.id)
         self.assign(node.target, self.binop(node.op, cur, self.visit(node.value)))
 
@@ -299,8 +319,15 @@ class CodeGenerator(ast.NodeVisitor):
             self.scoped_out.pop(target.id, None)
         elif isinstance(target, (ast.Tuple, ast.List)):
             if not isinstance(value, (tuple, list)) or len(value) != len(target.elts):
-                n = len(value) if isinstance(value, (tuple, list)) else "a non-tuple"
-                raise CompilationError(f"can't unpack {n} values into {len(target.elts)} names")
+                k = len(target.elts)
+                if isinstance(value, (tuple, list)):
+                    what = f"{len(value)} values"
+                else:
+                    what = f"{semantic.describe(value)}, which isn't a compile-time tuple,"
+                raise CompilationError(
+                    f"can't unpack {what} into {k} names. Unpack only compile-time tuples "
+                    "with the same number of elements."
+                )
             for t, v in zip(target.elts, value, strict=True):
                 self.assign(t, v)
         elif isinstance(target, (ast.Subscript, ast.Attribute)):
@@ -309,7 +336,10 @@ class CodeGenerator(ast.NodeVisitor):
                 "new tile instead, for example with tl.where."
             )
         else:
-            raise CompilationError(f"can't assign to `{type(target).__name__}`")
+            raise CompilationError(
+                f"assignment to a `{type(target).__name__}` target isn't supported in kernels. "
+                "Assign to a plain variable name."
+            )
 
     def visit_Return(self, node: ast.Return) -> None:
         if self.runtime_depth > 0:
@@ -399,14 +429,17 @@ class CodeGenerator(ast.NodeVisitor):
             )
         if isinstance(cond.type, ir.ScalarType):
             return semantic.to_bool(self.b, cond)
-        raise CompilationError(f"{what} needs a scalar condition, but got {cond.type}")
+        raise CompilationError(
+            f"{what} needs a scalar condition, but got {semantic.describe(cond)}"
+        )
 
     def _unify_type(self, name: str, a: Any, b: Any) -> ir.Type:
         if isinstance(a, ir.Value) and isinstance(b, ir.Value):
             if a.type != b.type:
                 raise CompilationError(
-                    f"`{name}` has type {a.type} in one branch and {b.type} in the other. Convert "
-                    "one of them with `.to(...)` so that both branches agree."
+                    f"`{name}` has type {semantic.type_str(a.type)} in one branch and "
+                    f"{semantic.type_str(b.type)} in the other. Convert one of them with "
+                    "`.to(...)` so that both branches agree."
                 )
             return a.type
         for x in (a, b):
@@ -424,13 +457,24 @@ class CodeGenerator(ast.NodeVisitor):
         v = core.unwrap(v)
         if isinstance(v, ir.Value):
             if v.type != t:
-                raise CompilationError(f"`{name}` has type {v.type}, but {t} is expected here")
+                raise CompilationError(
+                    f"`{name}` has type {semantic.type_str(v.type)}, but "
+                    f"{semantic.type_str(t)} is expected here. Convert it with `.to(...)`, "
+                    "or broadcast it to the expected shape."
+                )
             return v
         e = ir.elem_of(t)
         if not semantic.is_literal(v) or not isinstance(e, ir.ScalarType):
-            raise CompilationError(f"can't use {semantic.describe(v)} as a value of type {t}")
+            raise CompilationError(
+                f"can't use {semantic.describe(v)} as `{name}`, which has type "
+                f"{semantic.type_str(t)}. Use a number or a value of that type."
+            )
         if isinstance(v, float) and not e.dtype.is_floating():
-            raise CompilationError(f"can't use the float {v!r} as `{name}` of integer type {t}")
+            raise CompilationError(
+                f"can't use the float {v!r} as `{name}`, which has type "
+                f"{semantic.type_str(t)}. Use an integer, or make `{name}` a float from the "
+                "start."
+            )
         if isinstance(t, ir.TileType):
             val = semantic.coerce_literal(v, e.dtype)
             return self.b.create("full", [], [t], {"value": val}).result
@@ -438,19 +482,26 @@ class CodeGenerator(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For) -> None:
         if node.orelse:
-            raise CompilationError("`for ... else` isn't supported")
+            raise CompilationError(
+                "`for ... else` isn't supported. Move the `else` body after the loop."
+            )
         it = node.iter
         func = self.visit(it.func) if isinstance(it, ast.Call) else None
         static_range = core.BUILTINS["static_range"]
         if not any(func is f for f in (static_range, builtins.range, core.BUILTINS["range"])):
             raise CompilationError(
-                "`for` loops must iterate over range(...), tl.range(...), or tl.static_range(...)"
+                "`for` loops must iterate over range(...), tl.range(...), or "
+                "tl.static_range(...). To process the elements of a tile, use elementwise tl "
+                "operations on the whole tile."
             )
         args = [core.unwrap(self.visit(a)) for a in it.args]
         kwargs = {k.arg: core.unwrap(self.visit(k.value)) for k in it.keywords}
         if func is static_range:
             if any(isinstance(a, ir.Value) for a in args) or kwargs:
-                raise CompilationError("tl.static_range needs compile-time integer bounds")
+                raise CompilationError(
+                    "tl.static_range needs compile-time integer bounds. Use literals or "
+                    "tl.constexpr parameters, or use range(...) for a runtime loop."
+                )
             for v in range(*args):
                 self.assign(node.target, v)
                 self.visit_body(node.body)
@@ -458,12 +509,15 @@ class CodeGenerator(ast.NodeVisitor):
                     return
             return
         if func is builtins.range and kwargs:
-            raise CompilationError("range() takes no keyword arguments")
+            raise CompilationError(
+                "range() takes no keyword arguments. Pass the bounds positionally, as in "
+                "`range(start, stop, step)`."
+            )
         self._runtime_for(node, args)
 
     def _runtime_for(self, node: ast.For, args: list[Any]) -> None:
         if not 1 <= len(args) <= 3:
-            raise CompilationError(f"range() takes 1 to 3 arguments, got {len(args)}")
+            raise CompilationError(f"range() takes 1 to 3 arguments, but got {len(args)}")
         lb, ub, step = (0, args[0], 1) if len(args) == 1 else (*args, 1)[:3]
         for v in (lb, ub, step):
             ok = (isinstance(v, int) and not isinstance(v, bool)) or (
@@ -474,12 +528,15 @@ class CodeGenerator(ast.NodeVisitor):
             )
             if not ok:
                 raise CompilationError(
-                    f"range() bounds must be integer scalars, not {semantic.describe(v)}"
+                    f"range() bounds must be integer scalars, not {semantic.describe(v)}. "
+                    "Convert a float bound with `.to(tl.int32)`."
                 )
         if step == 0:
-            raise CompilationError("range() step must not be zero")
+            raise CompilationError("the step of range() can't be zero. Use a nonzero step.")
         if not isinstance(node.target, ast.Name):
-            raise CompilationError("the loop variable must be a single name")
+            raise CompilationError(
+                "the loop variable must be a single name, as in `for i in range(n)`"
+            )
         target = node.target.id
         wide = any(
             (isinstance(v, ir.Value) and v.type.dtype.primitive_bitwidth == 64)
@@ -520,14 +577,17 @@ class CodeGenerator(ast.NodeVisitor):
                 if isinstance(e, ir.Value) and e.type != types_[n]:
                     if isinstance(p, ir.Value):
                         raise CompilationError(
-                            f"loop-carried variable `{n}` has type {p.type} before the loop but "
-                            f"{e.type} at the end of the body. Convert it with `.to(...)` so that "
-                            "the type stays the same, or initialize it with the final type."
+                            f"loop-carried variable `{n}` has type {semantic.type_str(p.type)} "
+                            f"before the loop but {semantic.type_str(e.type)} at the end of the "
+                            "body. Convert it with `.to(...)` so that the type stays the same, "
+                            "or initialize it with the final type."
                         )
                     types_[n], changed = e.type, True
                 elif not isinstance(e, ir.Value) and not semantic.is_literal(e):
                     raise CompilationError(
-                        f"`{n}` is reassigned to a non-numeric value inside a runtime loop"
+                        f"`{n}` is reassigned to {semantic.describe(e)} inside a runtime loop, "
+                        "but only numbers and tiles can be loop-carried. Assign it outside the "
+                        "loop, or use tl.static_range to unroll the loop."
                     )
                 keep.append(n)
             for n in fixed:
@@ -540,7 +600,7 @@ class CodeGenerator(ast.NodeVisitor):
                 break
             carried = keep
         else:  # pragma: no cover - the loop converges in at most one retype per variable.
-            raise CompilationError("couldn't infer the types of the loop-carried variables")
+            raise internal_error("couldn't infer the types of the loop-carried variables")
 
         inits = [self.materialize(pre[n], types_[n], n) for n in carried]
         with self.b.at(block):
@@ -584,7 +644,10 @@ class CodeGenerator(ast.NodeVisitor):
             )
         if hasattr(builtins, name):
             return getattr(builtins, name)
-        raise CompilationError(f"name `{name}` isn't defined")
+        raise CompilationError(
+            f"name `{name}` isn't defined. Assign it before this line, or define it at module "
+            "level."
+        )
 
     def visit_Attribute(self, node: ast.Attribute) -> Any:
         obj = core.unwrap(self.visit(node.value))
@@ -592,11 +655,22 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(obj, ir.Value):
             return self.value_attr(obj, attr)
         if isinstance(obj, (list, dict, set)):
-            raise CompilationError(f"methods of {type(obj).__name__} aren't supported in kernels")
+            raise CompilationError(
+                f"methods of {type(obj).__name__} aren't supported in kernels. Use a "
+                "compile-time tuple instead."
+            )
         try:
             return core.unwrap(getattr(obj, attr))
         except AttributeError:
-            raise CompilationError(f"{semantic.describe(obj)} has no attribute `{attr}`") from None
+            hint = ""
+            if isinstance(obj, types.ModuleType) and obj.__name__ == "enceladus.language":
+                hint = (
+                    ". Check the spelling. Some Triton functions don't exist in Enceladus; "
+                    "the language reference lists the supported ones."
+                )
+            raise CompilationError(
+                f"{semantic.describe(obj)} has no attribute `{attr}`{hint}"
+            ) from None
 
     def value_attr(self, v: ir.Value, attr: str) -> Any:
         t = v.type
@@ -607,7 +681,10 @@ class CodeGenerator(ast.NodeVisitor):
                 return t.block_shape
             if attr in core.DESC_METHODS:
                 return _BoundMethod(core.DESC_METHODS[attr], v)
-            raise CompilationError(f"tensor descriptors have no attribute `{attr}`")
+            raise CompilationError(
+                f"tensor descriptors have no attribute `{attr}`. They have `load`, `store`, "
+                "`dtype`, and `block_shape`."
+            )
         e = ir.elem_of(t)
         if attr == "dtype":
             return e.elem.dtype if isinstance(e, ir.PointerType) else e.dtype
@@ -619,7 +696,10 @@ class CodeGenerator(ast.NodeVisitor):
             return core.BUILTINS["trans"].frontend(self, v)
         if attr in core.TILE_METHODS:
             return _BoundMethod(core.TILE_METHODS[attr], v)
-        raise CompilationError(f"a value of type {t} has no attribute `{attr}`")
+        raise CompilationError(
+            f"{semantic.describe(v)} has no attribute `{attr}`. Check the spelling, or call "
+            "the tl function of that name, for example `tl.sum(x)` for `x.sum()`."
+        )
 
     def visit_Call(self, node: ast.Call) -> Any:
         func = self.visit(node.func)
@@ -628,14 +708,19 @@ class CodeGenerator(ast.NodeVisitor):
             if isinstance(a, ast.Starred):
                 v = core.unwrap(self.visit(a.value))
                 if not isinstance(v, (tuple, list)):
-                    raise CompilationError("`*args` needs a compile-time tuple or list")
+                    raise CompilationError(
+                        f"`*` in a call needs a compile-time tuple or list, but got "
+                        f"{semantic.describe(v)}"
+                    )
                 args.extend(v)
             else:
                 args.append(self.visit(a))
         kwargs: dict[str, Any] = {}
         for k in node.keywords:
             if k.arg is None:
-                raise CompilationError("`**kwargs` isn't supported in kernels")
+                raise CompilationError(
+                    "`**` in a call isn't supported in kernels. Pass keyword arguments by name."
+                )
             kwargs[k.arg] = self.visit(k.value)
         return self.call(func, args, kwargs)
 
@@ -656,7 +741,8 @@ class CodeGenerator(ast.NodeVisitor):
             return core.BUILTINS["abs"].frontend(self, args[0])
         if runtime:
             hints = {
-                "min": "tl.minimum", "max": "tl.maximum", "print": "tl.static_print",
+                "min": "tl.minimum", "max": "tl.maximum", "print": "tl.device_print",
+                "len": "x.shape[0]", "sum": "tl.sum",
                 "float": "x.to(tl.float32)", "int": "x.to(tl.int32)", "bool": "x != 0",
             }  # fmt: skip
             hint = f" Use {hints[name]} instead." if name in hints else (
@@ -667,7 +753,9 @@ class CodeGenerator(ast.NodeVisitor):
                 f"{semantic.describe(core.unwrap(runtime[0]))}.{hint}"
             )
         if not callable(func):
-            raise CompilationError(f"{semantic.describe(func)} isn't callable")
+            raise CompilationError(
+                f"{semantic.describe(func)} isn't a function, so you can't call it"
+            )
         return core.unwrap(func(*[core.unwrap(a) for a in args],
                                 **{k: core.unwrap(v) for k, v in kwargs.items()}))  # fmt: skip
 
@@ -678,7 +766,8 @@ class CodeGenerator(ast.NodeVisitor):
         name = _BINOPS.get(type(op))
         if name is None:
             sym = {ast.Pow: "**", ast.MatMult: "@"}.get(type(op), type(op).__name__)
-            hint = " Use tl.dot(a, b)." if isinstance(op, ast.MatMult) else ""
+            hint = (" Use tl.dot(a, b)." if isinstance(op, ast.MatMult) else
+                    " Multiply explicitly, as in `x * x`, or use tl.exp2 and tl.log2.")
             raise CompilationError(f"`{sym}` isn't supported on runtime values.{hint}")
         return semantic.binary(self.b, name, x, y)
 
@@ -804,7 +893,8 @@ class CodeGenerator(ast.NodeVisitor):
                 return semantic.const(self.b, rest, dt)
         raise CompilationError(
             f"`{kw}` returns one of its operands unchanged, so both need the same type, but "
-            f"got {t} and {semantic.describe(rest)}. Convert one operand with `.to(...)`, or "
+            f"got {semantic.type_str(t)} and {semantic.describe(rest)}. Convert one operand "
+            "with `.to(...)`, or "
             "use tl.where to choose between values of different types."
         )
 
@@ -850,7 +940,8 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(idx, ir.Value):
             raise CompilationError(
                 f"indexing {type(obj).__name__} needs a compile-time index, but got "
-                f"{semantic.describe(idx)}"
+                f"{semantic.describe(idx)}. Use a literal, a tl.constexpr value, or the "
+                "variable of a tl.static_range loop."
             )
         return core.unwrap(obj[idx])
 
@@ -858,7 +949,10 @@ class CodeGenerator(ast.NodeVisitor):
         items = idx if isinstance(idx, tuple) else (idx,)
         rank = len(ir.shape_of(v.type))
         if isinstance(v.type, ir.DescType) or rank == 0:
-            raise CompilationError(f"a value of type {v.type} can't be indexed")
+            raise CompilationError(
+                f"{semantic.describe(v)} can't be indexed. Only tiles take subscripts, such as "
+                "`x[:, None]`."
+            )
         axis, kept = 0, 0
         for it in items:
             if it is None:
@@ -870,17 +964,23 @@ class CodeGenerator(ast.NodeVisitor):
             else:
                 raise CompilationError(
                     "tiles support only `None` and `:` in subscripts, as in `x[:, None]`, but "
-                    f"got {semantic.describe(it)}"
+                    f"got {semantic.describe(it)}. To select elements, use a mask or tl.where, "
+                    "or load the element from memory with tl.load."
                 )
         if kept > rank:
-            raise CompilationError(f"too many `:` for a tile of rank {rank}")
+            raise CompilationError(
+                f"too many `:` for a tile of rank {rank}. Use at most one `:` per dimension."
+            )
         return v
 
     def visit_Slice(self, node: ast.Slice) -> slice:
         parts = [core.unwrap(self.visit(p)) if p is not None else None
                  for p in (node.lower, node.upper, node.step)]  # fmt: skip
         if any(isinstance(p, ir.Value) for p in parts):
-            raise CompilationError("slice bounds must be compile-time constants")
+            raise CompilationError(
+                "slice bounds must be compile-time constants. Use literals or tl.constexpr "
+                "values."
+            )
         return slice(*parts)
 
     def visit_Tuple(self, node: ast.Tuple) -> tuple:
@@ -889,7 +989,9 @@ class CodeGenerator(ast.NodeVisitor):
             if isinstance(e, ast.Starred):
                 v = core.unwrap(self.visit(e.value))
                 if not isinstance(v, (tuple, list)):
-                    raise CompilationError("`*` in a tuple needs a compile-time tuple")
+                    raise CompilationError(
+                        f"`*` in a tuple needs a compile-time tuple, but got {semantic.describe(v)}"
+                    )
                 out.extend(v)
             else:
                 out.append(self.visit(e))
@@ -994,7 +1096,10 @@ def build_ir(
     runtime = [p for p in fn.params if not p.is_constexpr]
     missing = [p.name for p in runtime if p.name not in arg_types]
     if missing:
-        raise CompilationError(f"no argument type given for {missing}", def_loc)
+        raise CompilationError(
+            f"no argument type given for {missing}. Pass a value for every runtime parameter.",
+            def_loc,
+        )
     block = ir.Block([arg_types[p.name] for p in runtime], [p.name for p in runtime])
     facts = [dict(arg_facts.get(p.name, {})) for p in runtime]
     func = ir.Op(
@@ -1019,7 +1124,11 @@ def build_ir(
                 def_loc,
             )
         if isinstance(cvals[p.name], ir.Value):
-            raise CompilationError(f"constexpr `{p.name}` must be a Python value", def_loc)
+            raise CompilationError(
+                f"the tl.constexpr parameter `{p.name}` needs a compile-time Python value, such "
+                "as an int, a float, a bool, a string, or a dtype",
+                def_loc,
+            )
     scope.update(cvals)
     known_one = {id(a) for a, f in zip(block.args, facts, strict=True) if f.get("equal_to_1")}
     builder = ir.Builder()

@@ -13,7 +13,7 @@ follows:
 
 ```text
 enceladus.CompilationError: add.py:9:12: the end of tl.arange must be a compile-time
-integer, but got a runtime value `BLOCK` of type i32. If `BLOCK` comes from a kernel
+integer, but got a runtime value `BLOCK` of type tl.int32. If `BLOCK` comes from a kernel
 parameter, annotate the parameter as tl.constexpr, for example `BLOCK: tl.constexpr`.
     offs = tl.arange(0, BLOCK)
            ^

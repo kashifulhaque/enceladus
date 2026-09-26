@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from enceladus.compiler.errors import CompilationError, Loc
+from enceladus.compiler.errors import INTERNAL_ERROR_HINT, CompilationError, Loc
 from enceladus.language import core
 
 # ---------------------------------------------------------------------------
@@ -831,7 +831,10 @@ class _Verifier:
 
     def error(self, op: Op | None, msg: str) -> CompilationError:
         name = f"`{op.name}` " if op is not None else ""
-        return CompilationError(f"IR verification failed: {name}op: {msg}", op.loc if op else None)
+        return CompilationError(
+            f"IR verification failed: {name}op: {msg}. {INTERNAL_ERROR_HINT}",
+            op.loc if op else None,
+        )
 
     def run(self, module: Module) -> None:
         f = module.func

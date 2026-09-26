@@ -45,6 +45,9 @@ def _cint(v: Any, what: str) -> int:
         )
         v = describe(v) if isinstance(v, ir.Value) else f"a runtime value of type {v.dtype}"
     else:
+        hint = " Pass a Python int, or a tl.constexpr parameter that holds one."
+        if isinstance(v, float) and v.is_integer():
+            hint = f" Pass the int {int(v)} instead of the float {v!r}."
         v = describe(v)
     raise CompilationError(f"{what} must be a compile-time integer, but got {v}.{hint}")
 
@@ -59,7 +62,10 @@ def _dtype(v: Any, what: str = "dtype") -> core.dtype:
 def _axis(axis: Any, rank: int) -> int:
     a = _cint(axis, "`axis`")
     if not -rank <= a < rank:
-        raise CompilationError(f"axis {a} is out of range for a tile of rank {rank}")
+        raise CompilationError(
+            f"axis {a} is out of range for a tile of rank {rank}. Use an axis from {-rank} to "
+            f"{rank - 1}."
+        )
     return a % rank
 
 
@@ -120,7 +126,10 @@ def _method(b: core.Builtin, *names: str) -> core.Builtin:
 def _check_axis3(axis: Any) -> int:
     a = _cint(axis, "`axis`")
     if a not in (0, 1, 2):
-        raise CompilationError(f"`axis` must be 0, 1, or 2, but got {a}")
+        raise CompilationError(
+            f"`axis` must be 0, 1, or 2, because the grid has at most three dimensions, but "
+            f"got {a}"
+        )
     return a
 
 
@@ -153,7 +162,10 @@ def _arange_bounds(start, end) -> tuple[int, int]:
     s = _cint(start, "the start of tl.arange")
     e = _cint(end, "the end of tl.arange")
     if e <= s:
-        raise CompilationError(f"tl.arange({s}, {e}) needs end > start")
+        raise CompilationError(
+            f"tl.arange({s}, {e}) needs `end` greater than `start`. Swap the bounds, or "
+            "subtract the tile from a scalar to count down."
+        )
     _pow2_count(e - s, f"tl.arange({s}, {e})")
     return s, e
 
@@ -180,7 +192,10 @@ def _i_full(shape, value, dtype):
     dt = _dtype(dtype)
     v = core.unwrap(value)
     if isinstance(v, ITile) and v.shape != ():
-        raise CompilationError("tl.full needs a scalar value")
+        raise CompilationError(
+            f"tl.full needs a scalar value, but got {describe(v)}. To give a tile a new "
+            "shape, use tl.broadcast_to."
+        )
     return ITile(np.broadcast_to(I.to_tile(v, dt).data, shape).copy(), dt)
 
 
@@ -196,7 +211,10 @@ def full(ctx, shape, value, dtype):
     v = core.unwrap(value)
     if isinstance(v, ir.Value):
         if isinstance(v.type, ir.TileType):
-            raise CompilationError(f"tl.full needs a scalar value, but got {describe(v)}")
+            raise CompilationError(
+                f"tl.full needs a scalar value, but got {describe(v)}. To give a tile a new "
+                "shape, use tl.broadcast_to."
+            )
         return semantic.splat(ctx.b, semantic.cast(ctx.b, v, dt), shape)
     if not semantic.is_literal(v):
         raise CompilationError(f"tl.full needs a numeric value, but got {describe(v)}")
@@ -242,6 +260,8 @@ def full_like(ctx, input, value, dtype=None):
 # Memory
 # ---------------------------------------------------------------------------
 
+_PTR_HINT = " Pass an array as the kernel argument, and add offsets to it, as in `x_ptr + offs`."
+
 _BLOCK_PTR_MSG = (
     "`boundary_check` and `padding_option` apply to block pointers, which Enceladus doesn't "
     "support. Use tl.make_tensor_descriptor for bounds-checked block loads."
@@ -251,14 +271,16 @@ _BLOCK_PTR_MSG = (
 def _check_mask_dtype(dt: core.dtype) -> None:
     if not dt.is_bool():
         raise CompilationError(
-            f"a mask must be a boolean (int1) tile, such as `offs < n`, but got {dt}"
+            f"a mask must be a boolean (int1) tile, such as `offs < n`, but got {dt}. Build "
+            "the mask with a comparison, for example `x != 0`."
         )
 
 
 def _i_load(pointer, mask=None, other=None, boundary_check=(), padding_option="",
             cache_modifier="", eviction_policy="", volatile=False):  # fmt: skip
     if not isinstance(pointer, IPointer):
-        raise CompilationError(f"tl.load needs a pointer, but got {pointer!r}")
+        raise CompilationError(f"tl.load needs a pointer or pointer tile, but got "
+                               f"{describe(pointer)}.{_PTR_HINT}")
     if boundary_check or padding_option:
         raise CompilationError(_BLOCK_PTR_MSG)
     mask = core.unwrap(mask)
@@ -293,7 +315,9 @@ def load(ctx, pointer, mask=None, other=None, boundary_check=(), padding_option=
     b = ctx.b
     p = core.unwrap(pointer)
     if not semantic.is_pointer(p):
-        raise CompilationError(f"tl.load needs a pointer or pointer tile, but got {describe(p)}")
+        raise CompilationError(
+            f"tl.load needs a pointer or pointer tile, but got {describe(p)}.{_PTR_HINT}"
+        )
     if boundary_check or padding_option:
         raise CompilationError(_BLOCK_PTR_MSG)
     elem = ir.elem_of(p.type).elem.dtype
@@ -315,7 +339,8 @@ def load(ctx, pointer, mask=None, other=None, boundary_check=(), padding_option=
 def _i_store(pointer, value, mask=None, boundary_check=(), cache_modifier="",
              eviction_policy=""):  # fmt: skip
     if not isinstance(pointer, IPointer):
-        raise CompilationError(f"tl.store needs a pointer, but got {pointer!r}")
+        raise CompilationError(f"tl.store needs a pointer or pointer tile, but got "
+                               f"{describe(pointer)}.{_PTR_HINT}")
     if boundary_check:
         raise CompilationError(_BLOCK_PTR_MSG)
     val = I.to_tile(core.unwrap(value), pointer.elem)
@@ -346,13 +371,15 @@ def store(ctx, pointer, value, mask=None, boundary_check=(), cache_modifier="",
     b = ctx.b
     p = core.unwrap(pointer)
     if not semantic.is_pointer(p):
-        raise CompilationError(f"tl.store needs a pointer or pointer tile, but got {describe(p)}")
+        raise CompilationError(
+            f"tl.store needs a pointer or pointer tile, but got {describe(p)}.{_PTR_HINT}"
+        )
     if boundary_check:
         raise CompilationError(_BLOCK_PTR_MSG)
     elem = ir.elem_of(p.type).elem.dtype
     v = core.unwrap(value)
     if semantic.is_pointer(v):
-        raise CompilationError("tl.store can't store pointers")
+        raise CompilationError("tl.store can't store pointers. Store integer offsets instead.")
     vv = semantic.to_value(b, v, elem)
     mask = core.unwrap(mask)
     if mask is True:
@@ -398,7 +425,9 @@ _LAST_STRIDE_MSG = (
 def _i_make_tensor_descriptor(base, shape, strides, block_shape, padding_option="zero"):
     shape, strides, block = _desc_parts(base, shape, strides, block_shape)
     if not isinstance(base, IPointer) or base.shape != ():
-        raise CompilationError("tl.make_tensor_descriptor needs a scalar base pointer")
+        raise CompilationError(
+            f"tl.make_tensor_descriptor needs a scalar base pointer, but got {describe(base)}"
+        )
     if int(strides[-1]) != 1:
         raise CompilationError(_LAST_STRIDE_MSG)
     return IDesc(base, shape, strides, block)
@@ -425,7 +454,10 @@ def make_tensor_descriptor(ctx, base, shape, strides, block_shape, padding_optio
             f"tl.make_tensor_descriptor needs a scalar base pointer, but got {describe(base)}"
         )
     if padding_option not in ("zero", "", None):
-        raise CompilationError("tensor descriptors support only zero padding")
+        raise CompilationError(
+            'tensor descriptors support only zero padding. Omit `padding_option`, or pass '
+            '"zero".'
+        )
     if not ctx.is_known_one(strides[-1]):
         raise CompilationError(_LAST_STRIDE_MSG)
     vals = []
@@ -508,7 +540,10 @@ def _i_where(condition, x, y):
     if not c.dtype.is_bool():
         c = I.binary("ne", c, 0)
     if isinstance(x, IPointer) or isinstance(y, IPointer):
-        raise CompilationError("the interpreter doesn't support tl.where on pointers")
+        raise CompilationError(
+            "the interpreter doesn't support tl.where on pointers. Select integer offsets "
+            "instead, and add the result to one base pointer."
+        )
     dt = semantic.computation_dtype("select", I._operand(x), I._operand(y))
     semantic.broadcast_shapes(semantic.broadcast_shapes(c.shape, _ishape(x)), _ishape(y))
     return I.wrap(np.where(c.data, I.as_compute(x, dt), I.as_compute(y, dt)), dt)
@@ -543,7 +578,10 @@ def _fma_dtype(x, y, z, op_of) -> core.dtype:
     dt = semantic.computation_dtype("mul", op_of(x), op_of(y))
     dt = semantic.computation_dtype("add", dt, op_of(z))
     if not dt.is_floating():
-        raise CompilationError(f"tl.fma needs floating-point operands, but they promote to {dt}")
+        raise CompilationError(
+            f"tl.fma needs floating-point operands, but they promote to {dt}. Convert them "
+            "with `.to(tl.float32)` first."
+        )
     return dt
 
 
@@ -607,7 +645,10 @@ def clamp(ctx, x, min, max):
 def _i_to(x, dtype, bitcast=False, fp_downcast_rounding=None):
     dt = _dtype(dtype)
     if isinstance(x, IPointer):
-        raise CompilationError("pointers can't be converted with .to()")
+        raise CompilationError(
+            "pointers can't be converted with .to(). Load the values with tl.load, and then "
+            "convert them."
+        )
     t = _itile(x)
     if not bitcast:
         return I.convert(t, dt)
@@ -628,7 +669,10 @@ def _to(ctx, x, dtype, bitcast=False, fp_downcast_rounding=None):
     width. `fp_downcast_rounding` accepts only `None` and `"rtne"`.
     """
     if fp_downcast_rounding not in (None, "rtne"):
-        raise CompilationError("only round-to-nearest-even float conversion is supported")
+        raise CompilationError(
+            "only round-to-nearest-even float conversion is supported. Omit "
+            '`fp_downcast_rounding`, or pass "rtne".'
+        )
     return semantic.cast(ctx.b, _value(ctx, x), _dtype(dtype), bitcast=bool(core.unwrap(bitcast)))
 
 
@@ -663,7 +707,7 @@ def _norm_axes(axis: Any, rank_out: int) -> list[int]:
     axes = list(axes) if isinstance(axes, (tuple, list)) else [axes]
     out = sorted(_axis(a, rank_out) for a in axes)
     if len(set(out)) != len(out):
-        raise CompilationError(f"repeated axis in {axes}")
+        raise CompilationError(f"the axes {axes} name an axis more than once. List each axis once.")
     return out
 
 
@@ -688,7 +732,10 @@ def expand_dims(ctx, input, axis):
 def _reshape_shape(src: tuple[int, ...], shape) -> tuple[int, ...]:
     shape = semantic.check_shape(_shape_args(shape), "tl.reshape")
     if int(np.prod(src, dtype=np.int64)) != int(np.prod(shape, dtype=np.int64)):
-        raise CompilationError(f"can't reshape a tile of shape {src} to {shape}")
+        raise CompilationError(
+            f"can't reshape a tile of shape {src} to {shape}. The new shape must have the same "
+            "number of elements."
+        )
     return shape
 
 
@@ -717,11 +764,16 @@ def _perm(rank: int, dims: tuple[Any, ...], fname: str) -> tuple[int, ...]:
     dims = _shape_args(dims)
     if not dims:
         if fname == "permute":
-            raise CompilationError("tl.permute needs the new dimension order")
+            raise CompilationError(
+                "tl.permute needs the new dimension order, for example `tl.permute(x, (1, 0))`"
+            )
         return tuple(reversed(range(rank)))
     perm = tuple(_axis(d, rank) for d in dims)
     if sorted(perm) != list(range(rank)):
-        raise CompilationError(f"{dims} isn't a permutation of the {rank} dimensions")
+        raise CompilationError(
+            f"{dims} isn't a permutation of the {rank} dimensions. Name each dimension from 0 "
+            f"to {rank - 1} exactly once."
+        )
     return perm
 
 
@@ -767,7 +819,7 @@ def _reduce_frontend(ctx, input, axis, kind: str, keep_dims, fname: str, dtype=N
     b = ctx.b
     v = _tile_value(ctx, input, fname)
     if semantic.is_pointer(v):
-        raise CompilationError(f"tl.{fname} can't reduce pointers")
+        raise CompilationError(f"tl.{fname} can't reduce pointers. Reduce integer offsets instead.")
     if dtype is not None:
         v = semantic.cast(b, v, _dtype(dtype))
     if kind == "sum":
@@ -844,7 +896,9 @@ def _minmax_interp(kind):
 
 def _minmax_frontend(ctx, kind, input, axis, return_indices, tie_left, keep_dims):
     if not tie_left:
-        raise CompilationError("only `return_indices_tie_break_left=True` is supported")
+        raise CompilationError(
+            "only `return_indices_tie_break_left=True` is supported. Omit the argument."
+        )
     v = _reduce_frontend(ctx, input, axis, kind, keep_dims, kind)
     if core.unwrap(return_indices):
         return v, _reduce_frontend(ctx, input, axis, "arg" + kind, keep_dims, kind)
@@ -878,12 +932,12 @@ def min_(ctx, input, axis=None, return_indices=False, return_indices_tie_break_l
 def _argminmax(kind):
     def interp(input, axis, tie_break_left=True, keep_dims=False):
         if not tie_break_left:
-            raise CompilationError("only `tie_break_left=True` is supported")
+            raise CompilationError("only `tie_break_left=True` is supported. Omit the argument.")
         return _reduce_interp(input, axis, kind, keep_dims)
 
     def frontend(ctx, input, axis, tie_break_left=True, keep_dims=False):
         if not tie_break_left:
-            raise CompilationError("only `tie_break_left=True` is supported")
+            raise CompilationError("only `tie_break_left=True` is supported. Omit the argument.")
         return _reduce_frontend(ctx, input, axis, kind, keep_dims, kind)
 
     frontend.__doc__ = (
@@ -921,7 +975,10 @@ def _i_reduce(input, axis, combine_fn, keep_dims=False):
                          *[ITile(x.data[tuple(hi)], x.dtype) for x in xs])  # fmt: skip
         res = res if isinstance(res, tuple) else (res,)
         if len(res) != len(xs):
-            raise CompilationError(f"combine_fn returns {len(res)} values for {len(xs)} inputs")
+            raise CompilationError(
+                f"combine_fn returns {len(res)} values for {len(xs)} inputs. Return one value "
+                "per input."
+            )
         xs = [I.to_tile(r, x.dtype) for r, x in zip(res, xs, strict=True)]
         n = h
     outs = []
@@ -946,7 +1003,10 @@ def reduce(ctx, input, axis, combine_fn, keep_dims=False):
     b = ctx.b
     fn = core.unwrap(combine_fn)
     if not is_jit_function(fn):
-        raise CompilationError("tl.reduce needs a @enceladus.jit function as `combine_fn`")
+        raise CompilationError(
+            "tl.reduce needs a @enceladus.jit function as `combine_fn`. Decorate the combine "
+            "function with @enceladus.jit."
+        )
     single = not isinstance(core.unwrap(input), tuple)
     vals = [_tile_value(ctx, x, "reduce") for x in ((input,) if single else core.unwrap(input))]
     shapes = {v.type.shape for v in vals}
@@ -962,14 +1022,17 @@ def reduce(ctx, input, axis, combine_fn, keep_dims=False):
         ax = _axis(axis, rank)
     elems = [v.type.elem for v in vals]
     if any(not isinstance(e, ir.ScalarType) for e in elems):
-        raise CompilationError("tl.reduce can't reduce pointers")
+        raise CompilationError("tl.reduce can't reduce pointers. Reduce integer offsets instead.")
     names = [f"a{i}" for i in range(len(elems))] + [f"b{i}" for i in range(len(elems))]
     block = ir.Block(elems + elems, names)
     with b.at(block):
         res = ctx.call_function(fn, list(block.args), {})
         res = res if isinstance(res, tuple) else (res,)
         if len(res) != len(vals):
-            raise CompilationError(f"combine_fn returns {len(res)} values for {len(vals)} inputs")
+            raise CompilationError(
+                f"combine_fn returns {len(res)} values for {len(vals)} inputs. Return one value "
+                "per input."
+            )
         b.create("yield", [ctx.materialize(r, e, f"result {i} of combine_fn")
                            for i, (r, e) in enumerate(zip(res, elems, strict=True))])  # fmt: skip
     s = list(vals[0].type.shape)
@@ -994,7 +1057,10 @@ _DOT_DTYPES = (core.float16, core.bfloat16, core.float32)
 
 def _dot_check(a_shape, b_shape, a_dt, b_dt, out_dt, input_precision):
     if len(a_shape) != 2 or len(b_shape) != 2:
-        raise CompilationError(f"tl.dot needs 2D tiles, but got shapes {a_shape} and {b_shape}")
+        raise CompilationError(
+            f"tl.dot needs 2D tiles, but got shapes {a_shape} and {b_shape}. Reshape the "
+            "operands to 2D with tl.reshape."
+        )
     if a_shape[1] != b_shape[0]:
         raise CompilationError(
             f"tl.dot inner dimensions differ: {a_shape} @ {b_shape}. The first operand's "
@@ -1002,7 +1068,8 @@ def _dot_check(a_shape, b_shape, a_dt, b_dt, out_dt, input_precision):
         )
     if a_dt not in _DOT_DTYPES or b_dt not in _DOT_DTYPES:
         raise CompilationError(
-            f"tl.dot supports float16, bfloat16, and float32 operands, but got {a_dt} and {b_dt}"
+            f"tl.dot supports float16, bfloat16, and float32 operands, but got {a_dt} and "
+            f"{b_dt}. Convert the operands with `.to(tl.float16)` or `.to(tl.float32)`."
         )
     if a_dt is not b_dt:
         raise CompilationError(
@@ -1010,9 +1077,14 @@ def _dot_check(a_shape, b_shape, a_dt, b_dt, out_dt, input_precision):
             "with `.to(...)`."
         )
     if out_dt not in (core.float32, core.float16):
-        raise CompilationError(f"tl.dot accumulates in float32 or float16, not {out_dt}")
+        raise CompilationError(
+            f"tl.dot accumulates in float32 or float16, not {out_dt}. Pass "
+            "`out_dtype=tl.float32`, or an accumulator of one of those types."
+        )
     if input_precision not in (None, "ieee", "tf32", "tf32x3"):
-        raise CompilationError(f"unknown input_precision {input_precision!r}")
+        raise CompilationError(
+            f'unknown input_precision {input_precision!r}. Use "ieee", "tf32", or "tf32x3".'
+        )
 
 
 def _i_dot(input, other, acc=None, input_precision=None, allow_tf32=None,
@@ -1023,7 +1095,10 @@ def _i_dot(input, other, acc=None, input_precision=None, allow_tf32=None,
     m, n = a.shape[0], bt.shape[1]
     c = np.zeros((m, n), np.float32) if acc is None else I.as_compute(acc, out_dt)
     if c.shape != (m, n):
-        raise CompilationError(f"the tl.dot accumulator must be {m}x{n}, but got {c.shape}")
+        raise CompilationError(
+            f"the tl.dot accumulator must be {m}x{n}, but got {c.shape}. Create it with "
+            f"`tl.zeros(({m}, {n}), dtype=tl.float32)`."
+        )
     r = a.data.astype(np.float32) @ bt.data.astype(np.float32) + c
     return I.wrap(r, out_dt)
 
@@ -1050,7 +1125,10 @@ def dot(ctx, input, other, acc=None, input_precision=None, allow_tf32=None,
     out_dt = _dtype(out_dtype, "out_dtype")
     if acc is not None:
         if not isinstance(acc, ir.Value):
-            raise CompilationError(f"the tl.dot accumulator must be a tile, got {describe(acc)}")
+            raise CompilationError(
+                f"the tl.dot accumulator must be a tile, but got {describe(acc)}. Create it "
+                "with tl.zeros."
+            )
         out_dt = semantic.dtype_of(acc)
     _dot_check(ir.shape_of(av.type), ir.shape_of(bv.type), semantic.dtype_of(av),
                semantic.dtype_of(bv), out_dt, input_precision)  # fmt: skip
@@ -1058,7 +1136,10 @@ def dot(ctx, input, other, acc=None, input_precision=None, allow_tf32=None,
     if acc is None:
         acc = b.create("full", [], [ir.TileType((m, n), ir.scalar(out_dt))], {"value": 0.0}).result
     elif ir.shape_of(acc.type) != (m, n):
-        raise CompilationError(f"the tl.dot accumulator must be {m}x{n}, but got {acc.type}")
+        raise CompilationError(
+            f"the tl.dot accumulator must be {m}x{n}, but got {describe(acc)}. Create it with "
+            f"`tl.zeros(({m}, {n}), dtype=tl.float32)`."
+        )
     return b.create("dot", [av, bv, acc], [acc.type]).result
 
 
@@ -1088,7 +1169,10 @@ def _loop_only(name):
 def _i_static_range(arg1, arg2=None, step=None):
     args = [core.unwrap(a) for a in (arg1, arg2, step) if a is not None]
     if any(isinstance(a, ITile) for a in args):
-        raise CompilationError("tl.static_range needs compile-time integer bounds")
+        raise CompilationError(
+            "tl.static_range needs compile-time integer bounds. Use literals or "
+            "tl.constexpr parameters, or use range(...) for a runtime loop."
+        )
     return builtins.range(*args)
 
 
@@ -1117,7 +1201,10 @@ def _static_assert_msg(msg: str) -> str:
 
 def _i_static_assert(cond, msg=""):
     if isinstance(cond, ITile):
-        raise CompilationError("tl.static_assert needs a compile-time condition")
+        raise CompilationError(
+            "tl.static_assert needs a compile-time condition. For a runtime check, use "
+            "tl.device_assert."
+        )
     if not cond:
         raise CompilationError(_static_assert_msg(msg))
 
@@ -1127,7 +1214,10 @@ def static_assert(ctx, cond, msg=""):
     """Raises a `CompilationError` with `msg` if the compile-time `cond` is false."""
     cond = core.unwrap(cond)
     if isinstance(cond, ir.Value):
-        raise CompilationError("tl.static_assert needs a compile-time condition")
+        raise CompilationError(
+            "tl.static_assert needs a compile-time condition. For a runtime check, use "
+            "tl.device_assert."
+        )
     if not cond:
         raise CompilationError(_static_assert_msg(msg))
 
@@ -1165,9 +1255,12 @@ def _print_prefix_arg(prefix: Any, hex: Any) -> str:
             f"{describe(prefix)}. Write, for example, `tl.device_print(\"x\", x)`."
         )
     if not all(" " <= ch <= "~" for ch in prefix):
-        raise CompilationError("the tl.device_print prefix must be printable ASCII text")
+        raise CompilationError(
+            "the tl.device_print prefix must be printable ASCII text. Remove other characters, "
+            "such as newlines, from the prefix."
+        )
     if core.unwrap(hex):
-        raise CompilationError("tl.device_print doesn't support hex=True")
+        raise CompilationError("tl.device_print doesn't support hex=True. Omit `hex`.")
     return prefix
 
 
@@ -1178,7 +1271,7 @@ def _i_device_print(prefix, *args, hex=False):
     tiles = []
     for a in args:
         if isinstance(a, IPointer):
-            raise CompilationError("tl.device_print can't print pointers")
+            raise CompilationError("tl.device_print can't print pointers. Print offsets instead.")
         tiles.append(I.to_tile(core.unwrap(a)))
     shape: tuple[int, ...] = ()
     for t in tiles:
@@ -1212,7 +1305,7 @@ def device_print(ctx, prefix, *args, hex=False):
     for a in args:
         a = core.unwrap(a)
         if semantic.is_pointer(a):
-            raise CompilationError("tl.device_print can't print pointers")
+            raise CompilationError("tl.device_print can't print pointers. Print offsets instead.")
         vals.append(semantic.to_value(b, a))
     shape: tuple[int, ...] = ()
     for v in vals:
@@ -1315,7 +1408,8 @@ def _check_sem(sem: Any, scope: Any, fname: str) -> None:
         )
     if scope not in (None, "gpu", "cta"):
         raise CompilationError(
-            f'tl.{fname} supports scope="gpu" and scope="cta", but got scope={scope!r}'
+            f'tl.{fname} supports scope="gpu" and scope="cta", but got scope={scope!r}. '
+            'Omit `scope`, or pass one of those values.'
         )
 
 
@@ -1327,9 +1421,14 @@ def check_atomic_dtype(kind: str, dt: core.dtype, fname: str) -> None:
     fail on the GPU because of its dtype.
     """
     if dt.is_bool():
-        raise CompilationError(f"tl.{fname} doesn't support int1 (boolean) pointers")
+        raise CompilationError(
+            f"tl.{fname} doesn't support int1 (boolean) pointers. Use an int32 buffer instead."
+        )
     if dt.is_floating() and kind in _ATOMIC_BITWISE:
-        raise CompilationError(f"tl.{fname} needs integer elements, but the pointer is {dt}")
+        raise CompilationError(
+            f"tl.{fname} needs integer elements, but the pointer points to {dt}. Use an "
+            "integer buffer, or bitcast the pointer's buffer on the host."
+        )
     if kind == "add" and dt in (core.float16, core.bfloat16):
         raise CompilationError(
             f"tl.{fname} doesn't support {dt} addition, because 16-bit float atomics lose "
@@ -1349,7 +1448,9 @@ def _atomic_frontend(ctx, kind: str, pointer, operands: list[Any], mask, sem, sc
     b = ctx.b
     p = core.unwrap(pointer)
     if not semantic.is_pointer(p):
-        raise CompilationError(f"tl.{fname} needs a pointer or pointer tile, but got {describe(p)}")
+        raise CompilationError(
+            f"tl.{fname} needs a pointer or pointer tile, but got {describe(p)}.{_PTR_HINT}"
+        )
     _check_sem(sem, scope, fname)
     elem = ir.elem_of(p.type).elem.dtype
     check_atomic_dtype(kind, elem, fname)
@@ -1357,7 +1458,9 @@ def _atomic_frontend(ctx, kind: str, pointer, operands: list[Any], mask, sem, sc
     for v in operands:
         v = core.unwrap(v)
         if semantic.is_pointer(v):
-            raise CompilationError(f"tl.{fname} can't take pointers as values")
+            raise CompilationError(
+                f"tl.{fname} can't take pointers as values. Pass integer offsets instead."
+            )
         vals.append(semantic.to_value(b, v, elem))
     mask = core.unwrap(mask)
     if mask is True:
@@ -1397,7 +1500,10 @@ def _apply_atomic(kind: str, old: np.ndarray, val: np.ndarray, cmp: np.ndarray |
 
 def _atomic_interp(kind: str, pointer, operands: list[Any], mask, sem, scope, fname: str):
     if not isinstance(pointer, IPointer):
-        raise CompilationError(f"tl.{fname} needs a pointer, but got {pointer!r}")
+        raise CompilationError(
+            f"tl.{fname} needs a pointer or pointer tile, but got {describe(pointer)}."
+            f"{_PTR_HINT}"
+        )
     _check_sem(sem, scope, fname)
     dt = pointer.elem
     check_atomic_dtype(kind, dt, fname)
@@ -1503,7 +1609,7 @@ def atomic_cas(ctx, pointer, cmp, val, sem=None, scope=None):
 
 def _scan_axis(axis: Any, rank: int, fname: str) -> int:
     if core.unwrap(axis) is None:
-        raise CompilationError(f"tl.{fname} needs an `axis`")
+        raise CompilationError(f"tl.{fname} needs an `axis`, for example `axis=0`")
     return _axis(axis, rank)
 
 
@@ -1522,7 +1628,7 @@ def _scan_frontend(ctx, inputs: list[Any], axis, reverse, fname: str, kind: str 
     b = ctx.b
     vals = [_tile_value(ctx, x, fname) for x in inputs]
     if any(semantic.is_pointer(v) for v in vals):
-        raise CompilationError(f"tl.{fname} can't scan pointers")
+        raise CompilationError(f"tl.{fname} can't scan pointers. Scan integer offsets instead.")
     if kind == "sum":
         vals = [semantic.cast(b, vals[0], _sum_input_dtype(semantic.dtype_of(vals[0])))]
     shapes = {v.type.shape for v in vals}
@@ -1545,7 +1651,8 @@ def _scan_frontend(ctx, inputs: list[Any], axis, reverse, fname: str, kind: str 
             res = res if isinstance(res, tuple) else (res,)
             if len(res) != len(vals):
                 raise CompilationError(
-                    f"combine_fn returns {len(res)} values for {len(vals)} inputs"
+                    f"combine_fn returns {len(res)} values for {len(vals)} inputs. Return one "
+                    "value per input."
                 )
             pairs = enumerate(zip(res, elems, strict=True))
             b.create("yield", [ctx.materialize(r, e, f"result {i} of combine_fn")
@@ -1566,7 +1673,10 @@ def _hillis_steele(xs: list[ITile], ax: int, combine) -> list[ITile]:
                       *[ITile(x.data[tuple(hi)], x.dtype) for x in xs])  # fmt: skip
         res = res if isinstance(res, tuple) else (res,)
         if len(res) != len(xs):
-            raise CompilationError(f"combine_fn returns {len(res)} values for {len(xs)} inputs")
+            raise CompilationError(
+                f"combine_fn returns {len(res)} values for {len(xs)} inputs. Return one value "
+                "per input."
+            )
         xs = [ITile(np.concatenate([x.data[tuple(head)], I.to_tile(r, x.dtype).data], axis=ax),
                     x.dtype) for x, r in zip(xs, res, strict=True)]  # fmt: skip
         s *= 2

@@ -165,7 +165,10 @@ def dtype_from_numpy(np_dtype: Any) -> dtype:
             "Enceladus has no float64 type. Cast the array to float32 first, for example "
             "with `x.astype(np.float32)`."
         )
-    raise TypeError(f"NumPy dtype {d} has no Enceladus equivalent.")
+    raise TypeError(
+        f"NumPy dtype {d} has no Enceladus equivalent. Convert the array to a supported dtype, "
+        "such as float32 or int32."
+    )
 
 
 def dtype_from_name(name: str) -> dtype:
@@ -178,7 +181,7 @@ def dtype_from_name(name: str) -> dtype:
         return _BY_NAME[name]
     except KeyError:
         if name in ("fp64", "f64", "float64", "double"):
-            raise KeyError("Enceladus has no float64 type; use float32 instead.") from None
+            raise KeyError("Enceladus has no float64 type. Use float32 instead.") from None
         raise KeyError(f"unknown dtype name {name!r}") from None
 
 

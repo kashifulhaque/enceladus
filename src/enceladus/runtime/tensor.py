@@ -38,7 +38,7 @@ def to_np_dtype(dtype: Any) -> np.dtype:
             pass
     d = np.dtype(dtype)
     if d == np.float64:
-        raise TypeError("Enceladus has no float64 support; use float32 instead.")
+        raise TypeError("Enceladus has no float64 type. Use float32 instead.")
     return d
 
 
@@ -208,7 +208,10 @@ class Tensor:
                 "use .numpy() to read single elements"
             )
         if any(s < 0 for s in v.strides):
-            raise ValueError("negative strides aren't supported")
+            raise ValueError(
+                "Tensor indexing doesn't support negative strides. Reverse the data with "
+                "NumPy after .numpy(), or index with a positive step."
+            )
         itemsize = self.itemsize
         byte_off = v.__array_interface__["data"][0] - self.buffer.ptr
         return Tensor(
@@ -274,7 +277,8 @@ def empty(shape: int | Sequence[int], dtype: Any = "float32") -> Tensor:
     if nbytes > dev.caps.max_buffer_length:
         raise MemoryError(
             f"{nbytes} bytes exceeds the device's maximum buffer length "
-            f"({dev.caps.max_buffer_length} bytes)"
+            f"({dev.caps.max_buffer_length} bytes). Allocate a smaller tensor, or split the "
+            "data into several tensors."
         )
     return Tensor(_C.new_buffer(dev.native, nbytes), shape, d)
 
