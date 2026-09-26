@@ -68,6 +68,33 @@ def test_matmul(mode, rng, dtype, mkn):
                  atol=1e-4 if dtype is F32 else None)  # fmt: skip
 
 
+# The plan's matmul shapes; the largest runs compiled only (the interpreter takes seconds).
+MATMUL_SHAPES = [(64, 64, 64), (513, 513, 513), (1000, 300, 777), (2048, 2048, 2048)]
+
+
+@pytest.mark.parametrize("dtype", [F32, F16, BF16])
+@pytest.mark.parametrize("mkn", MATMUL_SHAPES, ids=lambda s: "x".join(map(str, s)))
+@pytest.mark.parametrize("variant", ["desc", "pointer"])
+def test_matmul_shapes(mode, rng, dtype, mkn, variant):
+    m, k, n = mkn
+    if mode == "interpret" and (m * n * k > 1 << 27 or variant == "pointer" and m > 64):
+        pytest.skip("too slow for the interpreter; compiled mode covers it")
+    ex = load_example("04_matmul")
+    a, b = randn(rng, (m, k), dtype), randn(rng, (k, n), dtype)
+    run = ex.matmul_desc if variant == "desc" else ex.matmul
+    tol = 1e-4 * math.sqrt(k) if dtype is F32 else None
+    check_kernel(run, (a, b), ex.reference, modes=(mode,), atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("dtype", [F32, F16])
+def test_matmul_fused_epilogue(mode, rng, dtype):
+    ex = load_example("07_matmul_fused")
+    a, b = randn(rng, (200, 96), dtype), randn(rng, (96, 130), dtype)
+    bias = randn(rng, 130, dtype)
+    check_kernel(ex.matmul_bias_gelu, (a, b, bias), ex.reference, modes=(mode,),
+                 atol=1e-4 if dtype is F32 else None)  # fmt: skip
+
+
 @pytest.mark.parametrize("dtype", [F32, F16, BF16])
 @pytest.mark.parametrize("shape", [(4, 256), (7, 300)])
 def test_fused_gelu(mode, rng, dtype, shape):
@@ -404,26 +431,38 @@ def test_control_flow(mode):
 
 
 @tegula.jit
-def _desc_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bk, stride_cm,
-                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):  # fmt: skip
+def _desc_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_b, stride_cm,
+                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                        TRANS_B: tl.constexpr):  # fmt: skip
     pid_n, pid_m = tl.program_id(0), tl.program_id(1)
     a = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, 1], [BM, BK])
-    b = tl.make_tensor_descriptor(b_ptr, [K, N], [stride_bk, 1], [BK, BN])
+    if TRANS_B:  # b is stored N x K; read it transposed
+        b = tl.make_tensor_descriptor(b_ptr, [N, K], [stride_b, 1], [BN, BK])
+    else:
+        b = tl.make_tensor_descriptor(b_ptr, [K, N], [stride_b, 1], [BK, BN])
     c = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [BM, BN])
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
-        acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+        if TRANS_B:
+            bt = tl.trans(b.load([pid_n * BN, k]))
+        else:
+            bt = b.load([k, pid_n * BN])
+        acc = tl.dot(a.load([pid_m * BM, k]), bt, acc)
     c.store([pid_m * BM, pid_n * BN], acc.to(c.dtype))
 
 
-@pytest.mark.parametrize("dtype", [F32, F16])
-def test_descriptor_matmul(rng, dtype):
-    m, k, n = 50, 40, 33  # Ragged in every dimension: loads zero-fill, stores skip.
+@pytest.mark.parametrize("trans_b", [False, True])
+@pytest.mark.parametrize("dtype", [F32, F16, BF16])
+@pytest.mark.parametrize("mkn", [(64, 32, 32), (50, 40, 33)])
+def test_descriptor_matmul(mode, rng, dtype, mkn, trans_b):
+    m, k, n = mkn  # The ragged shape makes loads zero-fill and stores skip.
 
     def run(a, b):
         c = np.full((m, n + 3), 7, dtype)  # The padding columns must stay untouched.
         grid = (tegula.cdiv(n, 16), tegula.cdiv(m, 32))
-        _desc_matmul_kernel[grid](a, b, c, m, n, k, k, n, n + 3, BM=32, BN=16, BK=16)
+        bb = np.ascontiguousarray(b.T) if trans_b else b
+        _desc_matmul_kernel[grid](a, bb, c, m, n, k, k, bb.shape[1], n + 3, BM=32, BN=16,
+                                  BK=16, TRANS_B=trans_b)  # fmt: skip
         return c
 
     def ref(a, b):
@@ -431,9 +470,8 @@ def test_descriptor_matmul(rng, dtype):
         c[:, :n] = (a.astype(np.float32) @ b.astype(np.float32)).astype(dtype)
         return c
 
-    # Compiled descriptors arrive in M4.
     check_kernel(run, (randn(rng, (m, k), dtype), randn(rng, (k, n), dtype)), ref,
-                 modes=("interpret",), atol=1e-4 if dtype is F32 else None)  # fmt: skip
+                 modes=(mode,), atol=1e-4 if dtype is F32 else None)  # fmt: skip
 
 
 @tegula.jit

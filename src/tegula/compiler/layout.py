@@ -406,3 +406,23 @@ def reg_map(src: BitLayout, dst: BitLayout) -> tuple[int, ...] | None:
             return None
         out.append(index[c])
     return tuple(out)
+
+
+FRAG_LANE = ((0, 2), (1, 0), (2, 0), (0, 4), (4, 0))
+
+
+def frag_grid(layout: BitLayout) -> tuple[int, int, int, int] | None:
+    """Returns (TM, TN, WM, WN) if `layout` is a `simd_acc` layout, else None."""
+    if layout.rank != 2 or layout.lane != FRAG_LANE or not layout.reg or layout.reg[0] != (0, 1):
+        return None
+    bm, bn = layout.shape
+    for wm in (1 << i for i in range(len(layout.warp) + 1)):
+        wn = layout.num_warps // wm
+        if bm % (8 * wm) == 0 and bn % (8 * wn) == 0:
+            try:
+                cand = simd_acc(bm, bn, wm, wn)
+            except ValueError:
+                continue
+            if cand == layout:
+                return bm // wm // 8, bn // wn // 8, wm, wn
+    return None

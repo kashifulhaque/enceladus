@@ -110,9 +110,19 @@ class Tile:
     uniform: str | None = None
     base: str | None = None
     root: str | None = None  # the kernel argument a pointer tile derives from
+    frag: tuple[int, int] | None = None  # (TM, TN) for a simdgroup_matrix array
 
     def get(self, r: int | str) -> str:
-        return self.uniform if self.uniform is not None else f"{self.name}[{r}]"
+        if self.uniform is not None:
+            return self.uniform
+        if self.frag is None:
+            return f"{self.name}[{r}]"
+        ltn = self.frag[1].bit_length() - 1
+        if isinstance(r, int):
+            i, j, e = r >> (1 + ltn), (r >> 1) & (self.frag[1] - 1), r & 1
+            return f"{self.name}[{i}][{j}].thread_elements()[{e}]"
+        return (f"{self.name}[({r}) >> {1 + ltn}][(({r}) >> 1) & {self.frag[1] - 1}]"
+                f".thread_elements()[({r}) & 1]")  # fmt: skip
 
 
 @dataclass
@@ -160,6 +170,12 @@ class _Codegen:
         self.written: set[str] = set()
         self.warnings: list[str] = []
         self.loc: Loc | None = None
+        self.descs: dict[int, object] = {}  # descriptor value -> DescInfo
+        self._frag_elem: dict[str, str] = {}  # simdgroup_matrix array -> element type
+        from tegula.compiler.codegen.dot import find_direct_operands, use_counts
+
+        self.direct: set[int] = find_direct_operands(module)
+        self.uses: dict[int, int] = use_counts(module)
 
     # ---- helpers ----
 
@@ -213,10 +229,24 @@ class _Codegen:
         self.e.line(f"{ctype(t)} {name}[{lay.num_regs}];")
         return name
 
+    def declare_frag(self, t: ir.Type, lay: L.BitLayout, hint: str | None) -> Tile | None:
+        """Declares a simdgroup_matrix array for a float tile in an accumulator layout."""
+        g = L.frag_grid(lay)
+        e = ir.elem_of(t)
+        if g is None or not isinstance(e, ir.ScalarType) or not is_float(e):
+            return None
+        tm, tn = g[0], g[1]
+        name = self.fresh(hint)
+        self._frag_elem[name] = CTYPES[e.name]
+        self.e.line(f"simdgroup_matrix<{CTYPES[e.name]}, 8, 8> {name}[{tm}][{tn}];")
+        return Tile(lay, name, frag=(tm, tn))
+
     def loop(self, n: int, body: str) -> None:
         """Emits `body` (with `{r}` for the register index) for registers 0..n-1."""
-        if n == 1:
-            self.e.line(body.format(r="0"))
+        if n == 1 or "thread_elements" in body:
+            # simdgroup_matrix arrays must be indexed with constants.
+            for r in range(n):
+                self.e.line(body.format(r=r))
             return
         self.e.line("#pragma unroll")
         self.e.line(f"for (int r = 0; r < {n}; ++r) {body.format(r='r')}")
@@ -399,14 +429,14 @@ class _Codegen:
         src_lay = view_source_layout(op, lay)
         src = self.mat(op.operands[0], src_lay)
         if op.name != "broadcast" or src.uniform is not None:
-            return Tile(lay, src.name, src.uniform, src.base, src.root)
+            return Tile(lay, src.name, src.uniform, src.base, src.root, src.frag)
         m = L.reg_map(src_lay, lay)
         assert m is not None
-        if m == tuple(range(lay.num_regs)):
+        if m == tuple(range(lay.num_regs)) and src.frag is None:
             return Tile(lay, src.name, None, src.base, src.root)
         name = self.declare(op.result.type, lay, "bc")
         for r, sr in enumerate(m):
-            self.e.line(f"{name}[{r}] = {src.name}[{sr}];")
+            self.e.line(f"{name}[{r}] = {src.get(sr)};")
         return Tile(lay, name, None, src.base, src.root)
 
     def mat_cheap(self, op: ir.Op, lay: L.BitLayout) -> Tile:
@@ -482,7 +512,7 @@ class _Codegen:
         name = self.declare(v.type, lay, "cv")
         if m is not None:
             for r, sr in enumerate(m):
-                self.e.line(f"{name}[{r}] = {t.name}[{sr}];")
+                self.e.line(f"{name}[{r}] = {t.get(sr)};")
             return Tile(lay, name, base=t.base, root=t.root)
         cty = ctype(v.type)
         eb = 4 if cty == "int" else max(1, ir.elem_of(v.type).dtype.itemsize)
@@ -502,7 +532,7 @@ class _Codegen:
             self.e.line(f"threadgroup {cty}* buf = (threadgroup {cty}*)tg_mem;")
             with self.e.block(f"if ({own})"):
                 for r in range(t.layout.num_regs):
-                    self.e.line(f"buf[{_add(src_flat, src_c[r])}] = {t.name}[{r}];")
+                    self.e.line(f"buf[{_add(src_flat, src_c[r])}] = {t.get(r)};")
             self.e.line(BARRIER)
             for r in range(lay.num_regs):
                 self.e.line(f"{name}[{r}] = buf[{_add(dst_flat, dst_c[r])}];")
@@ -531,6 +561,16 @@ class _Codegen:
             elif name in ("binary", "cmp", "unary", "fma", "select", "cast", "bitcast",
                           "addptr"):  # fmt: skip
                 self.tiles[id(res)] = self.elementwise(op, lay, lazy=False)
+            elif name == "dot":
+                from tegula.compiler.codegen.dot import emit_dot
+
+                self.tiles[id(res)] = emit_dot(self, op, lay)
+            elif name == "desc_load":
+                if id(res) in self.direct:
+                    return  # read by its dot straight from device memory
+                from tegula.compiler.codegen.dot import emit_desc_load
+
+                self.tiles[id(res)] = emit_desc_load(self, op, lay)
             else:
                 raise self.err(f"`{name}` on tiles isn't supported by the MSL backend yet")
             return
@@ -621,10 +661,35 @@ class _Codegen:
     def op_return(self, op: ir.Op) -> None:
         pass
 
+    def op_make_desc(self, op: ir.Op) -> None:
+        from tegula.compiler.codegen.dot import DescInfo
+
+        t = op.result.type
+        r = t.shape_rank
+        vals = [self.s(v) for v in op.operands]
+        self.descs[id(op.result)] = DescInfo(
+            vals[0], vals[1 : 1 + r], vals[1 + r :], t.block_shape, t.elem,
+            self.roots.get(id(op.operands[0])),
+        )  # fmt: skip
+
+    def op_desc_store(self, op: ir.Op) -> None:
+        from tegula.compiler.codegen.dot import emit_desc_store
+
+        emit_desc_store(self, op)
+
     # ---- control flow ----
 
     def _assign(self, dst: Tile, src: Tile, n: int) -> None:
-        self.loop(n, f"{dst.name}[{{r}}] = {src.get('{r}')};")
+        if dst.frag is not None and (src.frag == dst.frag or src.uniform is not None):
+            tm, tn = dst.frag
+            et = self._frag_elem.get(dst.name, "float")
+            for i in range(tm):
+                for j in range(tn):
+                    rhs = f"{src.name}[{i}][{j}]" if src.uniform is None else \
+                        f"make_filled_simdgroup_matrix<{et}, 8, 8>({et}({src.uniform}))"
+                    self.e.line(f"{dst.name}[{i}][{j}] = {rhs};")
+            return
+        self.loop(n, f"{dst.get('{r}')} = {src.get('{r}')};")
 
     def _carried(self, v: ir.Value, init_tile: Tile | None, init_expr: str | None,
                  hint: str | None) -> Tile | str:  # fmt: skip
@@ -632,6 +697,11 @@ class _Codegen:
         t = v.type
         if isinstance(t, ir.TileType):
             lay = self.plan.layout_of(v)
+            ft = self.declare_frag(t, lay, hint)
+            if ft is not None:
+                if init_tile is not None:
+                    self._assign(ft, init_tile, lay.num_regs)
+                return ft
             name = self.declare(t, lay, hint)
             base = root = None
             if init_tile is not None:

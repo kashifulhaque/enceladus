@@ -1,7 +1,11 @@
-"""Matmul with pointer tiles: `c = a @ b`, accumulating in float32.
+"""Matmul, `c = a @ b`, accumulating in float32, in two variants.
 
-M4 adds a tensor-descriptor variant. Run the demo with
-`TEGULA_INTERPRET=1 uv run python examples/04_matmul.py`.
+- `matmul_desc` uses tensor descriptors. `tl.dot` loads its fragments straight from
+  device memory, and out-of-bounds tiles are handled for you. This is the fast path.
+- `matmul` uses pointer tiles with masks. The operands go through threadgroup memory,
+  which works for any tile but runs slower.
+
+Run the demo with `uv run python examples/04_matmul.py`.
 """
 
 import numpy as np
@@ -41,6 +45,31 @@ def matmul(a: np.ndarray, b: np.ndarray, bm: int = 32, bn: int = 32, bk: int = 3
     return c
 
 
+@tegula.jit
+def matmul_desc_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bk, stride_cm,
+                       BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):  # fmt: skip
+    pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+    a = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, 1], [BM, BK])
+    b = tl.make_tensor_descriptor(b_ptr, [K, N], [stride_bk, 1], [BK, BN])
+    c = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [BM, BN])
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+    c.store([pid_m * BM, pid_n * BN], acc.to(c.dtype))
+
+
+def matmul_desc(a, b, c=None, bm: int = 64, bn: int = 64, bk: int = 32, num_warps: int = 4):
+    """Returns `a @ b` in the input dtype. `a`, `b`, and `c` must be row-major."""
+    (m, k), (_, n) = a.shape, b.shape
+    if c is None:
+        c = np.empty((m, n), a.dtype) if isinstance(a, np.ndarray) else tegula.empty((m, n),
+                                                                                   a.dtype)
+    grid = (tegula.cdiv(n, bn), tegula.cdiv(m, bm))
+    matmul_desc_kernel[grid](a, b, c, m, n, k, k, n, n, BM=bm, BN=bn, BK=bk,
+                             num_warps=num_warps)  # fmt: skip
+    return c
+
+
 def reference(a: np.ndarray, b: np.ndarray, **_) -> np.ndarray:
     return (a.astype(np.float32) @ b.astype(np.float32)).astype(a.dtype)
 
@@ -49,4 +78,5 @@ if __name__ == "__main__":
     rng = np.random.default_rng(0)
     a = rng.standard_normal((100, 70)).astype(np.float32)
     b = rng.standard_normal((70, 90)).astype(np.float32)
-    print("max abs error:", np.abs(matmul(a, b) - reference(a, b)).max())
+    print("max abs error, pointer tiles:", np.abs(matmul(a, b) - reference(a, b)).max())
+    print("max abs error, descriptors:", np.abs(matmul_desc(a, b) - reference(a, b)).max())

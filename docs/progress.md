@@ -236,3 +236,80 @@ Welford through a tuple `tl.reduce`, and argmax ties pass in both modes.
 - A layout bug made loop-carried accumulators fall back to the FP32 default layout,
   which cost an exchange per iteration. It's fixed: loop results now share their block
   argument's layout, and elementwise ops prefer anchors that aren't loop-carried.
+
+## M4: Matmul
+
+### What was built
+
+- `codegen/dot.py`: `tl.dot` on `simdgroup_matrix`. The accumulator is a
+  `simdgroup_matrix` array whose registers the rest of codegen reads through
+  `thread_elements()`, so epilogues (bias, activation, casts) need no conversion.
+  - *Direct* operands (a `desc_load`, optionally through `tl.trans`, used only by the
+    dot) load fragments straight from device memory, with `transpose_matrix` for
+    transposed operands. No threadgroup memory, no barriers.
+  - *Staged* operands (any other tile) go through threadgroup memory with rows padded by
+    16 bytes.
+  - The accumulator updates in place when the dot is its only use.
+- Tensor descriptors: `make_desc`, `desc_load` (zero-filled out of bounds), and
+  `desc_store` (skips out-of-bounds elements) outside direct dots.
+- Layout assignment gives `dot` results `simd_acc(BM, BN, WM, WN)` with WN = 1 by default,
+  spreading SIMD groups along N only when BM is too small.
+- `runtime/device.py` checks the `simdgroup_matrix` lane layout once per process before
+  the first `tl.dot` compiles, and refuses `tl.dot` if the layout differs.
+- `examples/04_matmul.py` has both variants; `examples/07_matmul_fused.py` fuses bias
+  and GELU.
+
+### Benchmarks
+
+The following numbers come from `benchmarks/bench_matmul.py`, config 64x64x32 with 4 SIMD
+groups, in TFLOPS (Tegula GPU-timed; MLX and torch wall clock):
+
+| Shape | FP32 (MLX, torch) | FP16 (MLX, torch) | BF16 (MLX, torch) |
+|---|---|---|---|
+| 4096³ | 4.80-5.04 (5.24, 5.25) | 5.61 (5.79, 5.81) | 5.61 (5.82, 5.91) |
+| 2000³ | 4.29 (4.79, 4.93) | 4.75 (5.36, 5.27) | 4.77 (5.33, 5.27) |
+| 513³ | 1.75 (1.42, 1.26) | 1.87 (1.43, 1.43) | 1.95 (1.30, 1.30) |
+| 1024x4096x1024 | 5.34 (4.91, 5.06) | 5.75 (5.43, 5.46) | 5.76 (5.47, 5.44) |
+
+- The FP16 target (5.3 TFLOPS) is met. The FP32 target (4.9) is met in most runs; the
+  FP32 number varies 4.8-5.0 between runs. In the same harness, the reference
+  `best_matmul.metal` measured 4.95-5.09 FP32 and 5.68 FP16, so the generated kernel is
+  within about 2% of the reference.
+- The fused bias-plus-GELU epilogue runs within 2.3% of plain matmul (target 5%).
+- Ragged 2000³ is about 10% behind MLX, the cost of edge tiles.
+
+### Performance findings
+
+- **Pointer arithmetic shape matters by 17%.** `p + r * ld + (c0 + j * 8)` ran at 4.69
+  TFLOPS in FP16, and `p + r * ld + c0 + j * 8` at 5.59. Adding each term to the pointer
+  lets Metal fold the constant into the address; grouping the terms into one `int` sum
+  first blocks it. Codegen now adds column terms to fragment pointers one at a time.
+- Accumulator copies per iteration, the in-loop edge branch, fully unrolled versus looped
+  fragment code, `max_total_threads_per_threadgroup`, signed versus unsigned index math,
+  and scalars in constant buffers versus locals all measured within noise.
+
+### Tests
+
+386 tests pass and 18 are skipped (1.2 s). The skips are large shapes left to
+compiled mode because the interpreter is slow on them. New tests: both matmul variants
+at 64³, 513³, 1000x777x300, and 2048³ in FP32, FP16, and BF16; descriptor matmul with
+transposed B and ragged shapes; the fused epilogue; and a check that the descriptor
+matmul uses no threadgroup memory while the pointer variant does.
+
+### Deviations from the plan
+
+- **No `edge_versioning` pass.** Each direct `dot` takes a threadgroup-uniform branch:
+  the whole block in bounds runs unmasked `simdgroup_load`s, and anything else runs a
+  checked path where each fragment tests its own bounds (uniform across the SIMD group)
+  and only straddling fragments use per-lane masked loads. One branch per K step
+  measured within noise of hoisting it outside the loop, so neither loop versioning nor
+  peeling the K tail is needed.
+- **No vector-of-2 epilogue stores.** The epilogue stores elements one at a time with
+  masks; replacing it with the reference's `vec<T, 2>` stores measured within noise.
+- The register-operand path (an accumulator feeding a second `dot`) is left for M7,
+  where attention needs it.
+
+### Known gaps
+
+- Integer `dot` raises an error (the MPP path in M8 covers it).
+- `dot_warps` from `tegula.Config` arrives with the autotuner in M5.

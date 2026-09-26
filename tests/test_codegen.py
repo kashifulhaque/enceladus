@@ -66,6 +66,22 @@ def test_reduce_then_broadcast_back_needs_no_conversion(rng_np):
     assert "buf[" not in ck.msl  # no layout-conversion exchange, only reduction scratch
 
 
+def test_descriptor_matmul_reads_fragments_from_device_memory():
+    from conftest import load_example
+
+    ex = load_example("04_matmul")
+    a = np.zeros((128, 128), np.float16)
+    ck = ex.matmul_desc_kernel.warmup(a, a, a, 128, 128, 128, 128, 128, 128, BM=64, BN=64,
+                                      BK=32)  # fmt: skip
+    assert "simdgroup_multiply_accumulate" in ck.msl
+    # No staging arrays and no barriers.
+    assert ck.threadgroup_memory_bytes == 0 and "threadgroup_barrier" not in ck.msl
+    # The pointer-tile variant stages its operands through threadgroup memory instead.
+    ck = ex.matmul_kernel.warmup(a, a, a, 128, 128, 128, 128, 1, 128, 1, 128, 1, BM=32, BN=32,
+                                 BK=32)  # fmt: skip
+    assert "threadgroup_barrier" in ck.msl and ck.threadgroup_memory_bytes > 0
+
+
 def test_generated_msl_is_deterministic():
     x = np.zeros((16, 256), np.float32)
     first = _row_center.ir(x, x, N=256, M=16)

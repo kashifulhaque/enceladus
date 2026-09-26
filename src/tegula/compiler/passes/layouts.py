@@ -249,8 +249,32 @@ class _Assigner:
                         return lay
             return None
         if op.name == "dot":
-            raise CompilationError("tl.dot lowering arrives in M4", op.loc)
+            bm, bn = t.shape
+            bk = op.operands[0].type.shape[1]
+            wm, wn = dot_warps(bm, bn, p.num_warps, op.loc)
+            if bk % 8:
+                raise CompilationError(f"tl.dot needs a K block that's a multiple of 8, got {bk}",
+                                       op.loc)  # fmt: skip
+            return L.simd_acc(bm, bn, wm, wn)
         return None
+
+
+def dot_warps(bm: int, bn: int, num_warps: int, loc=None) -> tuple[int, int]:
+    """Returns the SIMD-group grid (WM, WN) for a BM x BN `dot`.
+
+    The default stacks every SIMD group along M (WN = 1), the measured best
+    configuration. Small BM spreads the remaining SIMD groups along N.
+    """
+    wm = max(1, min(num_warps, bm // 8))
+    wn = num_warps // wm
+    if bm % (8 * wm) or bn % (8 * wn):
+        raise CompilationError(
+            f"tl.dot can't split a {bm}x{bn} tile over {num_warps} SIMD groups; each needs "
+            "a strip that's a multiple of 8 in both dimensions. Use larger blocks or fewer "
+            "num_warps.",
+            loc,
+        )
+    return wm, wn
 
 
 def assign_layouts(module: ir.Module, num_warps: int) -> LayoutPlan:

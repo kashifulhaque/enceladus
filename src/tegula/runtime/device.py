@@ -86,3 +86,51 @@ def _create_device() -> Device:
 def current_stream():
     """Returns the default stream of the default device."""
     return get_device().stream
+
+
+_SIMD_LAYOUT_SRC = """
+#include <metal_stdlib>
+using namespace metal;
+kernel void probe(device const float* m [[buffer(0)]], device float* out [[buffer(1)]],
+                  uint lane [[thread_index_in_simdgroup]]) {
+  simdgroup_float8x8 f;
+  simdgroup_load(f, m, 8);
+  out[lane * 2] = f.thread_elements()[0];
+  out[lane * 2 + 1] = f.thread_elements()[1];
+}
+"""
+_simd_layout_ok: bool | None = None
+
+
+def check_simdgroup_layout() -> None:
+    """Verifies the `simdgroup_matrix` lane layout that `tl.dot` codegen assumes.
+
+    Metal leaves the layout unspecified. This runs once per process on first use.
+
+    Raises:
+        tegula.CompilationError: The device uses a different layout.
+    """
+    global _simd_layout_ok
+    if _simd_layout_ok is None:
+        import numpy as np
+
+        from tegula.runtime.raw import metal_kernel
+        from tegula.runtime.tensor import empty, from_numpy
+
+        k = metal_kernel(_SIMD_LAYOUT_SRC, "probe")
+        m = from_numpy(np.arange(64, dtype=np.float32))
+        out = empty(64)
+        k[(1,), (64,)](m, out)
+        lane = np.arange(32)
+        row = ((lane >> 2) & 4) + ((lane >> 1) & 3)
+        col = ((lane >> 1) & 4) + ((lane << 1) & 2)
+        expect = np.stack([row * 8 + col, row * 8 + col + 1], axis=1).reshape(-1)
+        _simd_layout_ok = bool(np.array_equal(out.numpy(), expect))
+    if not _simd_layout_ok:
+        from tegula.compiler.errors import CompilationError
+
+        raise CompilationError(
+            "this GPU's simdgroup_matrix lane layout differs from the one Tegula's tl.dot "
+            "lowering assumes, so tl.dot can't run here. Please report the device name: "
+            f"{get_device().caps.name}"
+        )

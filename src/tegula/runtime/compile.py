@@ -23,7 +23,7 @@ from tegula.compiler.codegen.msl import KernelArg
 from tegula.compiler.frontend import build_ir
 from tegula.compiler.pipeline import compile_module
 from tegula.runtime import cache
-from tegula.runtime.device import get_device
+from tegula.runtime.device import check_simdgroup_layout, get_device
 from tegula.runtime.launcher import CompiledKernel
 
 if TYPE_CHECKING:
@@ -82,5 +82,7 @@ def compile_specialization(fn: JITFunction, spec: Specialization, num_warps: int
     if dump:
         where = ck.cache_dir or "(not cached)"
         print(f"tegula: {fn.__name__}: IR and MSL in {where}", file=sys.stderr)
+    if "simdgroup_multiply_accumulate" in ck.msl:
+        check_simdgroup_layout()
     ck.pipeline = cache.get_pipeline(ck.msl, ck.name, None, fn.math_mode)
     return ck

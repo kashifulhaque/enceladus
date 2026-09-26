@@ -25,3 +25,23 @@ static inline long tg_shfl_xor(long x, ushort m) {
 static inline ulong tg_shfl_xor(ulong x, ushort m) {
   return as_type<ulong>(simd_shuffle_xor(as_type<uint2>(x), m));
 }
+
+// Loads an 8x8 fragment whose logical (row, col) lives at p[row * ld + col], or at
+// p[col * ld + row] when transposed. Fragments that fit load with simdgroup_load; the
+// test is uniform across the SIMD group. Straddling fragments fall back to per-lane
+// masked loads of the two elements each lane owns, (fm, fn) and (fm, fn + 1).
+template <typename T, typename P>
+static inline void tg_load_frag(thread simdgroup_matrix<T, 8, 8>& f, P p, int ld,
+                                int rows_left, int cols_left, bool transpose, int fm, int fn) {
+  if (rows_left >= 8 && cols_left >= 8) {
+    simdgroup_load(f, p, ulong(ld), ulong2(0, 0), transpose);
+    return;
+  }
+  thread auto& e = f.thread_elements();
+  const bool rok = fm < rows_left;
+  for (int i = 0; i < 2; ++i) {
+    const int c = fn + i;
+    const bool ok = rok && c < cols_left;
+    e[i] = ok ? T(transpose ? p[c * ld + fm] : p[fm * ld + c]) : T(0);
+  }
+}

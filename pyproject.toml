@@ -46,3 +46,5 @@ ignore = ["E741"]
 
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]
+# Benchmarks define timing closures inside loops and call them in the same iteration.
+"benchmarks/*" = ["B023"]
