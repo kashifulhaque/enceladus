@@ -838,169 +838,6 @@ the staging rule, and the one-B-fragment loop each fail at least one test.
 - Only the forward pass exists. Dropout, attention masks other than causal, grouped-query
   attention, and query and key lengths that differ aren't supported by the example.
 
-## M9: Debugging tools
-
-This entry covers items 1-4 of M9: device printing, device asserts, `kernel.explain`, and
-GPU capture. The error-message pass, the user guide, and wheels come later.
-
-### What was built
-
-- **`tl.device_print(prefix, *args)`.** The frontend emits a `print` op; codegen
-  (`compiler/codegen/debug.py`) lowers it to `os_log_default.log(...)` from
-  `<metal_logging>`.
-  - Each line starts with the program ID, then the element's index for tiles, then the
-    prefix and the values: `pid (1, 0, 0) idx (3) x: 1.500000 11`. Tile arguments
-    broadcast to one shape. Each thread prints the registers it owns, predicated on the
-    same owner mask as stores, so broadcast layouts (small tiles, reduction results)
-    print each element once.
-  - Integers print with `%d`, `%u`, `%ld`, or `%lu`, booleans as 0 or 1, and floats
-    (including `half` and `bfloat`) with `%f`. The interpreter formats values the same
-    way; compiled and interpreted output matched line for line for every dtype,
-    including -inf, NaN, -0.0, and 64-bit extremes.
-  - The codegen reports its needs through `GeneratedKernel.language_version` (3.2 for
-    printing kernels) and `GeneratedKernel.enable_logging`. `require_language_version`
-    combines requirements by taking the maximum. The values flow through `compile.py`,
-    `meta.json` in the disk cache, and `cache.get_pipeline`. Kernels that don't print
-    keep byte-identical MSL and compile options.
-  - The first launch of a printing kernel moves the default stream, after a sync, to a
-    command queue whose `MTLLogState` (8 MB buffer, debug level) collects messages. The
-    native log handler only appends to a mutex-protected sink; it never calls into
-    Python, so the GIL question doesn't arise. `Stream.synchronize` writes the collected
-    lines to `sys.stderr` after the GPU finishes.
-  - **Ordering guarantee.** Metal delivers messages on its own thread after the command
-    buffer completes: none had arrived when `sync` returned, and messages from different
-    command buffers interleave. Within one command buffer they arrive in order. So the
-    stream ends every command buffer that holds a printing launch with a one-thread
-    sentinel kernel that logs a fixed string, and `synchronize` waits (up to 10 s) until
-    the sink has counted every sentinel. Every line a kernel prints reaches `sys.stderr`
-    before the `synchronize` that waits for the kernel returns; this held for 1 to 500
-    launches per sync, including command-buffer splits. Command buffers without printing
-    launches get no sentinel and no wait.
-  - On the PyTorch path, printing kernels (and kernels with asserts) take the
-    synchronized native path, because `torch.mps.compile_shader` can't attach a log
-    state. The fallback logs once per kernel.
-- **`tl.device_assert(cond, msg, mask=None)`.** Active only when `ENCELADUS_DEBUG=1`;
-  otherwise the frontend emits nothing.
-  - The flag is part of the disk cache key and of the in-memory specialization key, so
-    toggling it recompiles. `core.debug_enabled()` reads `os.environ` through its
-    internal bytes dict, and launches put the raw value in the key through the bound
-    `dict.get`, which keeps the launch path within noise of the previous build.
-  - Codegen adds `device atomic_uint* tg_assert_buf [[buffer(N)]]` after the runtime
-    arguments. A failing thread claims the buffer with a compare-and-swap and writes the
-    assert index and program ID. `CompiledKernel` owns a zeroed 32-byte buffer and binds
-    it on every launch path, including `timed_launch` and the synchronized path.
-  - At sync, the stream reads the buffer of every assert kernel that launched since the
-    previous sync, resets it, and raises `enceladus.DeviceAssertionError` with the
-    source file, line, column, source text, and first failing program ID. The assert
-    table (message and location per index) is stored in `meta.json`.
-  - The interpreter raises the same error at the failing assert, with the same line.
-- **`kernel.explain(*args, grid=..., **meta)`** (`compiler/explain.py`) builds the IR
-  through the new `compile.build_module` helper, runs `compile_module`, and prints and
-  returns a report with the following parts:
-  - The MSL language version, logging, and assert count.
-  - The `dot` backend, read as `module.attrs.get("dot_backend", "simdgroup")`, and each
-    `dot` with its shape and SIMD-group grid.
-  - Every anchored tile with its layout (registers, lanes, and SIMD groups per
-    dimension, and how many threads hold each element), its register estimate (the
-    codegen's own formula), and its source line. Operands that `tl.dot` reads straight
-    from device memory show 0 registers.
-  - Every layout conversion that codegen emitted: register moves or a threadgroup
-    exchange with its size, both layouts, the use site, and where the value was defined.
-  - Peak threadgroup memory and each request by operation and line.
-
-  Codegen records conversions and threadgroup requests in `GeneratedKernel.report`, and
-  exposes the layout plan as `GeneratedKernel.plan`.
-- **`enceladus.capture(path)`** (`runtime/debug.py`) is a context manager over
-  `MTLCaptureManager` that captures the device into a GPU trace document. It raises a
-  `RuntimeError` that explains the requirement when `MTL_CAPTURE_ENABLED=1` is missing,
-  refuses paths that don't end in `.gputrace` or that exist, syncs before it starts, and
-  syncs and stops on exit, even after an exception.
-- New public API: `tl.device_print`, `tl.device_assert`, `enceladus.capture`,
-  `enceladus.DeviceAssertionError`, and `JITFunction.explain`. New native functions:
-  `new_logging_queue`, `Queue.drain_logs`, `Queue.wait_log_sentinels`,
-  `Stream.set_log_sentinel`, `Stream.mark_logging`, `capture_start`, and `capture_stop`.
-
-### Manual GPU capture
-
-With `MTL_CAPTURE_ENABLED=1`, capturing a vector add wrote an 84 KB `.gputrace` bundle
-(`capture`, `index`, `metadata`, and resource files) in 0.12-0.16 s, and the kernel's
-results were correct. Opening the trace in Xcode wasn't checked, because this session had
-no GUI. Without the variable, `capture()` raises the explanatory error.
-
-### Benchmarks
-
-The following numbers come from `benchmarks/bench_dispatch.py`, three runs each, against
-a build of the previous commit on the same machine:
-
-| Launch, sustained | This build (min) | Previous build (min) |
-|---|---|---|
-| `@enceladus.jit` on `enceladus.Tensor` | 3.20-3.26 µs | 3.17-3.24 µs |
-| `@enceladus.jit` on PyTorch MPS tensors | 5.07-5.23 µs | 4.91-5.23 µs |
-
-Printing is slow by nature: Metal processed about 170,000 messages per second, and a
-command buffer that printed 25,600 lines took 160-200 ms to complete.
-
-### Tests
-
-`tests/test_debug.py` adds 4 test functions (9 cases). The suite runs 653 tests, with 18
-skipped, in 6.4-7.4 s.
-
-- Device printing in interpreted, compiled, and PyTorch-fallback modes: an 8-element
-  tile across 128 threads (16 copies of each element), a row sum (a slice layout held
-  by 4 threads), and scalars. The test compares the multiset of `stderr` lines with the
-  expected lines, so a duplicate, a missing line, a wrong program ID, or a wrong value
-  fails it.
-- Device asserts in both modes, with `ENCELADUS_DEBUG` on and off: a gather with an
-  out-of-range index in program 1 raises with the assert's line and program ID, and a
-  clean launch afterward doesn't raise again. With the flag off, the bad gather runs,
-  and the compiled kernel has no error buffer and no assert code.
-- `explain` on a kernel that adds a row-major tile to a column-major one and reduces: it
-  reports one threadgroup exchange for `bt` at the line of the sum, the reduction's
-  threadgroup bytes at that line, the source text, and the same peak as
-  `warmup().threadgroup_memory_bytes`.
-- `capture` without `MTL_CAPTURE_ENABLED` raises the explanatory error.
-
-Each of these mutations fails at least one test: printing without the owner predicate,
-not waiting for log sentinels, not resetting the error buffer, and leaving the debug flag
-out of the in-memory specialization key.
-
-### Deviations from the plan
-
-- **Printing blocks capture for the whole process.** The plan says to document that
-  printing and capture are incompatible. Metal refuses to start a capture ("Capturing
-  Shader logging is not supported") once the process has created any command queue with
-  a log state, even after the queue is released and even when the capture targets
-  another queue. So `capture()` raises a clear error if a printing kernel has run, and a
-  printing kernel that launches during a capture raises too.
-- **Printed lines arrive at sync, not while the kernel runs.** Metal's log handler runs
-  after the command buffer completes. The stream forwards lines at `synchronize`, which
-  `Tensor.numpy()`, NumPy-argument launches, and `enceladus.synchronize()` all call.
-- **`device_print` refuses `hex=True`**, and the prefix must be printable ASCII.
-- **Asserts don't stop the kernel.** Metal has no way to abort a dispatch, and returning
-  early would break barriers, so the kernel keeps running after a failed assert. The
-  docstring says to guard the access with a mask too.
-- **The interpreter follows `ENCELADUS_DEBUG` too**, so both modes behave the same.
-- **`explain` doesn't create a Metal pipeline**, so it has no measured register count;
-  the estimate is the codegen's own count of 32-bit registers per tile.
-
-### Known gaps
-
-- Metal drops log messages silently when a command buffer's messages overflow the 8 MB
-  log buffer, at about 88 bytes per line. A command buffer that printed 196,608 lines
-  delivered 95,324, and the sentinel still arrived, so no warning appeared. Print fewer
-  elements, or sync more often.
-- If a sentinel never arrives, for example after a command-buffer error, `synchronize`
-  waits up to 10 s (0.1 s after an error) and then writes a warning line.
-- A printing kernel that `timed_launch` runs right after other pending work can lose its
-  sentinel to the earlier command buffer, so its lines might appear at a later sync.
-  Only autotuning uses `timed_launch`.
-- Once a kernel prints, the default stream stays on the logging queue for the rest of
-  the process. Launches that don't print pay no sentinel cost there.
-- `explain` lists anchored tiles only. Cheap values (constants, `arange`, and
-  elementwise ops over them) are rematerialized at each use and aren't listed.
-- The `// file.py:LINE` source comments that the plan's M2 section schedules for
-  `ENCELADUS_DEBUG=1` aren't emitted.
-
 ## M8: Metal 4 matmul2d backend
 
 ### What was built
@@ -1165,3 +1002,166 @@ language version each fail at least one test.
   a fused softmax, falls back to `simdgroup`. Cooperative-tensor reductions
   (`reduce_rows`) and `get_left_input_cooperative_tensor` for attention aren't used.
 - `relaxed_precision` stays off; it measured no difference in the research.
+
+## M9: Debugging tools
+
+This entry covers items 1-4 of M9: device printing, device asserts, `kernel.explain`, and
+GPU capture. The error-message pass, the user guide, and wheels come later.
+
+### What was built
+
+- **`tl.device_print(prefix, *args)`.** The frontend emits a `print` op; codegen
+  (`compiler/codegen/debug.py`) lowers it to `os_log_default.log(...)` from
+  `<metal_logging>`.
+  - Each line starts with the program ID, then the element's index for tiles, then the
+    prefix and the values: `pid (1, 0, 0) idx (3) x: 1.500000 11`. Tile arguments
+    broadcast to one shape. Each thread prints the registers it owns, predicated on the
+    same owner mask as stores, so broadcast layouts (small tiles, reduction results)
+    print each element once.
+  - Integers print with `%d`, `%u`, `%ld`, or `%lu`, booleans as 0 or 1, and floats
+    (including `half` and `bfloat`) with `%f`. The interpreter formats values the same
+    way; compiled and interpreted output matched line for line for every dtype,
+    including -inf, NaN, -0.0, and 64-bit extremes.
+  - The codegen reports its needs through `GeneratedKernel.language_version` (3.2 for
+    printing kernels) and `GeneratedKernel.enable_logging`. `require_language_version`
+    combines requirements by taking the maximum. The values flow through `compile.py`,
+    `meta.json` in the disk cache, and `cache.get_pipeline`. Kernels that don't print
+    keep byte-identical MSL and compile options.
+  - The first launch of a printing kernel moves the default stream, after a sync, to a
+    command queue whose `MTLLogState` (8 MB buffer, debug level) collects messages. The
+    native log handler only appends to a mutex-protected sink; it never calls into
+    Python, so the GIL question doesn't arise. `Stream.synchronize` writes the collected
+    lines to `sys.stderr` after the GPU finishes.
+  - **Ordering guarantee.** Metal delivers messages on its own thread after the command
+    buffer completes: none had arrived when `sync` returned, and messages from different
+    command buffers interleave. Within one command buffer they arrive in order. So the
+    stream ends every command buffer that holds a printing launch with a one-thread
+    sentinel kernel that logs a fixed string, and `synchronize` waits (up to 10 s) until
+    the sink has counted every sentinel. Every line a kernel prints reaches `sys.stderr`
+    before the `synchronize` that waits for the kernel returns; this held for 1 to 500
+    launches per sync, including command-buffer splits. Command buffers without printing
+    launches get no sentinel and no wait.
+  - On the PyTorch path, printing kernels (and kernels with asserts) take the
+    synchronized native path, because `torch.mps.compile_shader` can't attach a log
+    state. The fallback logs once per kernel.
+- **`tl.device_assert(cond, msg, mask=None)`.** Active only when `ENCELADUS_DEBUG=1`;
+  otherwise the frontend emits nothing.
+  - The flag is part of the disk cache key and of the in-memory specialization key, so
+    toggling it recompiles. `core.debug_enabled()` reads `os.environ` through its
+    internal bytes dict, and launches put the raw value in the key through the bound
+    `dict.get`, which keeps the launch path within noise of the previous build.
+  - Codegen adds `device atomic_uint* tg_assert_buf [[buffer(N)]]` after the runtime
+    arguments. A failing thread claims the buffer with a compare-and-swap and writes the
+    assert index and program ID. `CompiledKernel` owns a zeroed 32-byte buffer and binds
+    it on every launch path, including `timed_launch` and the synchronized path.
+  - At sync, the stream reads the buffer of every assert kernel that launched since the
+    previous sync, resets it, and raises `enceladus.DeviceAssertionError` with the
+    source file, line, column, source text, and first failing program ID. The assert
+    table (message and location per index) is stored in `meta.json`.
+  - The interpreter raises the same error at the failing assert, with the same line.
+- **`kernel.explain(*args, grid=..., **meta)`** (`compiler/explain.py`) builds the IR
+  through the new `compile.build_module` helper, runs `compile_module`, and prints and
+  returns a report with the following parts:
+  - The MSL language version, logging, and assert count.
+  - The `dot` backend, read as `module.attrs.get("dot_backend", "simdgroup")`, and each
+    `dot` with its shape and SIMD-group grid.
+  - Every anchored tile with its layout (registers, lanes, and SIMD groups per
+    dimension, and how many threads hold each element), its register estimate (the
+    codegen's own formula), and its source line. Operands that `tl.dot` reads straight
+    from device memory show 0 registers.
+  - Every layout conversion that codegen emitted: register moves or a threadgroup
+    exchange with its size, both layouts, the use site, and where the value was defined.
+  - Peak threadgroup memory and each request by operation and line.
+
+  Codegen records conversions and threadgroup requests in `GeneratedKernel.report`, and
+  exposes the layout plan as `GeneratedKernel.plan`.
+- **`enceladus.capture(path)`** (`runtime/debug.py`) is a context manager over
+  `MTLCaptureManager` that captures the device into a GPU trace document. It raises a
+  `RuntimeError` that explains the requirement when `MTL_CAPTURE_ENABLED=1` is missing,
+  refuses paths that don't end in `.gputrace` or that exist, syncs before it starts, and
+  syncs and stops on exit, even after an exception.
+- New public API: `tl.device_print`, `tl.device_assert`, `enceladus.capture`,
+  `enceladus.DeviceAssertionError`, and `JITFunction.explain`. New native functions:
+  `new_logging_queue`, `Queue.drain_logs`, `Queue.wait_log_sentinels`,
+  `Stream.set_log_sentinel`, `Stream.mark_logging`, `capture_start`, and `capture_stop`.
+
+### Manual GPU capture
+
+With `MTL_CAPTURE_ENABLED=1`, capturing a vector add wrote an 84 KB `.gputrace` bundle
+(`capture`, `index`, `metadata`, and resource files) in 0.12-0.16 s, and the kernel's
+results were correct. Opening the trace in Xcode wasn't checked, because this session had
+no GUI. Without the variable, `capture()` raises the explanatory error.
+
+### Benchmarks
+
+The following numbers come from `benchmarks/bench_dispatch.py`, three runs each, against
+a build of the previous commit on the same machine:
+
+| Launch, sustained | This build (min) | Previous build (min) |
+|---|---|---|
+| `@enceladus.jit` on `enceladus.Tensor` | 3.20-3.26 µs | 3.17-3.24 µs |
+| `@enceladus.jit` on PyTorch MPS tensors | 5.07-5.23 µs | 4.91-5.23 µs |
+
+Printing is slow by nature: Metal processed about 170,000 messages per second, and a
+command buffer that printed 25,600 lines took 160-200 ms to complete.
+
+### Tests
+
+`tests/test_debug.py` adds 4 test functions (9 cases). The suite runs 653 tests, with 18
+skipped, in 6.4-7.4 s.
+
+- Device printing in interpreted, compiled, and PyTorch-fallback modes: an 8-element
+  tile across 128 threads (16 copies of each element), a row sum (a slice layout held
+  by 4 threads), and scalars. The test compares the multiset of `stderr` lines with the
+  expected lines, so a duplicate, a missing line, a wrong program ID, or a wrong value
+  fails it.
+- Device asserts in both modes, with `ENCELADUS_DEBUG` on and off: a gather with an
+  out-of-range index in program 1 raises with the assert's line and program ID, and a
+  clean launch afterward doesn't raise again. With the flag off, the bad gather runs,
+  and the compiled kernel has no error buffer and no assert code.
+- `explain` on a kernel that adds a row-major tile to a column-major one and reduces: it
+  reports one threadgroup exchange for `bt` at the line of the sum, the reduction's
+  threadgroup bytes at that line, the source text, and the same peak as
+  `warmup().threadgroup_memory_bytes`.
+- `capture` without `MTL_CAPTURE_ENABLED` raises the explanatory error.
+
+Each of these mutations fails at least one test: printing without the owner predicate,
+not waiting for log sentinels, not resetting the error buffer, and leaving the debug flag
+out of the in-memory specialization key.
+
+### Deviations from the plan
+
+- **Printing blocks capture for the whole process.** The plan says to document that
+  printing and capture are incompatible. Metal refuses to start a capture ("Capturing
+  Shader logging is not supported") once the process has created any command queue with
+  a log state, even after the queue is released and even when the capture targets
+  another queue. So `capture()` raises a clear error if a printing kernel has run, and a
+  printing kernel that launches during a capture raises too.
+- **Printed lines arrive at sync, not while the kernel runs.** Metal's log handler runs
+  after the command buffer completes. The stream forwards lines at `synchronize`, which
+  `Tensor.numpy()`, NumPy-argument launches, and `enceladus.synchronize()` all call.
+- **`device_print` refuses `hex=True`**, and the prefix must be printable ASCII.
+- **Asserts don't stop the kernel.** Metal has no way to abort a dispatch, and returning
+  early would break barriers, so the kernel keeps running after a failed assert. The
+  docstring says to guard the access with a mask too.
+- **The interpreter follows `ENCELADUS_DEBUG` too**, so both modes behave the same.
+- **`explain` doesn't create a Metal pipeline**, so it has no measured register count;
+  the estimate is the codegen's own count of 32-bit registers per tile.
+
+### Known gaps
+
+- Metal drops log messages silently when a command buffer's messages overflow the 8 MB
+  log buffer, at about 88 bytes per line. A command buffer that printed 196,608 lines
+  delivered 95,324, and the sentinel still arrived, so no warning appeared. Print fewer
+  elements, or sync more often.
+- If a sentinel never arrives, for example after a command-buffer error, `synchronize`
+  waits up to 10 s (0.1 s after an error) and then writes a warning line.
+- A printing kernel that `timed_launch` runs right after other pending work can lose its
+  sentinel to the earlier command buffer, so its lines might appear at a later sync.
+  Only autotuning uses `timed_launch`.
+- Once a kernel prints, the default stream stays on the logging queue for the rest of
+  the process. Launches that don't print pay no sentinel cost there.
+- `explain` lists anchored tiles only. Cheap values (constants, `arange`, and
+  elementwise ops over them) are rematerialized at each use and aren't listed.
+- The `// file.py:LINE` source comments that the plan's M2 section schedules for
+  `ENCELADUS_DEBUG=1` aren't emitted.
