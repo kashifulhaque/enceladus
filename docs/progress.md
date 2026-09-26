@@ -84,3 +84,47 @@ propagation; and flush-on-threshold with cross-batch dependencies.
 - **`Tensor.__dlpack__` and `__dlpack_device__` are deferred to M6**, where they export
   `kDLMetal` as the plan specifies. `Tensor.__array__` covers NumPy interop until then.
 - `launcher.py` and `cache.py` start in M2 with the compiled-kernel path.
+
+## M1: Frontend, IR, and interpreter
+
+### What was built
+
+- `language/`: dtypes, `constexpr`, and one builtin registry. Each `tl` function
+  registers a frontend handler and a NumPy interpreter handler together. The P0 surface
+  is complete, plus `tl.reduce` (including tuple inputs), `tl.dot`,
+  `make_tensor_descriptor` with `desc.load` and `desc.store`, `tl.range`, and `tl.cast`.
+- `compiler/ir.py`: types, values, ops, regions, a builder, an MLIR-style printer, and a
+  verifier with a rule for every op in the plan's table.
+- `compiler/frontend.py` and `semantic.py`: the AST-to-IR generator and Triton's
+  promotion and broadcasting rules. The frontend and the interpreter share these rules,
+  so their result dtypes agree. The M2 entry point is `build_ir(fn, arg_types, arg_facts,
+  constexprs, num_warps, math_mode)`.
+- `interpreter/interp.py`: `ITile`, `IPointer`, and `IDesc` over NumPy, with a sequential
+  grid. An out-of-bounds unmasked access raises `IndexError` with the kernel line.
+- `runtime/jit.py`: `@tegula.jit`, specialization facts as function-argument attributes,
+  and a SHA-256 dependency hash.
+- Examples 01-06.
+
+### Results
+
+- The default suite runs 189 tests and skips 130 in 0.4 s. Every skip is a compiled-mode
+  case that M2 enables.
+- The frontend plus verifier takes about 0.14 ms for vector add and 0.6 ms for matmul.
+- `TEGULA_INTERPRET=1 TEGULA_DUMP=1` prints readable IR for every example.
+
+### Deviations from the plan
+
+- `build_ir` always verifies. `TEGULA_VERIFY=1` makes interpreted launches also build
+  and verify IR once per specialization, which is how the tests check every example's IR.
+- Triton hints with no effect on Apple GPUs (`num_stages`, `cache_modifier`,
+  `eviction_policy`, and `input_precision`) are accepted and ignored.
+- A reduction to rank 0 produces a scalar, not a 0-d tile.
+
+### Known gaps
+
+- `multiple_of` and `max_contiguous` (M2), atomics and scans (M7), `device_print` and
+  `device_assert` (M9), `join`, and `split` aren't implemented.
+- The dependency hash tracks globals referenced by bare names only, not `module.attr`
+  chains, and has no test.
+- In the interpreter, the loop variable is a Python `int`, so `//`, `%`, and overflow on
+  it follow Python rules rather than `i32` rules.

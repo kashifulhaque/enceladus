@@ -23,3 +23,8 @@ from tegula.runtime.tensor import (
 )
 
 # --- language and compiler (M1) ---
+# isort: split
+from tegula import language
+from tegula.compiler.errors import CompilationError
+from tegula.language.core import constexpr
+from tegula.runtime.jit import JITFunction, cdiv, jit, next_power_of_2
