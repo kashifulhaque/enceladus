@@ -23,7 +23,7 @@ from typing import Any
 
 import numpy as np
 
-from enceladus.runtime import cache
+from enceladus.runtime import cache, interop
 from enceladus.runtime.device import get_device
 from enceladus.runtime.tensor import Tensor, from_numpy
 
@@ -83,6 +83,15 @@ class Config:
 
     def _identity(self) -> str:
         return json.dumps(self.to_json(), sort_keys=True)
+
+
+def _bench_view(a: Any) -> Any:
+    """Returns an `enceladus.Tensor` sharing the memory of a NumPy, PyTorch, or MLX array."""
+    if isinstance(a, np.ndarray):
+        return from_numpy(a)
+    if interop.framework_of(a) is not None:
+        return interop.as_tensor(a)
+    return a
 
 
 def _innermost(fn: Any):
@@ -269,10 +278,10 @@ class Autotuner:
         from enceladus.testing import do_bench
 
         configs = self._candidates(named)
-        # Benchmark on enceladus.Tensor views so launches don't synchronize.
-        bench_args = tuple(from_numpy(a) if isinstance(a, np.ndarray) else a for a in args)
-        bench_kwargs = {k: from_numpy(v) if isinstance(v, np.ndarray) else v
-                        for k, v in kwargs.items()}  # fmt: skip
+        # Benchmark on enceladus.Tensor views so launches run on Enceladus's stream, which
+        # do_bench times, and don't synchronize.
+        bench_args = tuple(_bench_view(a) for a in args)
+        bench_kwargs = {k: _bench_view(v) for k, v in kwargs.items()}
         self.jit._binder()  # build the binder before compiling from threads
 
         def compile_one(cfg: Config):

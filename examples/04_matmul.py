@@ -5,6 +5,9 @@
 - `matmul` uses pointer tiles with masks. The operands go through threadgroup memory,
   which works for any tile but runs slower.
 
+All three wrappers accept NumPy arrays, `enceladus.Tensor` objects, PyTorch tensors on
+the `mps` device, and MLX arrays, and return an array of the same kind.
+
 Run the demo with `uv run python examples/04_matmul.py`.
 """
 
@@ -36,11 +39,12 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
     tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
-def matmul(a: np.ndarray, b: np.ndarray, bm: int = 32, bn: int = 32, bk: int = 32) -> np.ndarray:
-    """Returns `a @ b` in the input dtype."""
+def matmul(a, b, bm: int = 32, bn: int = 32, bk: int = 32):
+    """Returns `a @ b` in the input dtype. The operands can have any strides."""
     (m, k), (_, n) = a.shape, b.shape
-    c = np.empty((m, n), a.dtype)
-    s = [x // a.itemsize for x in (*a.strides, *b.strides, *c.strides)]
+    c = enceladus.new_empty(a, (m, n))
+    s = [*enceladus.element_strides(a), *enceladus.element_strides(b),
+         *enceladus.element_strides(c)]  # fmt: skip
     grid = lambda meta: (enceladus.cdiv(n, meta["BN"]), enceladus.cdiv(m, meta["BM"]))  # noqa: E731
     matmul_kernel[grid](a, b, c, m, n, k, *s, BM=bm, BN=bn, BK=bk)
     return c
@@ -63,8 +67,7 @@ def matmul_desc(a, b, c=None, bm: int = 64, bn: int = 64, bk: int = 32, num_warp
     """Returns `a @ b` in the input dtype. `a`, `b`, and `c` must be row-major."""
     (m, k), (_, n) = a.shape, b.shape
     if c is None:
-        c = np.empty((m, n), a.dtype) if isinstance(a, np.ndarray) else enceladus.empty((m, n),
-                                                                                   a.dtype)
+        c = enceladus.new_empty(a, (m, n))
     grid = (enceladus.cdiv(n, bn), enceladus.cdiv(m, bm))
     matmul_desc_kernel[grid](a, b, c, m, n, k, k, n, n, BM=bm, BN=bn, BK=bk,
                              num_warps=num_warps)  # fmt: skip
@@ -91,8 +94,7 @@ def matmul_tuned(a, b, c=None):
     """Returns `a @ b` using the fastest configuration for this shape and dtype."""
     (m, k), (_, n) = a.shape, b.shape
     if c is None:
-        c = np.empty((m, n), a.dtype) if isinstance(a, np.ndarray) else enceladus.empty((m, n),
-                                                                                   a.dtype)
+        c = enceladus.new_empty(a, (m, n))
     grid = lambda meta: (enceladus.cdiv(n, meta["BN"]), enceladus.cdiv(m, meta["BM"]))  # noqa: E731
     matmul_desc_tuned[grid](a, b, c, m, n, k, k, n, n)
     return c

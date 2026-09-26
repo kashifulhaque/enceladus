@@ -1,6 +1,9 @@
 """Vector add: `out = x + y`.
 
-Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/01_vector_add.py`.
+`add` accepts NumPy arrays, `enceladus.Tensor` objects, PyTorch tensors on the `mps`
+device, and MLX arrays, and returns an array of the same kind.
+
+Run the demo with `uv run python examples/01_vector_add.py`.
 """
 
 import numpy as np
@@ -19,10 +22,10 @@ def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, x + y, mask=mask)
 
 
-def add(x: np.ndarray, y: np.ndarray, block: int = 1024) -> np.ndarray:
+def add(x, y, block: int = 1024):
     """Returns `x + y` for two contiguous arrays of the same shape and dtype."""
-    out = np.empty_like(x)
-    n = x.size
+    out = enceladus.new_empty(x)
+    n = int(np.prod(x.shape))
     add_kernel[(enceladus.cdiv(n, block),)](x, y, out, n, BLOCK=block)
     return out
 
@@ -37,3 +40,10 @@ if __name__ == "__main__":
     y = rng.standard_normal(100_003).astype(np.float32)
     out = add(x, y)
     print("max abs error:", np.abs(out - reference(x, y)).max())
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None and torch.backends.mps.is_available():
+        tx, ty = torch.from_numpy(x).to("mps"), torch.from_numpy(y).to("mps")
+        print("max abs error, torch:", (add(tx, ty) - (tx + ty)).abs().max().item())

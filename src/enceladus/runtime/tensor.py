@@ -11,6 +11,15 @@ import numpy as np
 from enceladus import _C
 from enceladus.runtime.device import get_device
 
+_K_DL_METAL = 8
+# NumPy dtype name -> DLPack (type code, bits). Codes: 0 int, 1 uint, 2 float, 4 bfloat,
+# 6 bool.
+_DLPACK_DTYPES = {
+    "float32": (2, 32), "float16": (2, 16), "bfloat16": (4, 16), "bool": (6, 8),
+    "int8": (0, 8), "int16": (0, 16), "int32": (0, 32), "int64": (0, 64),
+    "uint8": (1, 8), "uint16": (1, 16), "uint32": (1, 32), "uint64": (1, 64),
+}  # fmt: skip
+
 
 def to_np_dtype(dtype: Any) -> np.dtype:
     """Converts a tl dtype, NumPy dtype, or dtype name to a NumPy dtype."""
@@ -144,6 +153,45 @@ class Tensor:
         if dtype is not None:
             a = a.astype(dtype, copy=False)
         return a.copy() if copy else a
+
+    # ---- DLPack ----
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        """Returns `(kDLMetal, 0)`: the tensor lives in a Metal buffer on device 0."""
+        return (_K_DL_METAL, 0)
+
+    def __dlpack__(self, *, stream: Any = None, max_version: tuple[int, int] | None = None,
+                   dl_device: tuple[int, int] | None = None, copy: bool | None = None):  # fmt: skip
+        """Exports the tensor as a `kDLMetal` DLPack capsule, without copying.
+
+        The capsule's `data` is the `id<MTLBuffer>`, and `byte_offset` locates the first
+        element, which is how PyTorch and MLX exchange Metal memory. The call waits for
+        Enceladus's pending GPU work first. Enceladus's stream doesn't order against the
+        consumer's stream, so call `enceladus.synchronize()` before the consumer reads
+        data that later Enceladus launches on this tensor write.
+
+        Args:
+            stream: Ignored; Metal consumers pass no stream.
+            max_version: The highest DLPack version the consumer supports. A major
+                version of 1 or more selects a versioned capsule.
+            dl_device: The device the consumer wants; only `(8, 0)` is supported.
+            copy: `True` isn't supported, because the export never copies.
+
+        Raises:
+            BufferError: The consumer asked for a copy or for another device.
+        """
+        del stream
+        if copy:
+            raise BufferError("enceladus.Tensor exports without copying; copy=True isn't supported")
+        if dl_device is not None and tuple(dl_device) != (_K_DL_METAL, 0):
+            raise BufferError(f"enceladus.Tensor lives on (kDLMetal, 0), not {tuple(dl_device)}")
+        from enceladus.runtime.stream import synchronize
+
+        synchronize()
+        code, bits = _DLPACK_DTYPES[self.np_dtype.name]
+        versioned = max_version is not None and max_version[0] >= 1
+        return _C.dlpack_export(self.buffer, list(self.shape), list(self.strides),
+                                self.byte_offset, code, bits, self.buffer, versioned)  # fmt: skip
 
     def tolist(self) -> list:
         return self.numpy().tolist()
