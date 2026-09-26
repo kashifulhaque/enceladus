@@ -51,6 +51,17 @@ class CompilationError(Exception):
         return format_error(self.message, self.loc)
 
 
+INTERNAL_ERROR_HINT = (
+    "This is a bug in Enceladus, not in your kernel. Report it with the kernel source and "
+    "the launch arguments."
+)
+
+
+def internal_error(message: str, loc: Loc | None = None) -> CompilationError:
+    """Returns a `CompilationError` for a broken compiler invariant, located at `loc`."""
+    return CompilationError(f"internal compiler error: {message}. {INTERNAL_ERROR_HINT}", loc)
+
+
 def format_error(message: str, loc: Loc | None) -> str:
     """Formats `message` with a `file:line:col` prefix, the source line, and a caret."""
     if loc is None:

@@ -79,7 +79,10 @@ def pointer_from_array(obj: Any) -> IPointer:
             "non-negative strides; pass a copy made with `np.ascontiguousarray`."
         )
     if any(s % item for s in arr.strides):
-        raise ValueError(f"array strides {arr.strides} aren't multiples of the item size {item}")
+        raise ValueError(
+            f"array strides {arr.strides} aren't multiples of the item size {item}. Pass a "
+            "copy made with `np.ascontiguousarray`."
+        )
     if arr.size == 0:
         length = 0
     else:
@@ -175,11 +178,41 @@ class ITile:
     def __getattr__(self, name: str) -> Any:
         m = core.TILE_METHODS.get(name)
         if m is None:
-            raise AttributeError(f"tiles have no attribute {name!r}")
+            raise AttributeError(
+                f"tiles have no attribute {name!r}. Check the spelling, or call the tl "
+                "function of that name, for example `tl.sum(x)` for `x.sum()`."
+            )
         return lambda *a, **k: m.interp(self, *a, **k)
 
     def __getitem__(self, idx: Any) -> ITile:
         return ITile(self.data[_check_index(idx)], self.dtype)
+
+    # Python constructs that the compiler refuses. Without these methods, Python would
+    # fall back to `__getitem__` or raise a TypeError that names the interpreter's classes.
+    def __setitem__(self, idx: Any, value: Any) -> None:
+        raise CompilationError(
+            "tiles are immutable, so you can't assign to an element or attribute. Build a new "
+            "tile instead, for example with tl.where."
+        )
+
+    def __iter__(self):
+        raise CompilationError(
+            "tiles can't be iterated or unpacked. Loop with `for i in range(...)`, and select "
+            "elements with masks, or use tl.static_range with compile-time tuples."
+        )
+
+    def __pow__(self, o):
+        raise CompilationError(
+            "`**` isn't supported on runtime values. Multiply explicitly, as in `x * x`, or "
+            "use tl.exp2 and tl.log2."
+        )
+
+    __rpow__ = __pow__
+
+    def __matmul__(self, o):
+        raise CompilationError("`@` isn't supported on runtime values. Use tl.dot(a, b).")
+
+    __rmatmul__ = __matmul__
 
     def _scalar(self) -> Any:
         if self.data.ndim != 0:
@@ -201,7 +234,10 @@ class ITile:
 
     def __index__(self) -> int:
         if not self.dtype.is_int():
-            raise TypeError(f"a {self.dtype} value can't be used as an integer")
+            raise TypeError(
+                f"a {self.dtype} value can't be used as an integer. Convert it with "
+                "`.to(tl.int32)` first."
+            )
         return int(self._scalar())
 
     def __int__(self) -> int:
@@ -313,8 +349,9 @@ def _check_index(idx: Any) -> Any:
         if it is None or (isinstance(it, slice) and it == slice(None)):
             continue
         raise CompilationError(
-            f"tiles support only `None` and `:` in subscripts, as in `x[:, None]`, but got "
-            f"{it!r}"
+            "tiles support only `None` and `:` in subscripts, as in `x[:, None]`, but got "
+            f"{it!r}. To select elements, use a mask or tl.where, or load the element from "
+            "memory with tl.load."
         )
     return idx
 
@@ -355,7 +392,10 @@ class IPointer:
     def __getattr__(self, name: str) -> Any:
         m = core.TILE_METHODS.get(name)
         if m is None:
-            raise AttributeError(f"pointers have no attribute {name!r}")
+            raise AttributeError(
+                f"pointers have no attribute {name!r}. Check the spelling, or call the tl "
+                "function of that name."
+            )
         return lambda *a, **k: m.interp(self, *a, **k)
 
     def __repr__(self) -> str:
@@ -368,7 +408,8 @@ class IPointer:
             bad &= mask
         if bad.any():
             first = int(offsets[bad].flat[0])
-            hint = " Pass a mask that excludes it." if mask is None else ""
+            hint = (" Pass a mask that excludes it." if mask is None else
+                    " The mask doesn't exclude it; check the mask's bounds.")
             raise IndexError(
                 f"out-of-bounds {what}{_where()}: element offset {first} is outside the "
                 f"buffer of {n} elements.{hint}"
@@ -377,15 +418,24 @@ class IPointer:
 
 def _pointer_add(p: IPointer, o: Any, sign: int) -> IPointer:
     if isinstance(o, IPointer):
-        raise CompilationError("pointers support only `+` and `-` with an integer offset")
+        raise CompilationError(
+            "pointers support only `+` and `-` with an integer offset. Compute the offset "
+            "first, as in `ptr + i * stride`."
+        )
     if isinstance(o, ITile):
         if not o.dtype.is_int():
-            raise CompilationError(f"a pointer offset must be an integer, but got {o.dtype}")
+            raise CompilationError(
+                f"a pointer offset must be an integer, but got {o.dtype}. Convert it with "
+                "`.to(tl.int32)`."
+            )
         off = o.data.astype(np.int64)
     elif isinstance(o, (int, np.integer)) and not isinstance(o, bool):
         off = np.int64(o)
     else:
-        raise CompilationError(f"a pointer offset must be an integer, but got {o!r}")
+        raise CompilationError(
+            f"a pointer offset must be an integer, but got {o!r}. Convert it with "
+            "`.to(tl.int32)`."
+        )
     return p.with_offsets(p.offsets + sign * off)
 
 
@@ -514,7 +564,10 @@ def binary(op: str, x: Any, y: Any) -> ITile:
     if isinstance(x, IPointer) and op in ("add", "sub"):
         return _pointer_add(x, y, 1 if op == "add" else -1)
     if isinstance(x, IPointer) or isinstance(y, IPointer):
-        raise CompilationError("pointers support only `+` and `-` with an integer offset")
+        raise CompilationError(
+            "pointers support only `+` and `-` with an integer offset. Compute the offset "
+            "first, as in `ptr + i * stride`."
+        )
     dt = semantic.computation_dtype(op, _operand(x), _operand(y))
     a, b = as_compute(x, dt), as_compute(y, dt)
     semantic.broadcast_shapes(a.shape, b.shape)

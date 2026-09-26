@@ -327,8 +327,12 @@ class _Assigner:
             bk = op.operands[0].type.shape[1]
             wm, wn = dot_warps(bm, bn, p.num_warps, op.loc, p.dot_warps)
             if bk % 8:
-                raise CompilationError(f"tl.dot needs a K block that's a multiple of 8, got {bk}",
-                                       op.loc)  # fmt: skip
+                raise CompilationError(
+                    f"tl.dot needs a K dimension (the columns of the first operand) that's a "
+                    f"multiple of 8, but got {bk}. Use a K block size of at least 8, such as 16 "
+                    "or 32.",
+                    op.loc,
+                )
             return L.simd_acc(bm, bn, wm, wn)
         return None
 
@@ -355,16 +359,19 @@ def dot_warps(bm: int, bn: int, num_warps: int, loc=None,
     if override is not None:
         wm, wn = override
         if wm * wn != num_warps:
-            raise CompilationError(f"dot_warps={override} doesn't multiply to num_warps="
-                                   f"{num_warps}", loc)  # fmt: skip
+            raise CompilationError(
+                f"dot_warps={override} doesn't multiply to num_warps={num_warps}. Pass a "
+                f"(WM, WN) pair with WM * WN == {num_warps}.",
+                loc,
+            )
     else:
         wm = max(1, min(num_warps, bm // 8))
         wn = num_warps // wm
     if bm % (8 * wm) or bn % (8 * wn):
         raise CompilationError(
-            f"tl.dot can't split a {bm}x{bn} tile over {num_warps} SIMD groups; each needs "
-            "a strip that's a multiple of 8 in both dimensions. Use larger blocks or fewer "
-            "num_warps.",
+            f"tl.dot can't split a {bm}x{bn} tile over {num_warps} SIMD groups, because each "
+            "SIMD group needs a strip that's a multiple of 8 in both dimensions. Use larger "
+            "blocks, or launch with fewer num_warps.",
             loc,
         )
     return wm, wn

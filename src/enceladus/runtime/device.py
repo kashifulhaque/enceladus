@@ -123,8 +123,8 @@ def check_simdgroup_layout() -> None:
 
         raise CompilationError(
             "this GPU's simdgroup_matrix lane layout differs from the one Enceladus's tl.dot "
-            "lowering assumes, so tl.dot can't run here. Please report the device name: "
-            f"{get_device().caps.name}"
+            "lowering assumes, so tl.dot can't run here. Report this to the Enceladus "
+            f"maintainers with the device name, {get_device().caps.name}."
         )
 
 

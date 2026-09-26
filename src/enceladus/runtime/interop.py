@@ -110,14 +110,20 @@ def torch_np_dtype(t: Any) -> np.dtype:
     """
     if not t.is_mps:
         raise TypeError(
-            f"a torch tensor on the {t.device.type} device can't be a kernel argument; "
-            'move it to the GPU with `.to("mps")`'
+            f"a torch tensor on the {t.device.type} device can't be a kernel argument. "
+            'Move it to the GPU with `.to("mps")`.'
         )
     d = _torch_dtype_table().get(t.dtype)
     if d is None:
         if str(t.dtype) == "torch.float64":
-            raise TypeError("Enceladus has no float64 support; use float32 instead.")
-        raise TypeError(f"torch dtype {t.dtype} has no Enceladus equivalent")
+            raise TypeError(
+                "Enceladus has no float64 type. Convert the tensor to float32 first, for "
+                "example with `x.float()`."
+            )
+        raise TypeError(
+            f"torch dtype {t.dtype} has no Enceladus equivalent. Convert the tensor to a "
+            "supported dtype, such as float32 or int32."
+        )
     return d
 
 
@@ -189,8 +195,14 @@ def mlx_np_dtype(a: Any) -> np.dtype:
 
         return np.dtype(ml_dtypes.bfloat16)
     if name == "float64":
-        raise TypeError("Enceladus has no float64 support; use float32 instead.")
-    raise TypeError(f"MLX dtype {a.dtype} has no Enceladus equivalent")
+        raise TypeError(
+            "Enceladus has no float64 type. Convert the array to float32 first, for example "
+            "with `x.astype(mx.float32)`."
+        )
+    raise TypeError(
+        f"MLX dtype {a.dtype} has no Enceladus equivalent. Convert the array to a supported "
+        "dtype, such as float32 or int32."
+    )
 
 
 @dataclass
@@ -210,7 +222,10 @@ def _mlx_view(a: Any) -> _MlxView:
     cap = a.__dlpack__()
     handle, dev_type, _, off, shape, strides, _ = _C.dlpack_inspect(cap)
     if dev_type != K_DL_METAL:
-        raise TypeError(f"MLX array exports DLPack device type {dev_type}, not kDLMetal (8)")
+        raise TypeError(
+            f"MLX array exports DLPack device type {dev_type}, not kDLMetal (8). Create the "
+            "array on the GPU device."
+        )
     if strides is None:
         strides = _contiguous(shape)
     return _MlxView(handle, off, tuple(shape), tuple(strides), cap)
@@ -278,7 +293,10 @@ def element_strides(obj: Any) -> tuple[int, ...]:
         return tuple(obj.stride())
     if fw == KIND_MLX:
         return _mlx_view(obj).strides
-    raise TypeError(f"{type(obj).__name__} isn't a supported array type")
+    raise TypeError(
+        f"{type(obj).__name__} isn't a supported array type. Pass an enceladus.Tensor, a "
+        "NumPy array, a torch tensor on the mps device, or an MLX array."
+    )
 
 
 def new_empty(like: Any, shape: Any = None, dtype: Any = None) -> Any:
@@ -314,7 +332,10 @@ def new_empty(like: Any, shape: Any = None, dtype: Any = None) -> Any:
         out = mx.zeros(shape, dtype=dtype)
         mx.eval(out)
         return out
-    raise TypeError(f"{type(like).__name__} isn't a supported array type")
+    raise TypeError(
+        f"{type(like).__name__} isn't a supported array type. Pass an enceladus.Tensor, a "
+        "NumPy array, a torch tensor on the mps device, or an MLX array."
+    )
 
 
 def as_tensor(obj: Any) -> Tensor:
@@ -418,7 +439,10 @@ def _from_numpy(a: np.ndarray) -> BufferArg:
             "pass np.ascontiguousarray(x) instead"
         )
     if any(s % itemsize for s in a.strides):
-        raise ValueError("NumPy argument strides must be multiples of the element size")
+        raise ValueError(
+            "NumPy argument strides must be multiples of the element size. Pass "
+            "np.ascontiguousarray(x) instead."
+        )
     strides = tuple(s // itemsize for s in a.strides)
     start = a.__array_interface__["data"][0]
     pairs = zip(a.shape, strides, strict=True)

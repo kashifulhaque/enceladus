@@ -22,7 +22,7 @@ from typing import Any
 from enceladus.compiler import ir
 from enceladus.compiler import layout as L
 from enceladus.compiler.codegen.emitter import Emitter, NameGen
-from enceladus.compiler.errors import CompilationError, Loc
+from enceladus.compiler.errors import CompilationError, Loc, internal_error
 from enceladus.compiler.passes.layouts import (
     ANCHORED,
     CHEAP,
@@ -295,8 +295,9 @@ class _Codegen:
         regs32 = lay.num_regs * max(1, nbytes // 4) if nbytes >= 4 else lay.num_regs
         if regs32 > MAX_REGS_ERROR:
             raise self.err(
-                f"a {'x'.join(map(str, lay.shape))} tile needs {regs32} registers per thread, "
-                f"more than the limit of {MAX_REGS_ERROR}; use smaller blocks or more num_warps"
+                f"a tile of shape {tuple(lay.shape)} needs {regs32} registers per thread, "
+                f"more than the limit of {MAX_REGS_ERROR}. Use smaller blocks, or launch with "
+                "a larger num_warps."
             )
         if regs32 > MAX_REGS_WARN:
             self.warnings.append(f"{self.loc}: a tile uses {regs32} registers per thread")
@@ -380,8 +381,9 @@ class _Codegen:
             self.tg_loc = self.loc
         if nbytes > self.max_tg:
             raise self.err(
-                f"this operation needs {nbytes} bytes of threadgroup memory, more than the "
-                f"device's {self.max_tg}; use smaller blocks"
+                f"this line needs {nbytes} bytes of threadgroup memory, more than the "
+                f"device's {self.max_tg} bytes. Use smaller blocks, or a narrower dtype such "
+                "as tl.float16 for the tiles on this line."
             )
 
     # ---- scalars ----
@@ -390,7 +392,7 @@ class _Codegen:
         try:
             return self.sv[id(v)]
         except KeyError:
-            raise self.err(f"internal error: scalar {v!r} used before its definition") from None
+            raise internal_error(f"scalar {v!r} used before its definition", self.loc) from None
 
     def bind_scalar(self, v: ir.Value, expr: str, hint: str | None = None) -> str:
         """Binds a scalar result to a fresh local initialized with `expr`."""
@@ -476,7 +478,7 @@ class _Codegen:
             return f"{CTYPES[out.name]}({a})"
         if name == "bitcast":
             return f"as_type<{CTYPES[out.name]}>({args[0]})"
-        raise self.err(f"internal error: `{name}` isn't elementwise")
+        raise internal_error(f"`{name}` isn't elementwise", self.loc)
 
     # ---- materialization ----
 
@@ -490,7 +492,7 @@ class _Codegen:
         if k == ANCHORED:
             t = self.tiles.get(id(v))
             if t is None:
-                raise self.err(f"internal error: tile {v!r} used before its definition")
+                raise internal_error(f"tile {v!r} used before its definition", self.loc)
             if t.layout == lay:
                 return t
             return self.memo_put(key, self.convert(t, lay, v))
@@ -549,7 +551,7 @@ class _Codegen:
         if op.name == "addptr":
             p, off = ins
             if not isinstance(p, Tile):
-                raise self.err("internal error: scalar pointer in a tile addptr")
+                raise internal_error("scalar pointer in a tile addptr", self.loc)
             o = off if isinstance(off, str) else None
             if isinstance(off, Tile) and off.uniform is not None:
                 o = off.uniform
@@ -572,12 +574,12 @@ class _Codegen:
         base = root = None
         if ptr_tiles:
             if op.name != "select":
-                raise self.err(f"pointers don't support `{op.name}`")
+                raise internal_error(f"pointer tile operand of `{op.name}`", self.loc)
             bases = {x.base for x in ptr_tiles}
             if len(bases) != 1 or len(ptr_tiles) != 2:
                 raise self.err(
                     "tl.where on pointers needs both pointers to derive from the same base "
-                    "pointer; select integer offsets instead"
+                    "pointer. Select integer offsets instead, and add them to one pointer."
                 )
             base, root = ptr_tiles[0].base, ptr_tiles[0].root
         if all(isinstance(x, str) or x.uniform is not None for x in ins):
@@ -684,11 +686,19 @@ class _Codegen:
 
                 self.tiles[id(res)] = emit_desc_load(self, op, lay)
             else:
-                raise self.err(f"`{name}` on tiles isn't supported by the MSL backend yet")
+                raise self.err(
+                    f"the MSL backend can't compile this operation on tiles (IR op `{name}`). "
+                    "Rewrite the line with other tl functions, or run the kernel in the "
+                    "interpreter with ENCELADUS_INTERPRET=1."
+                )
             return
         handler = getattr(self, "op_" + name, None)
         if handler is None:
-            raise self.err(f"`{name}` isn't supported by the MSL backend yet")
+            raise self.err(
+                f"the MSL backend can't compile this operation (IR op `{name}`). Rewrite the "
+                "line with other tl functions, or run the kernel in the interpreter with "
+                "ENCELADUS_INTERPRET=1."
+            )
         handler(op)
 
     def op_const(self, op: ir.Op) -> None:
@@ -715,7 +725,7 @@ class _Codegen:
             self.roots[id(op.result)] = self.roots[id(p)]
 
     def op_splat(self, op: ir.Op) -> None:
-        raise self.err("internal error: scalar splat")
+        raise internal_error("scalar splat", self.loc)
 
     def load(self, op: ir.Op, lay: L.BitLayout) -> Tile:
         res = op.result
@@ -823,7 +833,10 @@ class _Codegen:
         name = self.fresh(hint)
         if isinstance(t, ir.PointerType):
             if init_expr is None:
-                raise self.err("a pointer can't be the result of a runtime `if`; select an offset")
+                raise self.err(
+                    "a pointer can't be the result of a runtime `if`. Choose an integer offset "
+                    "in the `if`, and add it to the pointer after the `if`."
+                )
             decl = f"auto {name}"
         else:
             decl = f"{CTYPES[t.name]} {name}"
@@ -838,7 +851,7 @@ class _Codegen:
                 if src.base is not None and tgt.base is not None and src.base != tgt.base:
                     raise self.err(
                         "a pointer tile carried through a loop or `if` must keep the same "
-                        "base pointer; carry an integer offset tile instead"
+                        "base pointer. Carry an integer offset tile instead."
                     )
                 if tgt.base is None and src.base is not None:
                     tgt.base, tgt.root = src.base, src.root
@@ -978,17 +991,23 @@ class _Codegen:
                 args.append(KernelArg(name, i, False, t.name))
         if len(args) > 31:
             raise CompilationError(
-                f"a kernel can take at most 31 runtime arguments, but this one takes {len(args)}",
+                f"a kernel can take at most 31 runtime arguments, but this one takes "
+                f"{len(args)}. Mark compile-time values as tl.constexpr, or pack scalars into "
+                "an array.",
                 func.loc,
             )
         kname = self.names.reserve(self.m.name)
-        self.block(body)
+        try:
+            self.block(body)
+        except (AssertionError, AttributeError, IndexError, KeyError, TypeError, ValueError) as e:
+            # A compiler bug: report it at the line whose op was being compiled.
+            raise internal_error(f"{type(e).__name__}: {e}", self.loc) from e
         assert_index = len(args) if self.asserts else None
         if assert_index is not None and assert_index >= 31:
             raise CompilationError(
                 "tl.device_assert needs one buffer slot for its error buffer, and this kernel "
-                "uses all 31 for its runtime arguments; pass fewer arguments or unset "
-                "ENCELADUS_DEBUG", func.loc,
+                "uses all 31 for its runtime arguments. Pass fewer arguments, or unset "
+                "ENCELADUS_DEBUG.", func.loc,
             )  # fmt: skip
         for a in args:
             a.written = a.name in self.written

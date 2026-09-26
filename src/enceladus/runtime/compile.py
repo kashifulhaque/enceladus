@@ -12,6 +12,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import json
 import os
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import enceladus
 from enceladus.compiler.codegen.msl import KernelArg
-from enceladus.compiler.frontend import build_ir
+from enceladus.compiler.frontend import build_ir, is_jit_function
 from enceladus.compiler.pipeline import compile_module
 from enceladus.language import core
 from enceladus.runtime import cache, dot_backend
@@ -37,7 +38,24 @@ def _key(fn: JITFunction, spec: Specialization, num_warps: int, dot_warps,
     caps = get_device().caps
     parts = (fn.cache_key, spec.key(num_warps, fn.math_mode), dot_warps, enceladus.__version__,
              cache.compiler_hash(), cache.os_build(), caps.architecture, backend)  # fmt: skip
-    return cache.stable_hash(*parts, "debug") if debug else cache.stable_hash(*parts)
+    if not debug:
+        return cache.stable_hash(*parts)
+    # A debug build stores the file and line of each tl.device_assert, so a kernel that
+    # moved within its file, or to another file, must not reuse an entry with stale lines.
+    return cache.stable_hash(*parts, "debug", *_source_locations(fn, set()))
+
+
+def _source_locations(fn: JITFunction, seen: set[int]) -> list[str]:
+    """Returns `file:first_line` of `fn` and of every @enceladus.jit function it references."""
+    seen.add(id(fn))
+    src = fn.source_info()
+    out = [f"{src.file}:{src.first_line}"]
+    g = fn.fn.__globals__
+    for name in sorted({n.id for n in ast.walk(src.tree) if isinstance(n, ast.Name)}):
+        v = core.unwrap(g.get(name))
+        if is_jit_function(v) and id(v) not in seen:
+            out += _source_locations(v, seen)
+    return out
 
 
 def build_module(fn: JITFunction, spec: Specialization, num_warps: int,

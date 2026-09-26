@@ -24,6 +24,7 @@ from enceladus.compiler import ir
 from enceladus.compiler import layout as L
 from enceladus.compiler.codegen.msl import BARRIER, CTYPES, Tile, _add, literal
 from enceladus.compiler.codegen.scan import shfl
+from enceladus.compiler.errors import internal_error
 
 if TYPE_CHECKING:
     from enceladus.compiler.codegen.msl import _Codegen
@@ -119,10 +120,13 @@ def atomic_call(cg: _Codegen, kind: str, elem: ir.ScalarType, addr: str, val: st
                 "64-bit atomics return nothing. Don't use the result, or use 32-bit elements."
             )
         if _apple_family(cg) < 9:
-            raise cg.err(f"tl.atomic_{kind} on uint64 needs an Apple9 GPU (M3 or later)")
+            raise cg.err(
+                f"tl.atomic_{kind} on uint64 needs an Apple9 GPU (M3 or later). Use 32-bit "
+                "elements on this GPU."
+            )
         return f"atomic_{kind}_explicit((device atomic_ulong*)({addr}), {val}, {MO})"
     if n in ("i64", "u64", "i1"):
-        raise cg.err(f"internal error: atomic `{kind}` on {n} passed the frontend")
+        raise internal_error(f"atomic `{kind}` on {n} passed the frontend", cg.loc)
     helper = _cas_loop_helper(cg, kind, elem)
     return f"{helper}({addr}, {cmp}, {val})" if kind == "cas" else f"{helper}({addr}, {val})"
 

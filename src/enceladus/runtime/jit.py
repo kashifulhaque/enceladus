@@ -227,7 +227,10 @@ class JITFunction:
         params = []
         for i, (n, p) in enumerate(self.signature.parameters.items()):
             if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
-                raise TypeError(f"kernel `{fn.__name__}` can't take *args or **kwargs")
+                raise TypeError(
+                    f"kernel `{fn.__name__}` can't take *args or **kwargs. List every "
+                    "parameter by name."
+                )
             params.append(
                 KernelParam(n, i, core.is_constexpr_annotation(p.annotation), p.default, n in dns)
             )
@@ -321,14 +324,14 @@ class JITFunction:
             self._run_compiled(args, kwargs, grid, num_warps, dot_warps, dot_backend)
             return
         if num_warps not in (1, 2, 4, 8, 16, 32):
-            raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
+            raise ValueError(_num_warps_msg(num_warps))
         bound = self.bind(args, kwargs)
         g = _resolve_grid(grid, bound)
         if _env_flag("ENCELADUS_DUMP") or ir.verify_enabled():
             self._interp_ir(bound, num_warps)
         if any(interop.framework_of(v) is not None for v in bound.values()):
             # The interpreter works on NumPy views of the frameworks' shared memory.
-            bound = {k: interop.host_view(v) for k, v in bound.items()}
+            bound = {k: self._host_view(k, v) for k, v in bound.items()}
         interp.run_grid(self.fn, g, self._interp_args(bound))
 
     # ---- compiled execution ----
@@ -360,19 +363,47 @@ class JITFunction:
             self._spec_history: list[tuple] = []
         return b
 
-    def _run_compiled(self, args: tuple, kwargs: dict, grid: Any, num_warps: int,
-                      dot_warps: tuple[int, int] | None = None,
-                      dot_backend: str = "auto") -> None:  # fmt: skip
+    def _lookup(self, args: tuple, kwargs: dict, num_warps: int,
+                dot_warps: tuple[int, int] | None, dot_backend: str):  # fmt: skip
+        """Splits launch arguments into runtime and constexpr values, and returns them with
+        the specialization key and the compiled kernel for that key, or `None`."""
         binder = self._binder()
         try:
             runtime, consts = binder(*args, **kwargs)
+            # List comprehensions: this runs on every launch, and generators cost more.
+            key = (tuple([_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)]),
+                   tuple([_const_key(c) for c in consts]), num_warps, dot_warps,
+                   dot_backend, _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
+            return runtime, consts, key, self._compiled.get(key)
         except TypeError as e:
-            raise TypeError(f"{self.__name__}: {e}") from None
-        # List comprehensions: this runs on every launch, and generators cost more.
-        key = (tuple([_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)]),
-               tuple([core.unwrap(c) for c in consts]), num_warps, dot_warps,
-               dot_backend, _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
-        ck = self._compiled.get(key)
+            raise self._argument_error(args, kwargs, e) from None
+
+    def _argument_error(self, args: tuple, kwargs: dict, e: TypeError) -> TypeError:
+        """Returns an error that names the kernel and the argument that the fast launch path
+        rejected with `e`."""
+        try:
+            bound = self.bind(args, kwargs)
+            self.specialize(bound)
+        except TypeError as named:
+            return named
+        for p in self.params:
+            if not p.is_constexpr:
+                continue
+            v = core.unwrap(bound[p.name])
+            try:
+                hash(_const_key(v))
+            except TypeError:
+                return TypeError(
+                    f"{self.__name__}: the tl.constexpr parameter `{p.name}` needs a hashable "
+                    "value, such as a number, a string, a dtype, or a tuple, but got a "
+                    f"{type(v).__name__}"
+                )
+        return TypeError(f"{self.__name__}: {e}")
+
+    def _run_compiled(self, args: tuple, kwargs: dict, grid: Any, num_warps: int,
+                      dot_warps: tuple[int, int] | None = None,
+                      dot_backend: str = "auto") -> None:  # fmt: skip
+        runtime, consts, key, ck = self._lookup(args, kwargs, num_warps, dot_warps, dot_backend)
         if ck is None:
             ck = self._compile_for(runtime, consts, num_warps, key, dot_warps,
                                    dot_backend=dot_backend)
@@ -390,7 +421,7 @@ class JITFunction:
                      dot_warps: tuple[int, int] | None = None, record: bool = True,
                      dot_backend: str = "auto"):  # fmt: skip
         if num_warps not in (1, 2, 4, 8, 16, 32):
-            raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
+            raise ValueError(_num_warps_msg(num_warps))
         from enceladus.runtime import dot_backend as backends
         from enceladus.runtime.compile import compile_specialization
 
@@ -416,14 +447,9 @@ class JITFunction:
         Returns:
             A `CompiledKernel` with `msl`, `ir`, `threadgroup_memory_bytes`, and `num_warps`.
         """
-        binder = self._binder()
-        runtime, consts = binder(*args, **kwargs)
-        key = (tuple(_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)),
-               tuple(core.unwrap(c) for c in consts), num_warps, dot_warps,
-               dot_backend, _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
-        return self._compiled.get(key) or self._compile_for(runtime, consts, num_warps, key,
-                                                            dot_warps, _record,
-                                                            dot_backend)  # fmt: skip
+        runtime, consts, key, ck = self._lookup(args, kwargs, num_warps, dot_warps, dot_backend)
+        return ck or self._compile_for(runtime, consts, num_warps, key, dot_warps, _record,
+                                       dot_backend)  # fmt: skip
 
     def explain(self, *args: Any, grid: Any = None, num_warps: int = 4,
                 dot_warps: tuple[int, int] | None = None, dot_backend: str = "auto",
@@ -452,7 +478,7 @@ class JITFunction:
         from enceladus.runtime.device import get_device
 
         if num_warps not in (1, 2, 4, 8, 16, 32):
-            raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
+            raise ValueError(_num_warps_msg(num_warps))
         bound = self.bind(args, kwargs)
         g = _resolve_grid(grid, bound) if grid is not None else None
         module = build_module(self, self.specialize(bound), num_warps, dot_warps,
@@ -474,6 +500,12 @@ class JITFunction:
                 print(f"// Enceladus IR for {self.__name__}\n{module}", flush=True)
         return module
 
+    def _host_view(self, name: str, v: Any) -> Any:
+        try:
+            return interop.host_view(v)
+        except (TypeError, ValueError) as e:
+            raise type(e)(f"{self.__name__}: argument `{name}`: {e}") from None
+
     def _interp_args(self, bound: Mapping[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for p in self.params:
@@ -481,11 +513,14 @@ class JITFunction:
             if p.is_constexpr:
                 out[p.name] = core.unwrap(v)
                 continue
-            t = arg_type(v)
-            if isinstance(t, ir.PointerType):
-                out[p.name] = interp.pointer_from_array(v)
-            else:
-                out[p.name] = interp.scalar_arg(v, t.dtype)
+            try:
+                t = arg_type(v)
+                if isinstance(t, ir.PointerType):
+                    out[p.name] = interp.pointer_from_array(v)
+                else:
+                    out[p.name] = interp.scalar_arg(v, t.dtype)
+            except (TypeError, ValueError) as e:
+                raise type(e)(f"{self.__name__}: argument `{p.name}`: {e}") from None
         return out
 
 
@@ -495,7 +530,7 @@ def _resolve_grid(grid: Any, bound: Mapping[str, Any]) -> tuple[int, int, int]:
         g = (g,)
     g = tuple(int(x) for x in g)
     if not 1 <= len(g) <= 3:
-        raise ValueError(f"the grid needs 1 to 3 dimensions, but got {g}")
+        raise ValueError(_GRID_RANK_MSG.format(g))
     if any(x < 0 for x in g):
         raise ValueError(f"grid dimensions can't be negative, but got {g}")
     return (*g, *(1,) * (3 - len(g)))  # type: ignore[return-value]
@@ -506,10 +541,32 @@ def _normalize_grid(g: Any) -> tuple[int, int, int]:
         g = (g,)
     g = tuple(int(x) for x in g)
     if not 1 <= len(g) <= 3:
-        raise ValueError(f"the grid needs 1 to 3 dimensions, but got {g}")
+        raise ValueError(_GRID_RANK_MSG.format(g))
     if any(x < 0 for x in g):
         raise ValueError(f"grid dimensions can't be negative, but got {g}")
     return (*g, *(1,) * (3 - len(g)))  # type: ignore[return-value]
+
+
+def _num_warps_msg(num_warps: Any) -> str:
+    return f"num_warps must be a power of two from 1 to 32, but got {num_warps}"
+
+
+_GRID_RANK_MSG = (
+    "the grid needs 1 to 3 dimensions, but got {}. Pass a tuple such as `(n,)` or `(m, n)`."
+)
+
+
+def _const_key(v: Any) -> Any:
+    """Returns the part of the specialization key contributed by one constexpr value.
+
+    The key includes the type, because `1`, `1.0`, and `True` compare equal but compile to
+    different code.
+    """
+    v = core.unwrap(v)
+    t = type(v)
+    if t is tuple or t is list:
+        return (t, tuple([_const_key(x) for x in v]))
+    return (t, v)
 
 
 def _spec_key(v: Any, no_facts: bool) -> Any:

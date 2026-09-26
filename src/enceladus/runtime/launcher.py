@@ -286,7 +286,10 @@ class CompiledKernel:
         if grid[0] == 0 or grid[1] == 0 or grid[2] == 0:
             return
         if grid[0] > MAX_GRID or grid[1] > MAX_GRID or grid[2] > MAX_GRID:
-            raise ValueError(f"grid {grid} exceeds the device limit of {MAX_GRID} per dimension")
+            raise ValueError(
+                f"grid {grid} exceeds the device limit of {MAX_GRID} per dimension. Launch "
+                "fewer programs, for example by giving each program a larger block."
+            )
         debug = self._debug
         if debug:
             self._prepare_debug(get_device().stream)

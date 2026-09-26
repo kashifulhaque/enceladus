@@ -78,7 +78,7 @@ def matmul_configs(dtype: Any = "float16") -> list[Config]:
         shapes = _COMMON + _HALF_ONLY
     else:
         raise ValueError(f"matmul_configs supports float32, float16, and bfloat16, but got "
-                         f"{dtype!r}")  # fmt: skip
+                         f"{name}. Pass the dtype of the matmul operands.")  # fmt: skip
     configs = [Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=nw, dot_warps=dw)
                for bm, bn, bk, nw, dw in shapes]  # fmt: skip
     return configs + [Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=nw,
@@ -121,7 +121,7 @@ def attention_configs(dtype: Any = "float16", head_dim: int = 64) -> list[Config
     name = _dtype_name(dtype)
     if name not in _FP32_NAMES + _HALF_NAMES:
         raise ValueError(f"attention_configs supports float32, float16, and bfloat16, but got "
-                         f"{dtype!r}")  # fmt: skip
+                         f"{name}. Pass the dtype of q, k, and v.")  # fmt: skip
     if head_dim not in (16, 32, 64, 128):
         raise ValueError(f"attention_configs supports head dimensions 16, 32, 64, and 128, "
                          f"but got {head_dim}")  # fmt: skip

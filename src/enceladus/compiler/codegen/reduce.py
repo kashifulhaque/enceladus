@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from enceladus.compiler import ir
 from enceladus.compiler import layout as L
 from enceladus.compiler.codegen.msl import BARRIER, CTYPES, _add, _body_ops, is_float, is_half
+from enceladus.compiler.errors import internal_error
 
 if TYPE_CHECKING:
     from enceladus.compiler.codegen.msl import _Codegen
@@ -77,7 +78,7 @@ def emit_reduce(cg: _Codegen, op: ir.Op) -> None:
         rlay = cg.plan.layout_of(results[0])
         order = [L.coords_of(rlay, r) for r in range(rlay.num_regs)]
         if sorted(order) != sorted(groups):
-            raise cg.err("internal error: reduction result layout doesn't match its input")
+            raise internal_error("reduction result layout doesn't match its input", cg.loc)
     else:
         rlay = None
         order = list(groups)

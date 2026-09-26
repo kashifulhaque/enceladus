@@ -130,7 +130,8 @@ class MetalKernel:
         grid, tg = _dim3(key[0], "grid"), _dim3(key[1], "threads_per_group")
         if tg[0] * tg[1] * tg[2] > self._max_threads:
             raise ValueError(
-                f"threads_per_group {tg} exceeds the pipeline limit of {self._max_threads}"
+                f"threads_per_group {tg} exceeds the pipeline limit of {self._max_threads}. "
+                "Use fewer threads per threadgroup."
             )
         return _Launcher(self, grid, tg)
 
