@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 26 26">
+  <style>
+    .ring { stroke: #0C1920; }
+    .stripe { stroke: #006A7E; }
+    @media (prefers-color-scheme: dark) { .ring { stroke: #DDE8EC; } .stripe { stroke: #5CC6D6; } }
+  </style>
+  <circle class="ring" cx="13" cy="13" r="11.5" fill="none" stroke-width="1.8"/>
+  <path class="stripe" d="M6.5 16.5c2.2-1.2 4.6-1.6 7.2-1.1M8 19.4c2.4-1 5-1.2 7.6-.4M9.8 13.4c2-.9 4.2-1.1 6.4-.6" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+</svg>
