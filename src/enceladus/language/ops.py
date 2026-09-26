@@ -1107,6 +1107,140 @@ def static_print(ctx, *values, sep=" "):
 
 
 # ---------------------------------------------------------------------------
+# Device printing and asserts
+# ---------------------------------------------------------------------------
+
+
+def _print_prefix_arg(prefix: Any, hex: Any) -> str:
+    prefix = core.unwrap(prefix)
+    if not isinstance(prefix, str):
+        raise CompilationError(
+            f"tl.device_print needs a string prefix as its first argument, but got "
+            f"{describe(prefix)}. Write, for example, `tl.device_print(\"x\", x)`."
+        )
+    if not all(" " <= ch <= "~" for ch in prefix):
+        raise CompilationError("the tl.device_print prefix must be printable ASCII text")
+    if core.unwrap(hex):
+        raise CompilationError("tl.device_print doesn't support hex=True")
+    return prefix
+
+
+def _i_device_print(prefix, *args, hex=False):
+    from enceladus.compiler.codegen.debug import format_line, format_value
+
+    prefix = _print_prefix_arg(prefix, hex)
+    tiles = []
+    for a in args:
+        if isinstance(a, IPointer):
+            raise CompilationError("tl.device_print can't print pointers")
+        tiles.append(I.to_tile(core.unwrap(a)))
+    shape: tuple[int, ...] = ()
+    for t in tiles:
+        shape = semantic.broadcast_shapes(shape, t.shape)
+    pid = INTERP.program_id
+    data = [np.broadcast_to(t.data, shape) for t in tiles]
+    names = [t.dtype.ir_name for t in tiles]
+    lines = []
+    for idx in np.ndindex(*shape) if shape else [None]:
+        k = idx if idx is not None else ()
+        vals = [format_value(d[k], n) for d, n in zip(data, names, strict=True)]
+        lines.append(format_line(pid, idx, prefix, vals) + "\n")
+    import sys
+
+    sys.stderr.write("".join(lines))
+
+
+@builtin(interp=_i_device_print)
+def device_print(ctx, prefix, *args, hex=False):
+    """Prints runtime values from the GPU, one line per element, to `sys.stderr`.
+
+    Each line starts with the program ID, then the element's index for tiles, then the
+    prefix and the values, for example `pid (0, 0, 0) idx (3) x: 1.500000`. Tile
+    arguments broadcast to one shape, and each element prints once. Lines arrive when
+    the stream synchronizes, in no particular order. Printing is incompatible with
+    `enceladus.capture`.
+    """
+    b = ctx.b
+    prefix = _print_prefix_arg(prefix, hex)
+    vals = []
+    for a in args:
+        a = core.unwrap(a)
+        if semantic.is_pointer(a):
+            raise CompilationError("tl.device_print can't print pointers")
+        vals.append(semantic.to_value(b, a))
+    shape: tuple[int, ...] = ()
+    for v in vals:
+        shape = semantic.broadcast_shapes(shape, ir.shape_of(v.type))
+    if shape:
+        vals = [semantic.broadcast_to(b, v, shape) if isinstance(v.type, ir.TileType) else v
+                for v in vals]  # fmt: skip
+    b.create("print", vals, [], {"prefix": prefix})
+
+
+def _assert_message(msg: Any) -> str:
+    msg = core.unwrap(msg)
+    if not isinstance(msg, str):
+        raise CompilationError(
+            f"the tl.device_assert message must be a string, not {describe(msg)}"
+        )
+    return msg
+
+
+def _i_device_assert(cond, msg="", mask=None):
+    msg = _assert_message(msg)
+    if not core.debug_enabled():
+        return
+    c = I.to_tile(core.unwrap(cond))
+    if not c.dtype.is_bool():
+        raise CompilationError(f"tl.device_assert needs a boolean condition, but got {c.dtype}")
+    failed = ~c.data.astype(bool)
+    mask = core.unwrap(mask)
+    if mask is not None:
+        m = _itile(mask)
+        _check_mask_dtype(m.dtype)
+        failed, mb = np.broadcast_arrays(failed, m.data.astype(bool))
+        failed = failed & mb
+    if np.any(failed):
+        from enceladus.compiler.errors import DeviceAssertionError
+
+        raise DeviceAssertionError(msg, I.kernel_loc(), INTERP.program_id)
+
+
+@builtin(interp=_i_device_assert)
+def device_assert(ctx, cond, msg="", mask=None):
+    """Checks `cond` on the GPU and raises `enceladus.DeviceAssertionError` if it fails.
+
+    Asserts are active only when the environment sets `ENCELADUS_DEBUG=1`; otherwise the
+    compiler removes them. A failing assert records the first failing program and the
+    assert's source line, and the error is raised at the next synchronization. The
+    kernel keeps running after a failure, so guard dangerous accesses with a mask too.
+    Where `mask` is false, `cond` isn't checked. The interpreter raises immediately.
+    """
+    msg = _assert_message(msg)
+    if not getattr(ctx, "debug", False):
+        return
+    b = ctx.b
+    c = core.unwrap(cond)
+    if isinstance(c, (bool, np.bool_)):
+        c = semantic.const(b, bool(c), core.int1)
+    if not isinstance(c, ir.Value) or semantic.dtype_of(c) is not core.int1:
+        what = describe(c)
+        raise CompilationError(
+            f"tl.device_assert needs a boolean condition, such as `offs < n`, but got {what}"
+        )
+    ops = [c]
+    mask = core.unwrap(mask)
+    if mask is not None and mask is not True:
+        if not isinstance(mask, ir.Value):
+            raise CompilationError(f"`mask` must be a boolean tile, but got {describe(mask)}")
+        _check_mask_dtype(semantic.dtype_of(mask))
+        shape = semantic.broadcast_shapes(ir.shape_of(c.type), ir.shape_of(mask.type))
+        ops = [semantic.broadcast_to(b, c, shape) if shape else c,
+               semantic.broadcast_to(b, mask, shape) if shape else mask]  # fmt: skip
+    b.create("assert", ops, [], {"msg": msg})
+
+
+# ---------------------------------------------------------------------------
 # Tile methods
 # ---------------------------------------------------------------------------
 

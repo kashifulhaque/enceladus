@@ -7,6 +7,7 @@ the interpreter can all import it.
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -241,6 +242,33 @@ def is_constexpr_annotation(annotation: Any) -> bool:
 # ---------------------------------------------------------------------------
 # builtin registry
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ENCELADUS_DEBUG
+# ---------------------------------------------------------------------------
+
+_OFF = (b"", b"0", b"false", b"False")
+_ENV_DATA = getattr(os.environ, "_data", None)
+if type(_ENV_DATA) is dict:
+    # `os.environ` keeps its contents in `_data`, a dict of bytes that assignments and
+    # deletions through `os.environ` update. Its bound `get` costs one C call, several
+    # times less than `os.environ.get`, which matters because every launch reads it.
+    env_lookup = _ENV_DATA.get
+else:  # pragma: no cover - CPython always has `_data`
+
+    def env_lookup(key: bytes, default: bytes | None = None) -> bytes | None:
+        """Returns the raw value of environment variable `key`, or `default`."""
+        v = os.environ.get(key.decode())
+        return default if v is None else v.encode()
+
+
+def debug_enabled() -> bool:
+    """Returns whether `ENCELADUS_DEBUG` is set, which turns on `tl.device_assert`.
+
+    The flag is part of every kernel's specialization, so changing it recompiles.
+    """
+    return env_lookup(b"ENCELADUS_DEBUG", b"") not in _OFF
 
 
 class _InterpState:

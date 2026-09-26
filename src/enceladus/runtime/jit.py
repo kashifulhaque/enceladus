@@ -45,6 +45,11 @@ RECOMPILE_WARNING = 16
 
 MATH_MODES = ("relaxed", "fast")
 
+# The raw ENCELADUS_DEBUG value is part of the in-memory specialization key, because the
+# flag decides whether tl.device_assert compiles. Reading it through a bound C method
+# avoids a Python call per launch.
+_debug_key = core.env_lookup
+
 
 def cdiv(x: int, div: int) -> int:
     """Returns `ceil(x / div)` for positive integers: the number of blocks that cover `x`."""
@@ -361,7 +366,8 @@ class JITFunction:
             raise TypeError(f"{self.__name__}: {e}") from None
         # List comprehensions: this runs on every launch, and generators cost more.
         key = (tuple([_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)]),
-               tuple([core.unwrap(c) for c in consts]), num_warps, dot_warps)  # fmt: skip
+               tuple([core.unwrap(c) for c in consts]), num_warps, dot_warps,
+               _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
         ck = self._compiled.get(key)
         if ck is None:
             ck = self._compile_for(runtime, consts, num_warps, key, dot_warps)
@@ -404,9 +410,42 @@ class JITFunction:
         binder = self._binder()
         runtime, consts = binder(*args, **kwargs)
         key = (tuple(_spec_key(v, d) for v, d in zip(runtime, self._dns, strict=True)),
-               tuple(core.unwrap(c) for c in consts), num_warps, dot_warps)  # fmt: skip
+               tuple(core.unwrap(c) for c in consts), num_warps, dot_warps,
+               _debug_key(b"ENCELADUS_DEBUG"))  # fmt: skip
         return self._compiled.get(key) or self._compile_for(runtime, consts, num_warps, key,
                                                             dot_warps, _record)  # fmt: skip
+
+    def explain(self, *args: Any, grid: Any = None, num_warps: int = 4,
+                dot_warps: tuple[int, int] | None = None, **kwargs: Any) -> str:  # fmt: skip
+        """Prints and returns what the compiler decided for these arguments.
+
+        The report lists each tile's layout and register estimate, the layout
+        conversions and how codegen performs them, threadgroup memory use, and the
+        `tl.dot` backend, each with its source line. It compiles the kernel's IR and MSL
+        but doesn't launch it or create a Metal pipeline.
+
+        Args:
+            *args: The launch arguments, as for `kernel[grid](...)`.
+            grid: The launch grid, shown in the report's header.
+            num_warps: SIMD groups per program.
+            dot_warps: The `(WM, WN)` SIMD-group grid for `tl.dot`.
+            **kwargs: Keyword launch arguments, including constexprs.
+
+        Returns:
+            The report text.
+        """
+        from enceladus.compiler.explain import explain_kernel
+        from enceladus.runtime.compile import build_module
+        from enceladus.runtime.device import get_device
+
+        if num_warps not in (1, 2, 4, 8, 16, 32):
+            raise ValueError(f"num_warps must be a power of two from 1 to 32, got {num_warps}")
+        bound = self.bind(args, kwargs)
+        g = _resolve_grid(grid, bound) if grid is not None else None
+        module = build_module(self, self.specialize(bound), num_warps, dot_warps)
+        text = explain_kernel(module, get_device().caps.max_threadgroup_memory, g)
+        print(text)
+        return text
 
     def _interp_ir(self, bound: Mapping[str, Any], num_warps: int) -> ir.Module:
         """Builds and verifies the IR once per specialization, printing it for ENCELADUS_DUMP."""

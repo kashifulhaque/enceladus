@@ -15,6 +15,7 @@ A launch takes one of three paths:
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import logging
 import struct
@@ -168,11 +169,13 @@ def log_fallback(name: str, reason: str) -> None:
 
 
 def launch_synced(stream: Any, pipeline: Any, plan: Any, bufs_values: Sequence[Any],
-                  scalars: bytes, grid: tuple, tg: tuple) -> None:  # fmt: skip
+                  scalars: bytes, grid: tuple, tg: tuple,
+                  extra_bufs: Sequence[Any] = ()) -> None:  # fmt: skip
     """Dispatches on Enceladus's stream between syncs with PyTorch's stream.
 
     Waits for PyTorch's pending work, binds every array argument (evaluating MLX arrays),
     dispatches, and waits until the GPU finishes, so PyTorch and MLX read the results.
+    `extra_bufs` are native buffers bound after the arguments, such as an error buffer.
     """
     interop.torch_synchronize()
     bufs, offsets = [], []
@@ -183,6 +186,9 @@ def launch_synced(stream: Any, pipeline: Any, plan: Any, bufs_values: Sequence[A
         stream.keep_alive(ba.owner)
         if ba.writeback is not None:
             stream.after_sync(ba.writeback)
+    for b in extra_bufs:
+        bufs.append(b)
+        offsets.append(0)
     stream.native.dispatch(pipeline, plan, bufs, offsets, scalars, grid, tg)
     stream.synchronize()
 
@@ -203,6 +209,12 @@ class CompiledKernel:
         threadgroup_memory_bytes: Threadgroup memory the kernel declares.
         cache_dir: The on-disk cache entry, if one was written.
         math_mode: The Metal math mode the kernel compiles with.
+        language_version: The MSL version the kernel compiles with, as (major, minor).
+        enable_logging: Whether the kernel prints with `tl.device_print`. Such a kernel
+            runs on the stream's logging queue and never on the PyTorch path.
+        asserts: The kernel's `tl.device_assert` calls, as dicts with `message`, `file`,
+            `line`, and `col`, indexed as in the error buffer.
+        assert_buffer_index: The buffer index of the error buffer, or None.
     """
 
     name: str
@@ -215,17 +227,51 @@ class CompiledKernel:
     cache_dir: str | None = None
     warnings: list[str] = field(default_factory=list)
     math_mode: str = "relaxed"
+    language_version: tuple[int, int] = (3, 2)
+    enable_logging: bool = False
+    asserts: list[dict[str, Any]] = field(default_factory=list)
+    assert_buffer_index: int | None = None
 
     def __post_init__(self) -> None:
         self._ptr_idx = [i for i, a in enumerate(self.args) if a.is_pointer]
         self._scalar_idx = [i for i, a in enumerate(self.args) if not a.is_pointer]
         self._packer = struct.Struct("<" + "".join(self.args[i].struct_format
                                                    for i in self._scalar_idx))  # fmt: skip
-        self._plan = _C.LaunchPlan([self.args[i].index for i in self._ptr_idx],
-                                   scalar_slots(self.args))  # fmt: skip
+        buf_index = [self.args[i].index for i in self._ptr_idx]
+        # Buffers bound after the arguments: the device-assert error buffer, if any.
+        self._extra_bufs: list[Any] = []
+        self.assert_buffer = None
+        if self.assert_buffer_index is not None:
+            self.assert_buffer = _C.new_buffer(get_device().native, 32)
+            ctypes.memset(self.assert_buffer.ptr, 0, 32)
+            self._extra_bufs.append(self.assert_buffer)
+            buf_index.append(self.assert_buffer_index)
+        self._plan = _C.LaunchPlan(buf_index, scalar_slots(self.args))
         self._tg = (self.num_warps * 32, 1, 1)
         self._torch: TorchLaunch | str | None = None  # a reason string if unavailable
         self._fallback_logged = False
+        self._debug = self.enable_logging or self.assert_buffer is not None
+        if self.enable_logging:
+            self._torch = ("it calls tl.device_print, which needs Enceladus's logging queue; "
+                           "torch.mps.compile_shader can't attach one")  # fmt: skip
+        elif self.assert_buffer is not None:
+            self._torch = "it has device asserts (ENCELADUS_DEBUG=1), which bind an error buffer"
+
+    def _prepare_debug(self, stream: Any) -> None:
+        """Readies the stream for a launch that prints or asserts."""
+        if self.enable_logging:
+            stream.enable_logging()
+            stream.native.mark_logging()
+        if self.assert_buffer is not None:
+            stream.watch_asserts(self)
+
+    def assert_error(self, index: int, program_id: tuple[int, int, int]) -> Exception:
+        """Returns the `DeviceAssertionError` for assert `index` failing in `program_id`."""
+        from enceladus.compiler.errors import DeviceAssertionError, Loc
+
+        a = self.asserts[index] if index < len(self.asserts) else {"message": "?", "file": ""}
+        loc = Loc(a["file"], a["line"], a.get("col", 1)) if a["file"] else None
+        return DeviceAssertionError(a["message"], loc, program_id)
 
     def launch(self, grid: tuple[int, int, int], values: Sequence[Any]) -> None:
         """Launches with runtime argument values in signature order."""
@@ -233,6 +279,9 @@ class CompiledKernel:
             return
         if grid[0] > MAX_GRID or grid[1] > MAX_GRID or grid[2] > MAX_GRID:
             raise ValueError(f"grid {grid} exceeds the device limit of {MAX_GRID} per dimension")
+        debug = self._debug
+        if debug:
+            self._prepare_debug(get_device().stream)
         tl = self._torch
         if type(tl) is TorchLaunch:  # the PyTorch hot path: every array is an MPS tensor
             tensor_type = sys.modules["torch"].Tensor
@@ -264,6 +313,9 @@ class CompiledKernel:
                 stream.keep_alive(ba.owner)
             if ba.writeback is not None:
                 stream.after_sync(ba.writeback)
+        if debug and self._extra_bufs:
+            bufs += self._extra_bufs
+            offsets += [0] * len(self._extra_bufs)
         scalars = self._packer.pack(*[values[i] for i in self._scalar_idx])
         stream.native.dispatch(self.pipeline, self._plan, bufs, offsets, scalars, grid, self._tg)
         if sync:
@@ -299,16 +351,20 @@ class CompiledKernel:
                 _check_writable(values[i], self.args[i].name)
         scalars = self._packer.pack(*[values[i] for i in self._scalar_idx])
         launch_synced(get_device().stream, self.pipeline, self._plan,
-                      [values[i] for i in self._ptr_idx], scalars, grid, self._tg)  # fmt: skip
+                      [values[i] for i in self._ptr_idx], scalars, grid, self._tg,
+                      self._extra_bufs)  # fmt: skip
 
     def timed_launch(self, grid: tuple[int, int, int], values: Sequence[Any]) -> float:
         """Runs one launch in its own command buffer and returns its GPU time in seconds."""
         interop.torch_synchronize()
+        stream = get_device().stream
+        if self._debug:
+            self._prepare_debug(stream)
         bufs = [as_kernel_arg(values[i]) for i in self._ptr_idx]
         scalars = self._packer.pack(*[values[i] for i in self._scalar_idx])
-        t0, t1 = get_device().stream.native.timed_run(
-            self.pipeline, self._plan, [b.buffer for b in bufs], [b.byte_offset for b in bufs],
-            scalars, grid, self._tg,
+        t0, t1 = stream.native.timed_run(
+            self.pipeline, self._plan, [b.buffer for b in bufs] + self._extra_bufs,
+            [b.byte_offset for b in bufs] + [0] * len(self._extra_bufs), scalars, grid, self._tg,
         )  # fmt: skip
         return t1 - t0
 

@@ -185,6 +185,7 @@ class CodeGenerator(ast.NodeVisitor):
         self.in_kernel = True
         self.scoped_out: dict[str, str] = {}
         self.truth_context = False
+        self.debug = False  # keep tl.device_assert checks (ENCELADUS_DEBUG)
 
     # ---- infrastructure ----
 
@@ -958,6 +959,7 @@ def build_ir(
     num_warps: int = 4,
     math_mode: str = "relaxed",
     verify: bool = True,
+    debug: bool | None = None,
 ) -> ir.Module:
     """Builds and verifies the IR for one specialization of a kernel.
 
@@ -976,6 +978,8 @@ def build_ir(
         num_warps: The number of SIMD groups per program, stored as a module attribute.
         math_mode: `"relaxed"` or `"fast"`, stored as a module attribute.
         verify: Whether to run the IR verifier on the result.
+        debug: Whether to keep `tl.device_assert` checks. `None` reads
+            `ENCELADUS_DEBUG`. A debug module has the attribute `debug = True`.
 
     Returns:
         The kernel's `ir.Module`. `str(module)` is the printed IR.
@@ -1020,13 +1024,18 @@ def build_ir(
     known_one = {id(a) for a, f in zip(block.args, facts, strict=True) if f.get("equal_to_1")}
     builder = ir.Builder()
     builder.block = block
+    if debug is None:
+        debug = core.debug_enabled()
     cg = CodeGenerator(fn, builder, known_one)
+    cg.debug = debug
     cg.run_kernel(scope)
     attrs = {
         "num_warps": num_warps,
         "math_mode": math_mode,
         "constexprs": {k: _attr_value(v) for k, v in cvals.items()},
     }
+    if debug:
+        attrs["debug"] = True
     module = ir.Module(func, attrs)
     if verify:
         ir.verify(module)
