@@ -34,6 +34,7 @@ from enceladus.compiler.passes.layouts import (
     store_layout,
     view_source_layout,
 )
+from enceladus.compiler.passes.widen_index import needs_idx64
 
 PRELUDE = (Path(__file__).parent / "prelude.metal").read_text()
 
@@ -89,8 +90,11 @@ def offset_type(module: ir.Module) -> str:
     """Returns the C type of pointer-tile offsets in `module`.
 
     Offsets are `int` unless some pointer tile gets an offset that doesn't fit in 32 bits,
-    such as an `int64` one. Then every pointer tile in the kernel uses `long` offsets.
+    such as an `int64` one, or some argument has the `idx64` fact. Then every pointer tile
+    in the kernel uses `long` offsets.
     """
+    if needs_idx64(module):
+        return "long"
     for op in module.walk():
         if op.name == "addptr" and isinstance(op.result.type, ir.TileType):
             if ir.elem_of(op.operands[1].type).name in WIDE_OFFSETS:
@@ -194,6 +198,8 @@ class GeneratedKernel:
             every `tl.dot` uses `simdgroup_matrix`, and None for a kernel without `tl.dot`.
         dot_fallbacks: Why each `tl.dot` that `dot_backend="mpp"` asked for uses
             `simdgroup` instead.
+        idx64: Whether some argument has the `idx64` fact, so the kernel computes its
+            index math and pointer offsets in 64 bits.
     """
 
     name: str
@@ -210,6 +216,7 @@ class GeneratedKernel:
     plan: Any = None
     dot_backend: str | None = None
     dot_fallbacks: list[str] = field(default_factory=list)
+    idx64: bool = False
 
 
 class _Codegen:
@@ -1233,7 +1240,7 @@ class _Codegen:
             kname, out.text(), args, self.nw, self.tg_bytes, self.warnings,
             language_version=self.language_version, enable_logging=self.enable_logging,
             asserts=self.asserts, assert_buffer_index=assert_index, report=self.report,
-            plan=self.plan,
+            plan=self.plan, idx64=needs_idx64(self.m),
         )  # fmt: skip
         if any(op.name == "dot" for op in self.m.walk()):
             gen.dot_backend = "mpp" if self.mpp is not None and self.mpp.loops else "simdgroup"
