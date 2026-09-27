@@ -76,8 +76,16 @@ The following behavior differs from Triton.
 - Memory ordering is relaxed only. `sem` accepts only `None` and `"relaxed"`, and
   `scope` accepts `None`, `"gpu"`, and `"cta"`.
 - `float16` and `bfloat16` `atomic_add` isn't supported. Accumulate in `float32`.
-- Of the 64-bit atomics, only `uint64` `atomic_max` and `atomic_min` are supported,
-  and only when you don't use the returned value.
+- Of the 64-bit atomics, only `uint64` `atomic_max` and `atomic_min` are supported, on
+  Apple9 GPUs (M3 or later), and only when you don't use the returned value. These are
+  the only 64-bit atomics that Metal has, and Metal has no 64-bit compare-and-swap to
+  build others from. Port 64-bit atomics as follows:
+  - Use 32-bit elements where the values fit.
+  - For a 64-bit sum, keep the low and high halves in two `uint32` buffers. Add to the
+    low half, and add the high half plus the carry to the high half. The pair is exact
+    after the kernel ends.
+  - For `int64` `max` or `min`, store each value as `uint64` with its sign bit flipped,
+    which keeps the order, and flip the bit back afterward.
 - 8-bit and 16-bit atomics, `float32` `max` and `min`, and `atomic_cas` run as
   compare-and-swap loops on the surrounding 32-bit word, which is slower than a native
   atomic.

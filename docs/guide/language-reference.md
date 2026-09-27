@@ -559,7 +559,7 @@ These functions update device memory atomically and return the previous values.
 
 Atomically adds `val` to each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. `float16` and `bfloat16` addition isn't supported; accumulate in a `float32` buffer instead.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. `float16` and `bfloat16` addition isn't supported; accumulate in a `float32` buffer instead.
 
 ### `tl.atomic_max`
 
@@ -567,7 +567,7 @@ Atomically adds `val` to each element that `pointer` points to, where `mask` is 
 
 Atomically stores the maximum of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. For floats, a NaN operand is ignored, as in `tl.maximum`. `uint64` is supported only when you don't use the result.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. For floats, a NaN operand is ignored, as in `tl.maximum`. `uint64` needs an Apple9 GPU (M3 or later), and you can't use its result.
 
 ### `tl.atomic_min`
 
@@ -575,7 +575,7 @@ Atomically stores the maximum of `val` and each element that `pointer` points to
 
 Atomically stores the minimum of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. For floats, a NaN operand is ignored, as in `tl.minimum`. `uint64` is supported only when you don't use the result.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. For floats, a NaN operand is ignored, as in `tl.minimum`. `uint64` needs an Apple9 GPU (M3 or later), and you can't use its result.
 
 ### `tl.atomic_xchg`
 
@@ -583,7 +583,7 @@ Atomically stores the minimum of `val` and each element that `pointer` points to
 
 Atomically stores `val` in each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported.
 
 ### `tl.atomic_and`
 
@@ -591,7 +591,7 @@ Atomically stores `val` in each element that `pointer` points to, where `mask` i
 
 Atomically stores the bitwise AND of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. The elements must be integers.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. The elements must be integers.
 
 ### `tl.atomic_or`
 
@@ -599,7 +599,7 @@ Atomically stores the bitwise AND of `val` and each element that `pointer` point
 
 Atomically stores the bitwise OR of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. The elements must be integers.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. The elements must be integers.
 
 ### `tl.atomic_xor`
 
@@ -607,7 +607,7 @@ Atomically stores the bitwise OR of `val` and each element that `pointer` points
 
 Atomically stores the bitwise XOR of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. The elements must be integers.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. The elements must be integers.
 
 ### `tl.atomic_cas`
 

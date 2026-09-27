@@ -1485,6 +1485,38 @@ def _check_sem(sem: Any, scope: Any, fname: str) -> None:
         )
 
 
+# What Metal offers for 64-bit atomics, as probed on macOS 27 (MSL 3.2 to 4.1, Apple9):
+# `atomic_max_explicit` and `atomic_min_explicit` on `device atomic_ulong`, which return
+# void. There's no `atomic_long`, and no 64-bit fetch, exchange, load, store, or
+# compare-and-swap, even through the compiler's `__metal_atomic_*` builtins. Without a
+# 64-bit compare-and-swap, no other 64-bit atomic can be built.
+_ATOMIC64_LIMITS = (
+    "Metal's only 64-bit atomics are uint64 tl.atomic_max and tl.atomic_min, which return "
+    "no old value and need an Apple9 GPU (M3 or later). Metal has no 64-bit "
+    "compare-and-swap, so Enceladus can't build other 64-bit atomics from one."
+)
+_ATOMIC64_HINT = {
+    "add": "Use int32 or uint32 elements. For a 64-bit sum, keep the low and high halves "
+           "in two uint32 buffers: `old = tl.atomic_add(lo_ptr, lo)`, then add "
+           "`hi + (old + lo < old)` to the high half. The pair is exact after the kernel "
+           "ends.",
+    "max": "For int64, store each value as uint64 with its sign bit flipped "
+           "(`x ^ (1 << 63)`), which keeps the order, use uint64 tl.atomic_max, and flip "
+           "the bit back afterward.",
+    "min": "For int64, store each value as uint64 with its sign bit flipped "
+           "(`x ^ (1 << 63)`), which keeps the order, use uint64 tl.atomic_min, and flip "
+           "the bit back afterward.",
+    "and": "Use 32-bit elements, or apply the operation to each uint32 half through a "
+           "uint32 view of the buffer.",
+    "or": "Use 32-bit elements, or apply the operation to each uint32 half through a "
+          "uint32 view of the buffer.",
+    "xor": "Use 32-bit elements, or apply the operation to each uint32 half through a "
+           "uint32 view of the buffer.",
+    "xchg": "Use 32-bit elements.",
+    "cas": "Use 32-bit elements.",
+}
+
+
 def check_atomic_dtype(kind: str, dt: core.dtype, fname: str) -> None:
     """Raises an error when no backend can run atomic `kind` on elements of `dt`.
 
@@ -1509,9 +1541,7 @@ def check_atomic_dtype(kind: str, dt: core.dtype, fname: str) -> None:
         )
     if dt.primitive_bitwidth == 64 and not (dt is core.uint64 and kind in ("max", "min")):
         raise CompilationError(
-            f"tl.{fname} doesn't support {dt}: Metal has 64-bit atomics only for uint64 "
-            "tl.atomic_max and tl.atomic_min, and those return no old value. Use 32-bit "
-            "elements, or uint64 max and min whose result you don't use."
+            f"tl.{fname} doesn't support {dt}. {_ATOMIC64_LIMITS} {_ATOMIC64_HINT[kind]}"
         )
 
 
@@ -1631,10 +1661,10 @@ def _make_atomic(kind: str) -> core.Builtin:
     notes = {
         "add": "`float16` and `bfloat16` addition isn't supported; accumulate in a `float32` "
                "buffer instead.",
-        "max": "For floats, a NaN operand is ignored, as in `tl.maximum`. `uint64` is "
-               "supported only when you don't use the result.",
-        "min": "For floats, a NaN operand is ignored, as in `tl.minimum`. `uint64` is "
-               "supported only when you don't use the result.",
+        "max": "For floats, a NaN operand is ignored, as in `tl.maximum`. `uint64` needs an "
+               "Apple9 GPU (M3 or later), and you can't use its result.",
+        "min": "For floats, a NaN operand is ignored, as in `tl.minimum`. `uint64` needs an "
+               "Apple9 GPU (M3 or later), and you can't use its result.",
         "xchg": "",
         "and": "The elements must be integers.",
         "or": "The elements must be integers.",
@@ -1645,8 +1675,9 @@ def _make_atomic(kind: str) -> core.Builtin:
         "`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. "
         "Returns the values that memory held before the operation, or 0 where `mask` is "
         "false. Memory ordering is relaxed: `sem` accepts only `None` and `\"relaxed\"`, "
-        "and `scope` accepts `None`, `\"gpu\"`, and `\"cta\"`. 64-bit elements other "
-        f"than `uint64` `max` and `min` aren't supported. {notes}"
+        "and `scope` accepts `None`, `\"gpu\"`, and `\"cta\"`. Metal has no 64-bit "
+        "atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't "
+        f"supported. {notes}"
     ).rstrip() + "\n"
     return builtin(interp=interp, name=fname)(frontend)
 
