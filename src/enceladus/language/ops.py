@@ -669,8 +669,13 @@ def _to(ctx, x, dtype, bitcast=False, fp_downcast_rounding=None):
     """Converts `x` to `dtype`, or reinterprets its bits when `bitcast=True`.
 
     The tile method `x.to(dtype)` does the same. Float-to-integer conversion truncates
-    toward zero. Conversion to `int1` is `x != 0`. A bitcast needs types of the same
-    width. `fp_downcast_rounding` accepts only `None` and `"rtne"`.
+    toward zero. For a value out of the integer type's range, both execution modes give
+    what Metal gives on Apple GPUs: NaN becomes 0; `int64` wraps the truncated value
+    modulo 2**64 and turns infinities into 0; and every other integer type saturates to
+    its minimum or maximum. For example, -2.5 converts to 0 as `uint8` and to -2 as
+    `int8`, and 300.0 converts to 255 as `uint8`. Conversion to `int1` is `x != 0`. A
+    bitcast needs types of the same width. `fp_downcast_rounding` accepts only `None`
+    and `"rtne"`.
     """
     if fp_downcast_rounding not in (None, "rtne"):
         raise CompilationError(
