@@ -109,20 +109,21 @@ def test_axis_info_tracks_contiguity_and_order():
 
 
 @enceladus.jit
-def _dot_shared_acc(a_ptr, b_ptr, out_ptr, iters, N: tl.constexpr, CASE: tl.constexpr):
+def _dot_shared_acc(a_ptr, b_ptr, out_ptr, iters, N: tl.constexpr, CASE: tl.constexpr,
+                    ACC: tl.constexpr):  # fmt: skip
     r = tl.arange(0, N)
     a = tl.load(a_ptr + r[:, None] * N + r[None, :])
     b = tl.load(b_ptr + r[:, None] * N + r[None, :])
     acc = tl.dot(a, b)
     if CASE == "loop":
-        res = tl.zeros((N, N), tl.float32)
+        res = tl.zeros((N, N), ACC)
         for _ in range(iters):
             res = tl.dot(a, b, acc)
         acc = res
     elif CASE == "nested":
         # `acc` is carried by the outer loop but reused unchanged by every inner iteration.
         for _ in range(iters):
-            res = tl.zeros((N, N), tl.float32)
+            res = tl.zeros((N, N), ACC)
             for _ in range(iters):
                 res = tl.dot(a, b, acc)
             acc = res
@@ -132,23 +133,26 @@ def _dot_shared_acc(a_ptr, b_ptr, out_ptr, iters, N: tl.constexpr, CASE: tl.cons
     tl.store(out_ptr + r[:, None] * N + r[None, :], acc)
 
 
+# Integer dots keep the accumulator in plain registers, so their in-place logic differs.
+@pytest.mark.parametrize(("dtype", "acc"), [(np.float32, np.float32), (np.int8, np.int32)])
 @pytest.mark.parametrize(("case", "iters", "scale"), [
     ("loop", 1, 2), ("loop", 2, 2), ("loop", 3, 2), ("nested", 2, 3), ("nested", 3, 4),
     ("view", 1, 3),
 ])  # fmt: skip
-def test_dot_updates_its_accumulator_in_place_only_when_nothing_rereads_it(rng_np, case, iters,
-                                                                           scale):  # fmt: skip
+def test_dot_updates_its_accumulator_in_place_only_when_nothing_rereads_it(
+        rng_np, case, iters, scale, dtype, acc):  # fmt: skip
     # Each case gives the accumulator a single use, the dot, while its storage is read again:
     # by the next loop iteration, or through another value.
-    a = rng_np.integers(-2, 3, (16, 16)).astype(np.float32)
-    b = rng_np.integers(-2, 3, (16, 16)).astype(np.float32)
+    a = rng_np.integers(-2, 3, (16, 16)).astype(dtype)
+    b = rng_np.integers(-2, 3, (16, 16)).astype(dtype)
 
     def run(a, b):
-        out = np.empty_like(a)
-        _dot_shared_acc[(1,)](a, b, out, iters, N=16, CASE=case)
+        out = np.empty(a.shape, acc)
+        acc_t = tl.float32 if acc is np.float32 else tl.int32
+        _dot_shared_acc[(1,)](a, b, out, iters, N=16, CASE=case, ACC=acc_t)
         return out
 
-    check_kernel(run, (a, b), lambda a, b: scale * (a @ b))
+    check_kernel(run, (a, b), lambda a, b: scale * (a.astype(acc) @ b.astype(acc)))
 
 
 @enceladus.jit

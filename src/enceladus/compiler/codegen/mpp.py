@@ -333,6 +333,11 @@ def _analyze(dot: ir.Op, users, num_warps: int) -> tuple[MppLoop, set[int]]:
         raise _Ineligible(f"num_warps={num_warps} is more than the {MAX_WARPS} SIMD groups that "
                           "Enceladus validates for matmul2d")  # fmt: skip
     in_t, acc_t = a.type.elem.name, dot.result.type.elem.name
+    if acc_t == "i32":
+        # On Apple9, int8 x int8 -> int32 matmul2d compiles but sums in float32, so it
+        # returned wrong results once a sum passed 2^24 (for uint8, with random data).
+        raise _Ineligible("integer matmul2d isn't exact on every GPU, so integer dots use "
+                          "the exact simdgroup lowering")  # fmt: skip
     if (in_t, acc_t) not in TYPES:
         raise _Ineligible(f"matmul2d doesn't support {in_t} operands with a {acc_t} accumulator")
     oa = _operand(a, dot, loop, users, True)

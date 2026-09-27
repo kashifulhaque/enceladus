@@ -73,6 +73,15 @@ def _small_dot_k(x_ptr, M: tl.constexpr, K: tl.constexpr):
 
 
 @enceladus.jit
+def _int_dot_float_acc(x_ptr, out_ptr, N: tl.constexpr):
+    r = tl.arange(0, N)
+    x = tl.load(x_ptr + r[:, None] * N + r[None, :])
+    acc = tl.zeros((N, N), dtype=tl.float32)
+    acc = tl.dot(x, x, acc)  # error
+    tl.store(out_ptr + r[:, None] * N + r[None, :], acc)
+
+
+@enceladus.jit
 def _tg_overflow(x_ptr, y_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
     rm = tl.arange(0, M)
     rn = tl.arange(0, N)
@@ -192,6 +201,10 @@ KERNEL_CASES = [
     (_small_dot_k, lambda: _small_dot_k[(1,)](np.zeros((16, 16), np.float32), M=16, K=4),
      ("compiled",), "Use a K block size of at least 8"),
     (_tg_overflow, _tg_overflow_launch, ("compiled",), "Use smaller blocks"),
+    (_int_dot_float_acc,
+     lambda: _int_dot_float_acc[(1,)](np.zeros((16, 16), np.int8), np.zeros((16, 16), np.float32),
+                                     N=16),
+     ("interpret", "compiled"), "`tl.zeros(..., dtype=tl.int32)`"),
     (_literal_out_of_range_merge,
      lambda: _literal_out_of_range_merge[(1,)](X, np.zeros(1, np.uint8), 0), ("compiled",),
      "Convert the tl.uint8 value with `.to(tl.int32)`"),

@@ -12,7 +12,7 @@ The following table maps chips to Metal GPU families. Source: [Metal Feature Set
 |---|---|---|
 | M1 series, A14 | Apple7 | SIMD-group matrix, SIMD reductions, and float atomics start here. The Metal 4 API is available from Apple7. |
 | M2 series, A15, A16 | Apple8 | Only `ulong` atomic min and max (macOS only). SIMD shift-and-fill. |
-| M3 and M4 series, A17 Pro, A18 | Apple9 | Dynamic caching, full 64-bit atomics, hardware BF16 (as MFA's code treats it). |
+| M3 and M4 series, A17 Pro, A18 | Apple9 | Dynamic caching, 64-bit atomics (only `ulong` min and max compile; see [Atomics](#atomics)), hardware BF16 (as MFA's code treats it). |
 | M5 series, A19 | Apple10 | Per-core *neural accelerators*, which TensorOps (MPP) use. |
 
 The M4 Pro on the dev machine reports `supportsFamily(.apple9) == true`, `.apple10 == false`, `.metal4 == true`, and architecture name `applegpu_g16s` **[measured]**. MLX gates its neural-accelerator (NAX) path on `get_architecture_gen() >= 17` and macOS 26.2 ([mlx `device.cpp`](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/device.cpp)), so M4 (g16) never takes that path.
@@ -137,7 +137,7 @@ The SIMD-group functions are `simd_shuffle`, `simd_shuffle_xor`, `simd_shuffle_u
 
 ### Atomics
 
-`atomic_int`, `atomic_uint`, `atomic_bool`, `atomic_ulong` (MSL 2.4 and later), and `atomic_float` (MSL 3 and later, **device memory only**). Apple9 is required for full 64-bit atomics. Orderings are relaxed in older versions. MSL 3.2 adds `thread_scope` and `seq_cst` fences, and MSL 4.1 adds real acquire, release, and seq_cst on atomic operations. MFA's README states that `atomic<float>` "is emulated" (a CAS loop) **[uncertain on M4]**, so avoid float atomics in hot paths such as split-K and dQ accumulation. GPUCompiler's Metal target lowers what AIR lacks (8-bit and 16-bit atomics, `nand`, float min and max) to CAS loops, and notes that device memory is coherent only within a threadgroup without acquire semantics ([GPUCompiler PR #942](https://github.com/JuliaGPU/GPUCompiler.jl/pull/942)).
+`atomic_int`, `atomic_uint`, `atomic_bool`, `atomic_ulong` (MSL 2.4 and later), and `atomic_float` (MSL 3 and later, **device memory only**). Apple9 is required for full 64-bit atomics. **[corrected]** On this machine (macOS 27, MSL 3.2 to 4.1), the only 64-bit atomics that compile are `atomic_max_explicit` and `atomic_min_explicit` on `device atomic_ulong`, which return `void`. There's no `atomic_long`, and no 64-bit fetch, exchange, load, store, or compare-and-swap, even through the `__metal_atomic_*` builtins. Orderings are relaxed in older versions. MSL 3.2 adds `thread_scope` and `seq_cst` fences, and MSL 4.1 adds real acquire, release, and seq_cst on atomic operations. MFA's README states that `atomic<float>` "is emulated" (a CAS loop) **[uncertain on M4]**, so avoid float atomics in hot paths such as split-K and dQ accumulation. GPUCompiler's Metal target lowers what AIR lacks (8-bit and 16-bit atomics, `nand`, float min and max) to CAS loops, and notes that device memory is coherent only within a threadgroup without acquire semantics ([GPUCompiler PR #942](https://github.com/JuliaGPU/GPUCompiler.jl/pull/942)).
 
 ### Function constants
 

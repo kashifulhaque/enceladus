@@ -4,7 +4,9 @@ Metal's native device atomics cover these cases:
 
 - `int` and `uint`: add, max, min, exchange, and, or, and xor.
 - `float`: add and exchange, through `atomic_float`.
-- `ulong`: max and min only, with no old value, on Apple9 and later.
+- `ulong`: max and min only, with no old value, on Apple9 and later. These are Metal's
+  only 64-bit atomics: there's no `atomic_long` and no 64-bit exchange, fetch, or
+  compare-and-swap, so the frontend refuses every other 64-bit atomic.
 
 Everything else (float max and min, compare-and-swap, and 8-bit and 16-bit elements)
 runs as a compare-and-swap loop on the aligned 32-bit word that holds the element. The
@@ -117,11 +119,13 @@ def atomic_call(cg: _Codegen, kind: str, elem: ir.ScalarType, addr: str, val: st
         if used:
             raise cg.err(
                 f"tl.atomic_{kind} on uint64 can't return the old value, because Metal's "
-                "64-bit atomics return nothing. Don't use the result, or use 32-bit elements."
+                f"64-bit atomic_{kind}_explicit returns nothing and Metal has no 64-bit "
+                "compare-and-swap to build a returning version from. Don't use the result, "
+                "or use uint32 elements."
             )
         if _apple_family(cg) < 9:
             raise cg.err(
-                f"tl.atomic_{kind} on uint64 needs an Apple9 GPU (M3 or later). Use 32-bit "
+                f"tl.atomic_{kind} on uint64 needs an Apple9 GPU (M3 or later). Use uint32 "
                 "elements on this GPU."
             )
         return f"atomic_{kind}_explicit((device atomic_ulong*)({addr}), {val}, {MO})"

@@ -239,6 +239,8 @@ A `tl.dot` loop is eligible for `mpp` when it meets the following conditions:
   counters, and non-negative constants.
 - The operands are `float16` accumulating in `float32` or `float16`, `bfloat16`
   accumulating in `float32` or `bfloat16`, or `float32` accumulating in `float32`.
+  Integer `tl.dot` always uses `"simdgroup"`: on an M4 Pro, `int8` `matmul2d` sums in
+  floating point and returned wrong `int32` results once a sum passed 2^24.
 - The output tile is 16 to 128 in each dimension, and the kernel uses at most 8 SIMD
   groups.
 - After the loop, the result reaches a single descriptor store through elementwise
