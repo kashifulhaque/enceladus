@@ -224,6 +224,30 @@ def test_lazy_mlx_writes_only_fresh_outputs(lazy_mlx, monkeypatch, caplog):
 
 
 @NO_MLX
+def test_lazy_mlx_chain_never_evaluates_its_inputs(lazy_mlx, monkeypatch):
+    # Each launch reads the unevaluated result of the one before. Reading an input's
+    # strides (for the 64-bit offset check or the specialization key) evaluates it and
+    # waits for its work, which made every lazy launch a synchronized round trip.
+    from enceladus.runtime import interop
+
+    n = 3000
+    x = mx.arange(n, dtype=mx.float32)
+    grid = (enceladus.cdiv(n, 1024),)
+    out = enceladus.new_zeros(x)
+    _scale_kernel[grid](x, out, n, 1.0, BLOCK=1024)  # the first launch evaluates once
+    evaluated = []
+    real = interop._mlx_view
+    monkeypatch.setattr(interop, "_mlx_view", lambda a: evaluated.append(1) or real(a))
+    acc = out
+    for _ in range(5):
+        nxt = enceladus.new_zeros(x)
+        _scale_kernel[grid](acc, nxt, n, 2.0, BLOCK=1024)
+        acc = nxt
+    assert not evaluated
+    np.testing.assert_array_equal(np.array(acc), np.arange(n, dtype=np.float32) * 32)
+
+
+@NO_MLX
 def test_lazy_mlx_falls_back_when_mlx_cant_compile(lazy_mlx, monkeypatch, caplog):
     # MLX compiles a kernel only when it evaluates it, so an MSL error would surface at
     # some later mx.eval; the first launch must catch it and run the kernel eagerly.

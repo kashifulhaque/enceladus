@@ -267,7 +267,9 @@ def needs_idx64(value: Any) -> bool:
     `MAX_ELEMENT_INDEX` elements past its first.
 
     It checks the exact span only of arrays in buffers larger than 2 GB, and of
-    non-contiguous NumPy arrays, so the common case costs one attribute read.
+    non-contiguous NumPy arrays, so the common case costs one attribute read. With
+    `lazy_mlx(True)`, it checks the element count of MLX arrays, so it never evaluates
+    one.
     """
     t = type(value)
     if t is Tensor:
@@ -276,9 +278,17 @@ def needs_idx64(value: Any) -> bool:
     elif t is np.ndarray:
         if value.nbytes <= _INDEX_CHECK_BYTES and value.flags.c_contiguous:
             return False
-    elif interop.framework_of(value) == interop.KIND_TORCH:
-        if value.untyped_storage().nbytes() <= _INDEX_CHECK_BYTES:
-            return False
+    else:
+        fw = interop.framework_of(value)
+        if fw == interop.KIND_TORCH:
+            if value.untyped_storage().nbytes() <= _INDEX_CHECK_BYTES:
+                return False
+        elif fw == interop.KIND_MLX and mlx_lazy.enabled():
+            # MLX reports strides only for evaluated arrays, and evaluating one here would
+            # wait for its queued work, which turns a lazy launch into a synchronized one.
+            # Lazy launches check the element count instead (see `lazy_mlx`). A launch that
+            # takes the synchronized path still checks the exact span before it runs.
+            return value.size > MAX_ELEMENT_INDEX + 1
     return _last_index(value) > MAX_ELEMENT_INDEX
 
 
