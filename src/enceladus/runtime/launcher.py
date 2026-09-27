@@ -28,7 +28,7 @@ import numpy as np
 
 from enceladus import _C
 from enceladus.compiler.codegen.msl import KernelArg, scalar_slots
-from enceladus.runtime import interop
+from enceladus.runtime import interop, mlx_lazy
 from enceladus.runtime.device import get_device
 from enceladus.runtime.interop import as_kernel_arg
 from enceladus.runtime.raw import (
@@ -337,6 +337,7 @@ class CompiledKernel:
         self._checked_pipeline: Any = None  # the pipeline that `_check_pipeline` accepted
         self._torch: TorchLaunch | str | None = None  # a reason string if unavailable
         self._fallback_logged = False
+        self._mlx: Any = None  # an mlx_lazy.MlxKernel, or a reason string if unavailable
         self._debug = self.enable_logging or self.assert_buffer is not None
         if self.enable_logging:
             self._torch = ("it calls tl.device_print, which needs Enceladus's logging queue; "
@@ -487,8 +488,12 @@ class CompiledKernel:
             reason = f"torch.mps.compile_shader can't run it ({tl})"
         elif interop.KIND_TORCH in kinds:
             reason = "it mixes PyTorch tensors with other array types"
+        elif kinds == {interop.KIND_MLX} and mlx_lazy.enabled():
+            reason = self._launch_mlx_lazy(grid, values)
+            if reason is None:
+                return
         else:
-            reason = None  # MLX launches are synchronous by design
+            reason = None  # MLX launches are synchronous unless lazy_mlx(True) is set
         if reason is not None and not self._fallback_logged:
             self._fallback_logged = True
             log_fallback(self.name, reason)
@@ -496,10 +501,33 @@ class CompiledKernel:
             check_index_range(values[i], self.args[i].name)
             if self.args[i].written:
                 _check_writable(values[i], self.args[i].name)
+                mlx_lazy.consume(values[i])
         scalars = self._pack_scalars(values)
         launch_synced(get_device().stream, self.pipeline, self._plan,
                       [values[i] for i in self._ptr_idx], scalars, grid, self._tg,
                       self._extra_bufs)  # fmt: skip
+
+    def _launch_mlx_lazy(self, grid: tuple[int, int, int], values: Sequence[Any]) -> str | None:
+        """Adds a launch on MLX arrays to MLX's lazy graph.
+
+        Returns:
+            `None` if the launch is in MLX's graph, or the reason that it must take the
+            synchronized path.
+        """
+        for i in self._ptr_idx:
+            interop.mlx_np_dtype(values[i])  # refuses float64 arrays
+        mk = self._mlx
+        if mk is None:
+            mk = self._mlx = mlx_lazy.adapt(self)
+        if isinstance(mk, str):
+            return f"mx.fast.metal_kernel can't run it: {mk}"
+        reason = mlx_lazy.ineligible_reason(self, grid, values)
+        if reason is not None:
+            return f"the launch can't be lazy: {reason}"
+        reason = mlx_lazy.launch(mk, grid, values)
+        if reason is not None:
+            self._mlx = reason
+        return reason
 
     def timed_launch(self, grid: tuple[int, int, int], values: Sequence[Any]) -> float:
         """Runs one launch in its own command buffer and returns its GPU time in seconds."""

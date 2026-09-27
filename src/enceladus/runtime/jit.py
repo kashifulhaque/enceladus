@@ -722,6 +722,8 @@ def _spec_key(v: Any, no_facts: bool) -> Any:
         return "f32"
     if t.__name__ == "Tensor" and t.__module__ == "torch":
         return interop.torch_spec_key(v, no_facts)
+    if t.__name__ == "array" and t.__module__ == "mlx.core":
+        return interop.mlx_spec_key(v, no_facts)
     from enceladus.runtime.tensor import Tensor
 
     if t is Tensor:

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from enceladus import _C
-from enceladus.runtime import interop
+from enceladus.runtime import interop, mlx_lazy
 from enceladus.runtime.device import get_device
 from enceladus.runtime.interop import as_kernel_arg, is_array_like
 from enceladus.runtime.tensor import Tensor
@@ -302,6 +302,7 @@ class MetalKernel:
         for i, a in enumerate(args):
             if mask[i] and self._bindings[i]["access"] != "read":
                 check_writable_numpy(a, f"argument {i} ('{self._bindings[i]['name']}')")
+                mlx_lazy.consume(a)
         scalars = b"".join(self._pack(i, a) for i, a in enumerate(args) if not mask[i])
         launch_synced(get_device().stream, self.pipeline, self._plans.get(mask) or
                       self._plan(mask), [a for a, m in zip(args, mask, strict=True) if m],
