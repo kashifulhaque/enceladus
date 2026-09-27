@@ -103,9 +103,9 @@ torch.testing.assert_close(result, x)
 print("PyTorch ordering OK")
 ```
 
-A launch through `compile_shader` costs about 5 µs of host time, against about 3 µs on
-Enceladus's own stream. `compile_shader` compiles with precise math functions, so
-functions such as `tl.exp` can differ from the native path in the last bits.
+In a loop of small launches, a launch through `compile_shader` costs about 4.4 µs,
+against about 3.2 µs on Enceladus's own stream. Both paths compile with the same math
+settings, so a kernel gives bit-identical results on PyTorch tensors and on other arrays.
 
 ### Fallback to synchronized launches
 
@@ -129,9 +129,11 @@ with other array types
 
 ## MLX
 
-MLX arrays are lazy, so Enceladus evaluates each MLX argument with `mx.eval()` before it
-binds the array's buffer. MLX launches are synchronous: each launch waits for the GPU,
-which costs about 100 µs.
+By default, MLX launches are synchronous. MLX arrays are lazy, so Enceladus evaluates
+each MLX argument with `mx.eval()` before it binds the array's buffer. It also waits for
+MLX's queued work, which might still read an array that the kernel writes. Each launch
+then waits for the GPU, which costs about 100 µs. To add launches to MLX's lazy graph
+instead, see [Lazy MLX launches](#lazy-mlx-launches).
 
 MLX treats arrays as immutable, but an Enceladus kernel writes to its output arguments
 in place. An output must therefore be an array that you allocate for that purpose, such
@@ -167,6 +169,71 @@ add_kernel[(enceladus.cdiv(n, 1024),)](x, y, out, n, BLOCK=1024)
 assert mx.allclose(out, x * 4).item()
 print("MLX OK")
 ```
+
+### Lazy MLX launches
+
+With `enceladus.lazy_mlx(True)`, a launch on MLX arrays can join MLX's lazy graph through
+`mx.fast.metal_kernel`. The launch returns right away, and MLX runs the kernel when
+something evaluates its results, in order with MLX's own operations. MLX arrays are
+immutable, so a lazy launch doesn't write in place: each array that the kernel writes
+takes the value of a new array, as `out[...] = result` would.
+
+A launch is lazy when it meets the following conditions:
+
+- Every array argument is an MLX array.
+- Every array that the kernel writes is a *fresh output*: an array from
+  `enceladus.new_empty` or `enceladus.new_zeros` that no launch has written yet. In
+  lazy mode, both functions return a lazy zero-filled array, and the kernel sees a
+  zero-filled output. A kernel can read a fresh output, for example to accumulate into
+  it with atomics.
+- The kernel doesn't call `tl.device_print` or, with `ENCELADUS_DEBUG=1`,
+  `tl.device_assert`.
+
+Any other launch on MLX arrays, such as a kernel that updates an array in place, takes
+the synchronized path. The `enceladus` logger records a warning the first time each
+kernel does, with the reason. Don't modify a fresh output yourself, for example with
+`out[0] = 1`, before you pass it to a kernel: the lazy launch ignores its contents.
+
+The following program chains 100 lazy launches and evaluates the result once:
+
+```python
+import mlx.core as mx
+
+import enceladus
+import enceladus.language as tl
+
+
+@enceladus.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = tl.load(y_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, x + y, mask=mask)
+
+
+def add(x, y):
+    out = enceladus.new_empty(x)  # a fresh output
+    add_kernel[(enceladus.cdiv(x.size, 1024),)](x, y, out, x.size, BLOCK=1024)
+    return out
+
+
+enceladus.lazy_mlx(True)
+x = mx.random.normal((100_000,))
+y = x
+for _ in range(100):
+    y = add(x, y)  # returns without waiting for the GPU
+assert mx.allclose(y, x * 101).item()  # evaluates the whole chain
+enceladus.lazy_mlx(False)
+print("lazy MLX OK")
+```
+
+Lazy launches give the same results as synchronized ones, bit for bit. In lazy mode,
+Enceladus doesn't evaluate MLX arrays to learn their offsets, so kernels don't
+specialize on the alignment of MLX arguments other than fresh outputs.
+`enceladus.element_strides(x)` still evaluates `x`, except for a fresh output. A lazy
+launch doesn't check that a strided view spans fewer than 2^31 elements, because MLX
+reports strides only for evaluated arrays.
 
 ## NumPy
 

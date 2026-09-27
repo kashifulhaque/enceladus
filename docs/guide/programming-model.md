@@ -262,6 +262,7 @@ What a launch waits for depends on the kinds of arrays that you pass:
 | NumPy arrays, alone or with tensors | Enceladus's stream; the launch waits | When the launch returns. With `enceladus.async_numpy(True)`, after `enceladus.synchronize()`. |
 | PyTorch MPS tensors only | PyTorch's MPS stream, through `torch.mps.compile_shader` | In order with surrounding PyTorch operations; no Enceladus sync needed. |
 | MLX arrays | Enceladus's stream; the launch evaluates its inputs first and waits | When the launch returns. |
+| MLX arrays, with `enceladus.lazy_mlx(True)` and fresh outputs | MLX's lazy graph, through `mx.fast.metal_kernel` | When MLX evaluates the outputs. |
 | PyTorch tensors with other kinds | Enceladus's stream, between syncs of both streams | When the launch returns. |
 
 The following sections describe each case.
@@ -313,7 +314,8 @@ assert (x == 100).all()
 When every array argument is a PyTorch tensor on the `mps` device, the kernel runs on
 PyTorch's own MPS stream, so it's ordered with the PyTorch operations before and after
 it, and you synchronize the way you do for any PyTorch code. MLX launches are
-synchronous. For details, see [Framework interop](interop.md).
+synchronous, unless `enceladus.lazy_mlx(True)` adds them to MLX's lazy graph. For
+details, see [Framework interop](interop.md).
 
 ## What's next
 

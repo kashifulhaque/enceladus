@@ -155,7 +155,7 @@ Set `ENCELADUS_ALWAYS_COMPILE=1` to ignore saved results and tune again.
 ## Keep launches asynchronous
 
 Each launch that waits for the GPU costs about 70-100 µs, most of it in the GPU driver.
-An asynchronous launch costs about 3.3 µs of host time for a `@enceladus.jit` kernel,
+An asynchronous launch costs about 3.2 µs of host time for a `@enceladus.jit` kernel,
 and the stream batches up to 64 launches into one command buffer, which brings the
 GPU-side cost of a small launch to about 1 µs. For code that runs many small kernels,
 asynchronous launches are 20-30 times faster.
@@ -172,7 +172,9 @@ To keep launches asynchronous, follow these guidelines:
   `enceladus.synchronize()` before you read them.
 - With PyTorch, pass only MPS tensors to a kernel. A launch that mixes PyTorch tensors
   with other arrays takes the synchronized path.
-- MLX launches always wait. Batch work into fewer, larger kernels where you can.
+- With MLX, call `enceladus.lazy_mlx(True)` and allocate outputs with
+  `enceladus.new_empty`, so that launches join MLX's lazy graph instead of waiting. For
+  the conditions, see [Lazy MLX launches](interop.md#lazy-mlx-launches).
 
 `enceladus.from_numpy` shares the array's memory only when the array is C-contiguous
 and starts on a 16 KB page boundary. Otherwise, it copies the array, and later changes
@@ -201,10 +203,15 @@ NaNs. `@enceladus.jit(math_mode="fast")` lets the Metal compiler assume that no 
 infinite or NaN, which can speed up math-heavy kernels. Don't use it for kernels that
 rely on `-inf`, such as a softmax that masks with `-float("inf")`.
 
-In both modes, `tl.sin` and `tl.cos` use Metal's precise variants, because the fast ones
-return 0 for inputs above about 1e7. In compute-bound code, they take up to 3.3 times as
-long as the fast ones. `tl.tanh` takes about 1.7 times as long as Metal's fast `tanh`,
-which is inaccurate near 0 and returns NaN for inputs of 45 and more.
+In both modes, math functions such as `tl.exp` compile with Metal's precise variants,
+on every launch path, so a kernel gives bit-identical results on NumPy arrays, PyTorch
+tensors, and MLX arrays. PyTorch's `compile_shader` offers no other choice. In
+compute-bound code, the precise variants take longer than the fast ones: about 1.7 times
+as long for `tl.exp`, 2.4 times for `tl.log`, 3 times for `tl.rsqrt`, 3.4 times for
+`tl.sqrt`, and 3.3 times for `tl.sin` and `tl.cos`. Memory-bound kernels, such as a softmax or a
+LayerNorm, don't slow down. `tl.tanh` uses an accurate implementation of its own,
+because Metal's fast `tanh` is inaccurate near 0 and returns NaN for inputs of 45 and
+more.
 
 For exponentials, prefer `tl.exp2` and fold the factor `log2(e)` into a scale that you
 compute once, as `examples/08_flash_attention.py` does.
