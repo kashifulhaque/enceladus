@@ -1,5 +1,9 @@
 """Matmul TFLOPS for both `tl.dot` backends, against MLX and PyTorch MPS.
 
+It also reports exact `int8` matmul (`int32` accumulation) in TOPS. MLX's matmul takes
+only floating-point types, and PyTorch MPS `int8` matmul returns `int8`, so neither has a
+comparable `int8` number.
+
 Enceladus uses GPU timestamps. MLX and PyTorch use wall clock around a synchronized call
 (overhead is under 1% at 4096^3). Operands come from memory, never constants.
 
@@ -14,7 +18,10 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 import enceladus
+import enceladus.language as tl
 from enceladus.testing import do_bench
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +91,40 @@ def row(label: str, dtype: str, cfg: str, flops: float, ms: list[float], extra: 
           f"{extra}")  # fmt: skip
 
 
+@enceladus.jit
+def int8_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr,
+                       BK: tl.constexpr):  # fmt: skip
+    pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+    a = tl.make_tensor_descriptor(a_ptr, [M, K], [K, 1], [BM, BK])
+    b = tl.make_tensor_descriptor(b_ptr, [K, N], [N, 1], [BK, BN])
+    c = tl.make_tensor_descriptor(c_ptr, [M, N], [N, 1], [BM, BN])
+    acc = tl.zeros((BM, BN), dtype=tl.int32)
+    for k in range(0, K, BK):
+        acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+    c.store([pid_m * BM, pid_n * BN], acc)
+
+
+def int8_variants(m: int, n: int, k: int) -> dict:
+    """Returns exact int8 matmul launches, after checking one against NumPy."""
+    rng = np.random.default_rng(0)
+    a_np = rng.integers(-128, 128, (m, k), dtype=np.int8)
+    b_np = rng.integers(-128, 128, (k, n), dtype=np.int8)
+    a, b = enceladus.from_numpy(a_np), enceladus.from_numpy(b_np)
+    c = enceladus.empty((m, n), "int32")
+    out = {}
+    for bm, bn, bk, nw in ((64, 64, 32, 4), (64, 64, 64, 4), (128, 64, 32, 8)):
+        grid = (enceladus.cdiv(n, bn), enceladus.cdiv(m, bm))
+        out[f"exact {bm}x{bn}x{bk} w{nw}"] = (
+            lambda grid=grid, bm=bm, bn=bn, bk=bk, nw=nw: int8_matmul_kernel[grid](
+                a, b, c, m, n, k, BM=bm, BN=bn, BK=bk, num_warps=nw))
+    if m * n * k <= 1 << 33:
+        next(iter(out.values()))()
+        want = (a_np.astype(np.int64) @ b_np.astype(np.int64)).astype(np.int32)
+        if not np.array_equal(c.numpy(), want):
+            raise AssertionError(f"int8 matmul {m}x{n}x{k} differs from NumPy")
+    return out
+
+
 def main() -> None:
     ex = load("04_matmul")
     fused = load("07_matmul_fused")
@@ -119,6 +160,9 @@ def main() -> None:
             label = f"{m}x{n}x{k}"
             for i, (cfg, ms) in enumerate(res.items()):
                 row(label if i == 0 else "", dtype, cfg, flops, ms, ref if i == 0 else "")
+        res = interleaved(int8_variants(m, n, k))
+        for cfg, ms in res.items():
+            row("", "int8", cfg, flops, ms, f"{'n/a':>8}{'n/a':>8}")
 
 
 if __name__ == "__main__":
