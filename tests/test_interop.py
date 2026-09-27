@@ -207,17 +207,12 @@ def test_mixed_arguments_fall_back_and_log_once(caplog):
     assert len(fallbacks) == 1
 
 
-def test_refusals():
+@NO_MLX
+def test_mlx_refusals():
     ex = load_example("01_vector_add")
-    y = torch.zeros(4, device="mps")
-    with pytest.raises(TypeError, match=r'\.to\("mps"\)'):
-        ex.add_kernel[(1,)](torch.zeros(4), y, y, 4, BLOCK=1024)
+    f64 = mx.zeros((4,), dtype=mx.float64, stream=mx.cpu)
     with pytest.raises(TypeError, match="float64"):
-        ex.add_kernel[(1,)](np.zeros(4), np.zeros(4), np.zeros(4), 4, BLOCK=1024)
-    if mx is not None:
-        f64 = mx.zeros((4,), dtype=mx.float64, stream=mx.cpu)
-        with pytest.raises(TypeError, match="float64"):
-            ex.add_kernel[(1,)](f64, f64, f64, 4, BLOCK=1024)
-        out = mx.broadcast_to(mx.array([0.0]), (4,))
-        with pytest.raises(ValueError, match="broadcast MLX array"):
-            ex.add_kernel[(1,)](mx.ones((4,)), mx.ones((4,)), out, 4, BLOCK=1024)
+        ex.add_kernel[(1,)](f64, f64, f64, 4, BLOCK=1024)
+    out = mx.broadcast_to(mx.array([0.0]), (4,))
+    with pytest.raises(ValueError, match="broadcast MLX array"):
+        ex.add_kernel[(1,)](mx.ones((4,)), mx.ones((4,)), out, 4, BLOCK=1024)

@@ -16,34 +16,15 @@ from enceladus.compiler.semantic import computation_dtype
 X = np.zeros(64, np.float32)
 
 # ---------------------------------------------------------------------------
-# Errors for common mistakes. Each kernel marks its offending line with `# error`.
+# Frontend errors. Each kernel marks its offending line with `# error`. test_errors.py
+# covers the errors that a launch reports.
 # ---------------------------------------------------------------------------
-
-
-@enceladus.jit
-def _missing_constexpr(x_ptr, BLOCK):
-    offs = tl.arange(0, BLOCK)  # error
-    tl.store(x_ptr + offs, 1.0)
-
-
-@enceladus.jit
-def _non_pow2_arange(x_ptr):
-    offs = tl.arange(0, 100)  # error
-    tl.store(x_ptr + offs, 1.0)
 
 
 @enceladus.jit
 def _non_pow2_zeros(x_ptr, BLOCK: tl.constexpr):
     acc = tl.zeros((BLOCK, 3), dtype=tl.float32)  # error
     tl.store(x_ptr + tl.arange(0, BLOCK), tl.sum(acc, axis=1))
-
-
-@enceladus.jit
-def _while_loop(x_ptr, n):
-    i = 0
-    while i < n:  # error
-        i += 1
-    tl.store(x_ptr, i)
 
 
 @enceladus.jit
@@ -91,10 +72,7 @@ def _calls_recursive(x_ptr):
 
 
 ERROR_CASES = [
-    (_missing_constexpr, {}, "BLOCK: tl.constexpr"),
-    (_non_pow2_arange, {}, "power of two"),
     (_non_pow2_zeros, {"BLOCK": 64}, "dimension 1"),
-    (_while_loop, {}, "`while` loops aren't supported"),
     (_break_in_loop, {}, "`break` isn't supported"),
     (_if_on_tile, {"BLOCK": 64}, "tl.where"),
     (_loop_type_change, {"BLOCK": 64}, "loop-carried variable `acc`"),

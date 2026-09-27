@@ -58,11 +58,12 @@ def test_layernorm(mode, rng, dtype, shape, block):
                  atol=1e-4 if dtype is F32 else None)  # fmt: skip
 
 
+# test_matmul_shapes skips the ragged pointer-tile shapes in the interpreter, so this one
+# covers them there.
 @pytest.mark.parametrize("dtype", [F32, F16, BF16])
-@pytest.mark.parametrize("mkn", [(64, 64, 64), (100, 70, 90)])
-def test_matmul(mode, rng, dtype, mkn):
+def test_matmul(mode, rng, dtype):
     ex = load_example("04_matmul")
-    m, k, n = mkn
+    m, k, n = 100, 70, 90
     a, b = randn(rng, (m, k), dtype), randn(rng, (k, n), dtype)
     check_kernel(ex.matmul, (a, b), ex.reference, modes=(mode,),
                  atol=1e-4 if dtype is F32 else None)  # fmt: skip
