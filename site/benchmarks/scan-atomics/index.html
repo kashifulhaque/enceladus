@@ -6,8 +6,6 @@
 </header>
 
 <section class="doc prose">
-  <div class="callout"><b>Note</b><p>These numbers don't come from the results file that the other benchmark pages use, because <code>run_all.py</code> doesn't run this script. They come from two separate runs of <code>bench_scan_atomics.py</code> on the same M4 Pro on 2026-09-27, with Enceladus at commit <code>c59ff21</code> and MLX 0.32.2.</p></div>
-
   <h2>What it measures</h2>
   <p><code>bench_scan_atomics</code> runs two example kernels:</p>
   <ul class="tight">
@@ -19,22 +17,22 @@
 
 <section class="doc prose">
   <h2>Results</h2>
-  <p>The following table lists the row cumsum for both runs:</p>
+  <p>The following table lists the row cumsum by SIMD-group count:</p>
   <div class="table-wrap"><table>
-    <thead><tr><th class="n">num_warps</th><th class="n">Run 1 (ms)</th><th class="n">Run 1 GB/s</th><th class="n">Run 2 (ms)</th><th class="n">Run 2 GB/s</th></tr></thead>
+    <thead><tr><th class="n">num_warps</th><th class="n">Min (ms)</th><th class="n">GB/s</th></tr></thead>
     <tbody>
-      <tr><td class="n">4</td><td class="n">0.595</td><td class="n">225.6</td><td class="n">0.578</td><td class="n">232.1</td></tr>
-      <tr><td class="n">8</td><td class="n">0.581</td><td class="n">230.9</td><td class="n">0.568</td><td class="n">236.1</td></tr>
-      <tr><td class="n">16</td><td class="n">0.583</td><td class="n">230.1</td><td class="n">0.564</td><td class="n">238.0</td></tr>
-      <tr><td>MLX <code>cumsum</code></td><td class="n"></td><td class="n">192.5</td><td class="n"></td><td class="n">192.7</td></tr>
+      <tr><td class="n">4</td><td class="n">0.556</td><td class="n">241.2</td></tr>
+      <tr><td class="n">8</td><td class="n">0.557</td><td class="n">241.0</td></tr>
+      <tr><td class="n">16</td><td class="n">0.554</td><td class="n">242.2</td></tr>
+      <tr><td>MLX <code>cumsum</code></td><td class="n"></td><td class="n">189.5</td></tr>
     </tbody>
   </table></div>
-  <p>The following table lists the histogram. Its times match between the runs to within 0.001 ms:</p>
+  <p>The following table lists the histogram by bin count:</p>
   <div class="table-wrap"><table>
-    <thead><tr><th class="n">Bins</th><th class="n">Run 1 (ms)</th><th class="n">Run 2 (ms)</th><th class="n">GB/s</th></tr></thead>
+    <thead><tr><th class="n">Bins</th><th class="n">Min (ms)</th><th class="n">GB/s</th></tr></thead>
     <tbody>
-      <tr><td class="n">64</td><td class="n">2.157</td><td class="n">2.158</td><td class="n">31.1</td></tr>
-      <tr><td class="n">4096</td><td class="n">1.071</td><td class="n">1.071</td><td class="n">62.7</td></tr>
+      <tr><td class="n">64</td><td class="n">2.159</td><td class="n">31.1</td></tr>
+      <tr><td class="n">4096</td><td class="n">1.074</td><td class="n">62.5</td></tr>
     </tbody>
   </table></div>
 </section>
@@ -42,31 +40,17 @@
 <section class="doc prose">
   <h2>Reading the results</h2>
   <ul class="tight">
-    <li><strong>The scan runs at copy bandwidth.</strong> The row cumsum reaches 225.6-238.0 GB/s, close to the <a href="/benchmarks/softmax/">row softmax</a> on the same matrix, and the SIMD-group count changes it by 2-3%. The two runs differ by up to 3.4%, which is more than the difference between SIMD-group counts.</li>
-    <li><strong>The lead over MLX is about the overhead.</strong> MLX's 192.5 GB/s corresponds to about 0.70 ms, against 0.56-0.60 ms for Enceladus. That 0.10-0.13 ms difference is about the wall-clock overhead, so the data doesn't show which kernel is faster.</li>
-    <li><strong>Atomic contention limits the histogram.</strong> Every count goes to a counter in device memory, and there are no threadgroup-memory atomics to privatize the counters per threadgroup. With 64 bins, normally distributed values pile onto a few central counters, and the kernel reaches 31.1 GB/s. With 4,096 bins, the same values spread over more counters, and throughput doubles to 62.7 GB/s.</li>
+    <li><strong>The scan runs at copy bandwidth.</strong> The row cumsum reaches 241.0-242.2 GB/s, close to the <a href="/benchmarks/softmax/">row softmax</a> on the same matrix, and the SIMD-group count changes it by under 1%.</li>
+    <li><strong>The lead over MLX is mostly overhead.</strong> MLX's 189.5 GB/s corresponds to about 0.71 ms, against 0.55-0.56 ms for Enceladus. That 0.15 ms difference is only a little more than the wall-clock overhead of about 0.1 ms, so the data doesn't show that the Enceladus kernel is much faster.</li>
+    <li><strong>Atomic contention limits the histogram.</strong> Every count goes to a counter in device memory, and there are no threadgroup-memory atomics to privatize the counters per threadgroup. With 64 bins, normally distributed values pile onto a few central counters, and the kernel reaches 31.1 GB/s. With 4,096 bins, the same values spread over more counters, and throughput doubles to 62.5 GB/s.</li>
   </ul>
   <p>For the atomic and scan builtins, see the <a href="/reference/">language reference</a>.</p>
 </section>
 
 <section class="doc prose">
   <h2>Raw output</h2>
-  <p>The following output is from the first run:</p>
-  <div class="codeblock"><div class="bar"><span class="file">bench_scan_atomics output, run 1</span><span class="spacer"></span></div><pre class="text"><code class="nohighlight">Device: Apple M4 Pro
-Row cumsum 4096 x 4096 fp32 (MLX: 192.5 GB/s)
-  num_warps=4     0.595 ms   225.6 GB/s
-  num_warps=8     0.581 ms   230.9 GB/s
-  num_warps=16    0.583 ms   230.1 GB/s
-Histogram of 16777216 fp32 values, 64 bins:   2.157 ms    31.1 GB/s
-Histogram of 16777216 fp32 values, 4096 bins:   1.071 ms    62.7 GB/s</code></pre></div>
-  <p>The following output is from the second run:</p>
-  <div class="codeblock"><div class="bar"><span class="file">bench_scan_atomics output, run 2</span><span class="spacer"></span></div><pre class="text"><code class="nohighlight">Device: Apple M4 Pro
-Row cumsum 4096 x 4096 fp32 (MLX: 192.7 GB/s)
-  num_warps=4     0.578 ms   232.1 GB/s
-  num_warps=8     0.568 ms   236.1 GB/s
-  num_warps=16    0.564 ms   238.0 GB/s
-Histogram of 16777216 fp32 values, 64 bins:   2.158 ms    31.1 GB/s
-Histogram of 16777216 fp32 values, 4096 bins:   1.071 ms    62.7 GB/s</code></pre></div>
+  <p>The following output is the <code>bench_scan_atomics</code> section of the results file:</p>
+  <!-- @results bench_scan_atomics -->
 </section>
 
 <section class="doc prose">

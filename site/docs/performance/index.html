@@ -57,7 +57,7 @@ print("chose", matmul_kernel.config_for(a, b, c, M, N, K, K, N, N))</code></pre>
   <div class="codeblock"><pre class="text"><code class="nohighlight">enceladus: autotuning matmul_kernel [1024|1024|512|float16,float16,float16] chose enceladus.Config({'BM': 64, 'BN': 32, 'BK': 32}, num_warps=4, dot_warps=(4, 1), dot_backend='mpp') (0.186 ms)</code></pre></div>
 
   <h2>Launch asynchronously</h2>
-  <p>An asynchronous launch costs about 3.4 µs of host time, and batching 64 launches per command buffer brings a small launch to about 1 µs of GPU cost. A synchronized launch costs 70-100 µs. For many small kernels, allocate with <code>enceladus.empty</code>, <code>zeros</code>, or <code>randn</code>, or wrap arrays with <code>enceladus.from_numpy</code>, so that launches never wait.</p>
+  <p>An asynchronous launch costs about 3.4 µs of host time, and batching 64 launches per command buffer brings a small launch to about 1 µs of GPU cost. A synchronized launch costs about 80-100 µs. For many small kernels, allocate with <code>enceladus.empty</code>, <code>zeros</code>, or <code>randn</code>, or wrap arrays with <code>enceladus.from_numpy</code>, so that launches never wait.</p>
   <p>Other tips:</p>
   <ul class="tight">
     <li>Prefer <code>tl.exp2</code>, with <code>log2(e)</code> folded into the scale, over <code>tl.exp</code>.</li>

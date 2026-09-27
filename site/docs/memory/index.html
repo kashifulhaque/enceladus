@@ -38,7 +38,7 @@ c.store([pid_m * BM, pid_n * BN], acc)  # skips elements outside the array</code
       <tr><td>PyTorch tensors mixed with other kinds</td><td>Enceladus's stream, between syncs of both streams</td><td>When the launch returns</td></tr>
     </tbody>
   </table></div>
-  <p>A synchronized launch costs about 70-100 µs. To batch many launches over NumPy arrays, turn the wait off and synchronize once:</p>
+  <p>A synchronized launch costs about 80-100 µs. To batch many launches over NumPy arrays, turn the wait off and synchronize once:</p>
   <div class="codeblock"><div class="bar"><span class="file">async_numpy.py</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">x = np.zeros(10_000, np.float32)
 enceladus.async_numpy(True)
 for _ in range(100):

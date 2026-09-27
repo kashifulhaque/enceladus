@@ -16,18 +16,22 @@
   <p>Because the time comes from the command buffer, it excludes host-side launch cost and synchronization. The function must launch on <code>enceladus.Tensor</code> arguments; a launch that synchronizes internally can't be timed this way. For more information, see <a href="/docs/performance/">Performance</a>.</p>
 
   <h2>How MLX and PyTorch are timed</h2>
-  <p>MLX and PyTorch don't expose per-command-buffer GPU timestamps to these scripts, so their times use the wall clock around a synchronized call: <code>mx.eval(...)</code> for MLX, and the operation followed by <code>torch.mps.synchronize()</code> for PyTorch. Each script runs a few warmup calls first.</p>
+  <p>MLX and PyTorch don't expose per-command-buffer GPU timestamps to these scripts, so their times use the wall clock around a synchronized call: <code>mx.eval(...)</code> for MLX, and the operation followed by <code>torch.mps.synchronize()</code> for PyTorch. Each script runs a few warmup calls first. <code>bench_matmul</code> times MLX and PyTorch inside the same interleaved rounds as its Enceladus variants, and reports their minimum and median.</p>
   <p>The wall clock includes launch and synchronization overhead, which the softmax and attention scripts estimate at about 0.1 ms. That overhead is small for long kernels, for example under 1% for a 4096³ matmul, but it's a large fraction of a kernel that runs for well under a millisecond. When a comparison involves a short kernel, read the MLX and PyTorch numbers as lower bounds on their throughput.</p>
 
   <h2>Minimum and median</h2>
-  <p>Most tables report the minimum time over the repetitions, converted to throughput. The minimum is the least noisy estimate of what the kernel can do when nothing else interferes. Where the scripts also report the median, the tables show it in parentheses or in its own column. A large gap between the two means the kernel's time varies from run to run; for example, the <code>float32</code> <code>mpp</code> matmul at 4096³ has a minimum of 5.35 TFLOPS and a median of 3.36.</p>
+  <p>Most tables report the minimum time over the repetitions, converted to throughput. The minimum is the least noisy estimate of what the kernel can do when nothing else interferes. Where the scripts also report the median, the tables show it in parentheses or in its own column. A large gap between the two means the kernel's time varies from run to run; for example, the <code>float32</code> <code>mpp</code> matmul at 4096³ has a minimum of 5.40 TFLOPS and a median of 4.69.</p>
 
   <h2>Interleaved rounds</h2>
   <p>GPU clocks, temperature, and other GPU users change during a run. To spread those changes evenly across the kernels under comparison, two scripts interleave their measurements:</p>
   <ul class="tight">
-    <li><code>bench_matmul</code> times every variant for one shape and dtype in turn, for 3 rounds of 10 runs, and reports the minimum and median over all 30 samples.</li>
+    <li><code>bench_matmul</code> times every Enceladus variant for one shape and dtype in turn, followed by MLX and PyTorch, for 3 rounds. In each round, each Enceladus variant runs 10 times with GPU timestamps, and MLX and PyTorch each run 3 warmup calls and 10 wall-clock runs. The script reports the minimum and median over all 30 samples of each.</li>
     <li><code>bench_attention</code> alternates the Enceladus kernel and MLX in one process for 3 rounds of 10 runs. It reports the best round's minimum and the median of the round medians.</li>
   </ul>
+
+  <h2>Thermal throttling</h2>
+  <p>On a laptop, sustained GPU work lowers the GPU clock. In a 24-round run of back-to-back 4096³ <code>float16</code> matmuls that lasted about 50 s, every kernel, MLX included, slowed by 5-7% after about 35 s. After several minutes of matmul work on battery power, <code>float32</code> matmuls ran up to 35% slower.</p>
+  <p>For this reason, <code>bench_matmul</code> times MLX and PyTorch in the same rounds as the Enceladus variants, so that a clock change affects all of them alike. <code>run_all.py</code> takes a <code>--cooldown SECONDS</code> flag that idles between scripts, so that heat from one benchmark doesn't slow the next one.</p>
 
   <h2>Throughput units</h2>
   <p>The scripts convert times to throughput as follows:</p>
@@ -44,8 +48,9 @@
     <tbody>
       <tr><td>Computer</td><td>MacBook Pro, Apple M4 Pro, 24 GB unified memory</td></tr>
       <tr><td>GPU</td><td>16 cores, Apple9 family, <code>applegpu_g16s</code></td></tr>
-      <tr><td>Software</td><td>macOS 27, Xcode 27, Enceladus 0.1.0.dev0</td></tr>
-      <tr><td>Results file</td><td><code>benchmarks/results/2026-09-26-applegpu_g16s-m9.md</code>, after milestone M9</td></tr>
+      <tr><td>Software</td><td>macOS 27, Xcode 27, Enceladus 0.1.0</td></tr>
+      <tr><td>Results file</td><td><code>benchmarks/results/2026-09-27-applegpu_g16s-2.md</code>, from a run on 2026-09-27 with 90 s of idle time between scripts</td></tr>
+      <tr><td>Power</td><td>The run started on battery power, and the laptop was connected to power during it.</td></tr>
     </tbody>
   </table></div>
   <p>The M4 Pro's GPU isn't Apple10, so the Metal 4 <code>matmul2d</code> operation behind the <code>mpp</code> <code>tl.dot</code> backend runs on the regular shader cores, not on dedicated matrix hardware. Expect different ratios on other chips.</p>
@@ -58,13 +63,13 @@
     </li>
     <li>Close other GPU-heavy apps, and connect the computer to power.</li>
     <li>Run every benchmark and write a report:
-      <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python benchmarks/run_all.py</code></pre></div>
-      <p>The script writes a Markdown report named <code>DATE-ARCHITECTURE.md</code> to <code>benchmarks/results/</code>, with one section per benchmark.</p>
+      <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python benchmarks/run_all.py --cooldown 90</code></pre></div>
+      <p>The script runs every <code>bench_*.py</code> script in <code>benchmarks/</code>, in alphabetical order, and idles for 90 seconds before each one after the first. It writes a Markdown report named <code>DATE-ARCHITECTURE.md</code> to <code>benchmarks/results/</code>, with one section per benchmark. If a report with that name exists, the new report gets a numeric suffix, such as <code>DATE-ARCHITECTURE-2.md</code>.</p>
     </li>
   </ol>
   <p>To run one benchmark, run its script directly, for example:</p>
   <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python benchmarks/bench_matmul.py --quick</code></pre></div>
-  <p>The <code>--quick</code> flag limits <code>bench_matmul</code> to the 4096³ shape and <code>bench_attention</code> to sequence length 2048. <code>run_all.py</code> doesn't include <code>bench_scan_atomics.py</code>, so run that script on its own. A script skips its MLX or PyTorch rows when that framework isn't installed, except <code>bench_attention</code>, which requires MLX.</p>
+  <p>The <code>--quick</code> flag limits <code>bench_matmul</code> to the 4096³ shape and <code>bench_attention</code> to sequence length 2048. A script skips its MLX or PyTorch rows when that framework isn't installed, except <code>bench_attention</code>, which requires MLX.</p>
 </section>
 
 <section class="doc prose">

@@ -8,10 +8,10 @@
 <section class="doc" id="benchmarks">
   <div class="prose"><h2>Dispatch overhead</h2></div>
   <div class="tiles">
-    <div class="tile"><b>3.41 <small>µs</small></b><span><code>@enceladus.jit</code> launch, sustained</span></div>
-    <div class="tile"><b>1.00 <small>µs</small></b><span>Native stream dispatch, sustained</span></div>
-    <div class="tile"><b>70.67 <small>µs</small></b><span>Synchronized round trip, raw <code>metal_kernel</code></span></div>
-    <div class="tile"><b>0.37 <small>ms</small></b><span>Compile time for the vector add, frontend to MSL</span></div>
+    <div class="tile"><b>3.39 <small>µs</small></b><span><code>@enceladus.jit</code> launch, sustained</span></div>
+    <div class="tile"><b>1.02 <small>µs</small></b><span>Native stream dispatch, sustained</span></div>
+    <div class="tile"><b>82.92 <small>µs</small></b><span>Synchronized round trip, raw <code>metal_kernel</code></span></div>
+    <div class="tile"><b>0.46 <small>ms</small></b><span>Compile time for the vector add, frontend to MSL</span></div>
   </div>
   <div class="prose"><h2>Throughput relative to MLX</h2></div>
   <div class="bench" id="bench">
@@ -22,7 +22,7 @@
       </div>
     </div>
     <div id="bench-rows"></div>
-    <p class="bnote">Each bar shows Enceladus throughput relative to MLX in the same run. Enceladus times use GPU timestamps; MLX times use the wall clock. Values are the minimum over repeated runs; matmul uses 3 interleaved rounds of 10 runs. Matmul rows show the best Enceladus configuration for the shape. The 513³ bar is clipped at +60%. Source: <code>benchmarks/results/2026-09-26-applegpu_g16s-m9.md</code>.</p>
+    <p class="bnote">Each bar shows Enceladus throughput relative to MLX in the same run. Enceladus times use GPU timestamps; MLX times use the wall clock. Values are the minimum over repeated runs. Matmul times Enceladus and MLX in the same 3 interleaved rounds of 10 runs, and its rows show the best Enceladus configuration for the shape. The 513³ bar is clipped at +60%. Source: <code>benchmarks/results/2026-09-27-applegpu_g16s-2.md</code>.</p>
   </div>
   <div class="prose">
     <p>MLX's wall-clock times include about 0.1 ms of launch and synchronization overhead, which inflates the Enceladus lead on short kernels such as the softmax and the 513³ matmul. For how the timing works and how to run the benchmarks, see <a href="/benchmarks/methodology/">Methodology</a>.</p>
