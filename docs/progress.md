@@ -2247,3 +2247,147 @@ PyTorch tensors, within the noise of earlier runs.
   fully true vector mask.
 - The debug check of a hint checks the power-of-two part of each value, not the full
   promise.
+
+## Benchmarks and acceptance after the follow-up pass
+
+This pass looked for the cause of the run-to-run variance in the `mpp` matmul, checked
+the two-phase autotuner, refreshed every benchmark, and fixed a launch-cost regression
+that the refresh found. The full suite ran twice with `run_all.py --cooldown 90`, with
+no other GPU work on the machine. The site and the table use the second report,
+`benchmarks/results/2026-09-27-applegpu_g16s-2.md`. The first,
+`benchmarks/results/2026-09-27-applegpu_g16s.md`, ran on battery power before the
+lazy MLX fix; the laptop was connected to power during the second.
+
+### Acceptance status
+
+Values are TFLOPS, GB/s, or µs at the minimum time, with the median in parentheses where
+the script reports one. MLX runs in the same process and, for matmul, in the same
+interleaved rounds.
+
+| Milestone | Criterion | Result |
+|---|---|---|
+| Target | Vector add, 256 MB per array, 220 GB/s or more | Met: 236.6 float32, 238.1 float16, 236.4 int8 (MLX 227.4); M9 224.1 |
+| Target | Softmax 4096 x 4096, 215 GB/s or more | Met: 241.9 float32, 256.3 float16 (MLX 193.7 and 171.3) |
+| Target | LayerNorm and RMSNorm 4096 x 4096, 200 GB/s or more | Met: 234.4-247.4 in every row; float16 LayerNorm at BLOCK=4096 rose from 169.4 to 241.9 |
+| M4 | `simdgroup` matmul 4096³ FP16, 5.3 TFLOPS or more | Met: 5.73 (5.60), 97% of MLX's 5.88 (5.75) |
+| M4 | `simdgroup` matmul 4096³ FP32, 4.9 TFLOPS or more | Met: 5.27 (5.14); MLX 5.21 (5.14) |
+| M4 | Fused bias and GELU within 5% of plain matmul | Met: FP16 `simdgroup` 5.73 against 5.73, `mpp` 6.00 against 6.04 |
+| M8 | `mpp` matmul 4096³ FP16, 5.9 TFLOPS or more | Met: 6.04 (5.93), MLX 5.88 (5.75); 6.16 (6.15) on a cool GPU; first report 5.94 (5.82) |
+| M7 | FP16 attention within 1.3x of MLX, head dims 64 and 128 | Met: 0.96x-1.05x of MLX's time, causal and not |
+| Target | Sustained launch of 5 µs or less | Met: `@enceladus.jit` 3.39 (3.41), raw `metal_kernel` 1.15 (1.18) |
+| M6 | Sustained launch on PyTorch tensors, 5 µs or less | Met: 4.59 (4.60); M9 5.10 (5.17) |
+| Target | Compile time of a matmul, excluding Metal, 20 ms or less | Met: descriptor matmul 1.11 ms (`simdgroup`) and 0.51 ms (`mpp`), pointer-tile matmul 2.52 ms, vector add 0.42 ms; medians of 200 |
+| M5 | Autotuned matmul at least as fast as the fixed config | Met: 33 of 33 cases (3 shapes, 2-3 dtypes, 4 fresh-cache runs); see the notes |
+| New | Vector loads | Pointer-tile matmul FP16 2048³ 1.26x faster; memory-bound kernels within 2% |
+| New | Edge versioning | 1.02x-1.07x at 1000³ and 1000 x 777 x 300, under 1.01x at 2000³ |
+| New | Exact `int8` `tl.dot` | 4.57-4.75 TOPS at 4096³, 80-83% of FP16 `simdgroup`; 2.58 at 513³ |
+
+### Variance of the `mpp` matmul
+
+Recorded FP16 `mpp` runs at 4096³ ranged from 5.70 to 6.13 TFLOPS, and FP32 `mpp` was
+bimodal. The causes differ by dtype.
+
+- **FP16 and BF16 follow the GPU clock.** In a 24-round run of back-to-back 4096³ FP16
+  matmuls (about 50 s), every kernel slowed by the same amount after about 35 s: the
+  Enceladus `mpp` kernel from 6.16 to 5.84 TFLOPS per round, Apple's reference
+  `matmul2d` kernel from 6.18 to 5.83, `simdgroup` from 5.85 to 5.45, and MLX from 6.03
+  to 5.64. After several minutes of matmul work on battery power, every kernel,
+  `simdgroup` and MLX included, ran 20-35% slower until the GPU cooled. In the cooler
+  rounds, `mpp` ran at 6.15-6.18 TFLOPS, within 0.5% of the reference kernel. So the
+  spread between recorded runs is the GPU's clocks, not the kernel, and a comparison
+  with MLX is meaningful only in the same rounds.
+- **FP32 `matmul2d` is unstable on its own.** In 10 interleaved rounds, the Enceladus
+  `mpp` kernel's round medians ranged from 4.71 to 5.37 TFLOPS and the reference kernel's
+  from 3.32 to 5.47, while `simdgroup` (4.91-5.34) and MLX (4.94-5.36) held steady in the
+  same rounds. Between those episodes, FP32 `mpp` ran steadily at 5.5-5.7. The
+  instability is in Apple's kernel, so Enceladus can't remove it.
+- **Program order doesn't help.** Metal's 2D dispatch order already gives the caches
+  enough reuse: remapping program IDs into groups of 2-16 rows, as Triton's grouped
+  ordering does, measured the same in FP16 and the same or less stable in FP32. A plain
+  row-major 1D order dropped FP32 `matmul2d` to 2.2 TFLOPS, because it rereads B for every
+  row of tiles, while FP16 didn't change. The research sweep found the same for
+  `simdgroup`, so the examples keep the 2D grid.
+- **The tile list is right.** Of 10 `mpp` tiles (32x32 to 128x128, 2 to 8 SIMD groups),
+  the three in `matmul_configs` were the fastest or within 1% of the fastest: FP16 at
+  4096³ and 2000³, and FP32 at 4096³ and 1024 x 4096 x 1024. The list is unchanged. Its
+  comment, which said FP32 `matmul2d` ran 20-30% slower than `simdgroup`, now records
+  these measurements.
+
+What changed: `bench_matmul.py` times MLX and PyTorch in the same interleaved rounds as
+the Enceladus variants and reports their minimum and median, where before it timed them
+once, before the Enceladus variants, on a cooler GPU. `run_all.py` takes
+`--cooldown SECONDS`, so a benchmark that follows the matmul benchmark doesn't inherit
+its lowered clock.
+
+### Notes
+
+- **Autotuning.** In 4 runs, each with a fresh cache and at least 2 minutes of idle time
+  before it, the tuner picked `mpp` 64 x 64 at 4096³ every time (FP32 and FP16 in 4
+  runs, BF16 in 3), 3-6% faster than the fixed `simdgroup` config by minimum and within
+  1% of fixed `mpp` 64 x 64. At 2000³ it picked `mpp` 64 x 64 (FP32) or 64 x 32
+  (FP16), and at 1024 x 4096 x 1024 in FP32 it picked the fixed config. Tuning took
+  7.9-8.3 s at 4096³ and 1.0-1.6 s at the other shapes. Where the tuner picked the fixed
+  config, the two timings of that one config differed by up to 3.4%, which is the
+  benchmark's noise. In the suite report, the FP32 4096³ tuner also picked the fixed
+  config: 5.23 (5.14) against 5.27 (5.14).
+- **Autotuning on a hot GPU.** Right after a minute of matmul work, 3 more runs picked a
+  `simdgroup` config in 5 of 9 cases at 4096³, giving up the 2-7% that `mpp` gains. The
+  picks were never slower than the fixed config beyond the noise, which was 4% between
+  two timings of one config. Phase 1 times the configs in list order, and the `mpp`
+  configs come last, so they run on the hottest GPU; timing them in alternating order
+  would cancel a steady drift.
+- **Precise math functions.** A kernel that applies a function 64 times per element over
+  4M `float32` elements, compiled with fast and then precise functions, measured these
+  times: `exp` 0.338 and 0.684 ms (2.0x), `log` 0.338 and 0.792 ms (2.3x), `sqrt` 0.339
+  and 1.132 ms (3.3x), `rsqrt` 0.338 and 0.998 ms (3.0x), and `sin` 1.010 and 2.367 ms
+  (2.3x). The same chain written with `tl.exp` took 0.553 ms (1.6x the fast `exp`) and
+  with `tl.sqrt` 1.161 ms (3.4x). These match the
+  [interop pass](#interop-pass-after-m9) (1.7x and 3.4x). Memory-bound kernels don't
+  pay it: softmax, LayerNorm, and RMSNorm ran faster than in the M9 report.
+- **Vector loads and edge versioning on a quiet GPU.** Each A/B alternated builds with
+  the feature on and off, in separate processes and caches, 3 times, and compared
+  minimum times. The pointer-tile FP16 matmul at 2048³ took 2.903 ms against 3.644 ms.
+  The `int8` vector add took 3.38 ms against 3.43 ms: the 1.18x in the
+  [hints entry](#hints-vector-loads-and-64-bit-offsets) came from a shared GPU, where the
+  scalar version suffered more. Edge versioning: FP16 1000³ 0.560 against 0.600 ms, FP32
+  0.599 against 0.611 ms, 1000 x 777 x 300 0.162 against 0.167 ms (FP16) and 0.164
+  against 0.172 ms (FP32), and 2000³ under 1% faster in both dtypes.
+- **Regression fixed: lazy MLX launches.** The first report measured 131.6 µs per launch
+  in a chain of lazy MLX launches, against 12.8 µs in the interop pass. The 64-bit offset
+  check from the hints pass read each MLX argument's strides, which evaluates the array
+  and waits for its work. With `lazy_mlx(True)`, the check now uses the element count, as
+  the lazy launch path does, and the chain measures 13.4 µs. A regression test fails
+  without the fix.
+- **Other changes against the M9 report.**
+  - Raw `metal_kernel` launches measured 1.13-1.15 µs against 1.04 µs, and native
+    dispatch 1.02-1.04 µs against 1.00 µs. This wasn't investigated.
+  - The MLX synchronized round trip measured 121-126 µs against 99.8 µs; the interop
+    pass added about 7 µs for `mx.synchronize()` and measured 120 µs.
+  - Vector add compile time measured 0.42-0.46 ms against 0.37 ms, from the AxisInfo
+    rewrite in the hints pass.
+  - FP32 `mpp` at 4096³ measured 5.40 (4.69) and 5.38 (5.13) in the two reports, against
+    5.35 (3.36) in the M9 report; see the variance section.
+
+### Tests
+
+- `uv run pytest -q`: 1159 passed, 20 skipped, and 2 deselected in about 9 s. `uv run
+  ruff check src tests examples benchmarks`: clean.
+- New test: `test_lazy_mlx_chain_never_evaluates_its_inputs` runs a chain of lazy
+  launches whose inputs are unevaluated results and fails if any launch evaluates one.
+
+### Deviations from the plan
+
+- The FP16 `mpp` target holds on a cool GPU but not after a minute of sustained matmul
+  work on this laptop, where MLX slows by the same amount. The table reports the suite
+  run, which follows 90 s of idle time.
+- The performance scripts for this section (the dispatch-order and tile sweeps, the
+  math-function chain, and the feature A/Bs) were one-off measurements and aren't in
+  `benchmarks/`.
+
+### Known gaps
+
+- FP32 `matmul2d` stays unstable at 4096³; tuning can pick it on a good run.
+- Autotuning phase 1 still times configs in list order, so on a GPU whose clock is
+  falling it favors the configs that come first.
+- The site's benchmark pages come from the second report. Neither report ran with the
+  laptop on power the whole time.
