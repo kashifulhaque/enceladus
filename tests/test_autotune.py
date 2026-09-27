@@ -191,6 +191,28 @@ def test_restore_value_resets_before_every_benchmark_run():
     np.testing.assert_array_equal(out.numpy(), 6.0)
 
 
+@enceladus.jit
+def _strided_copy(x_ptr, out_ptr, n, stride, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs * stride, mask=mask), mask=mask)
+
+
+def test_tuning_benchmarks_the_specialization_that_the_launch_runs():
+    # Views that start 4 bytes into their arrays: neither pointer is 16-byte aligned, and
+    # `x` has a stride of 2 that the kernel applies itself.
+    x = np.arange(2 * 4096, dtype=np.float32)[1::2]
+    out = np.zeros(4096 + 1, np.float32)[1:]
+    tuned = Autotuner(_strided_copy, CONFIGS[1:], key=["n"], rep=3, warmup_ms=1)
+    tuned[_grid](x, out, 4096, 2)
+    np.testing.assert_array_equal(out, x)
+    # Tuning compiled every config, and the launch compiled or reused the chosen one. All
+    # of them specialize both pointers as unaligned, as the launch does.
+    f32 = np.dtype(np.float32)
+    assert len(_strided_copy._compiled) == 2
+    assert {k[0][:2] for k in _strided_copy._compiled} == {((f32, False), (f32, False))}
+
+
 def test_concurrent_saves_keep_every_result():
     tuners = [Autotuner(_accumulate, CONFIGS, key=["n"]) for _ in range(16)]
     for i, t in enumerate(tuners):

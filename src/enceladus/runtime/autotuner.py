@@ -27,8 +27,8 @@ from typing import Any
 import numpy as np
 
 from enceladus.runtime import cache, interop
-from enceladus.runtime.device import get_device
-from enceladus.runtime.tensor import Tensor, from_numpy
+from enceladus.runtime.device import PAGE_SIZE, get_device
+from enceladus.runtime.tensor import Tensor, empty, from_numpy
 
 log = logging.getLogger("enceladus.autotune")
 SPILL_FACTOR = 3.0  # configs slower than this multiple of the median are logged as spills
@@ -93,13 +93,49 @@ class Config:
         return json.dumps(self.to_json(), sort_keys=True)
 
 
+def _aligned16(a: Any) -> bool:
+    """Returns whether the launch specializes array `a` as 16-byte aligned."""
+    from enceladus.runtime.jit import arg_facts
+
+    return arg_facts(a).get("divisibility") == 16
+
+
 def _bench_view(a: Any) -> Any:
-    """Returns an `enceladus.Tensor` sharing the memory of a NumPy, PyTorch, or MLX array."""
+    """Returns an `enceladus.Tensor` for benchmarking in place of a launch argument.
+
+    The tensor specializes the kernel as `a` does: it has the same element strides, and
+    its data pointer has the same alignment to 16 bytes, so tuning times the code that
+    the real launch runs. It shares `a`'s memory when it can; otherwise it holds a copy.
+    """
     if isinstance(a, np.ndarray):
-        return from_numpy(a)
+        return _bench_numpy(a)
     if interop.framework_of(a) is not None:
-        return interop.as_tensor(a)
+        t = interop.as_tensor(a)
+        if _aligned16(t) != _aligned16(a):
+            t = _bench_numpy(interop.host_view(a))
+        return t
     return a
+
+
+def _bench_numpy(a: np.ndarray) -> Tensor:
+    ptr = a.__array_interface__["data"][0]
+    item = a.itemsize
+    if a.size == 0 or any(s < 0 or s % item for s in a.strides):
+        return from_numpy(a)  # the launch refuses these arrays, or they hold no data
+    if a.flags.c_contiguous and ptr % PAGE_SIZE == 0:
+        return from_numpy(a)  # shares `a`'s memory
+    # A copy that keeps the strides: the kernel indexes it with the strides of `a`.
+    strides = tuple(s // item for s in a.strides)
+    extent = 1 + sum((n - 1) * s for n, s in zip(a.shape, strides, strict=True))
+    # A new buffer starts on a page, so an element offset reproduces the alignment of
+    # `a`. When `a` isn't aligned to its own element size, any nonzero offset gives the
+    # same specialization, which records only whether the pointer is 16-byte aligned.
+    r = ptr % 16
+    offset = r // item if r % item == 0 else 1
+    base = empty((offset + extent,), a.dtype)
+    t = Tensor(base.buffer, a.shape, a.dtype, strides, offset)
+    t._view()[...] = a
+    return t
 
 
 def _innermost(fn: Any):
