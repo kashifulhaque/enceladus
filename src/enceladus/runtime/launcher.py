@@ -224,8 +224,9 @@ def launch_synced(stream: Any, pipeline: Any, plan: Any, bufs_values: Sequence[A
     """Dispatches on Enceladus's stream between syncs with PyTorch's stream.
 
     Waits for PyTorch's pending work, binds every array argument (evaluating MLX arrays),
-    dispatches, and waits until the GPU finishes, so PyTorch and MLX read the results.
-    `extra_bufs` are native buffers bound after the arguments, such as an error buffer.
+    waits for MLX's queued work if an argument is an MLX array, dispatches, and waits
+    until the GPU finishes, so PyTorch and MLX read the results. `extra_bufs` are native
+    buffers bound after the arguments, such as an error buffer.
     """
     interop.torch_synchronize()
     bufs, offsets, args = [], [], []
@@ -234,6 +235,10 @@ def launch_synced(stream: Any, pipeline: Any, plan: Any, bufs_values: Sequence[A
         bufs.append(ba.buffer)
         offsets.append(ba.byte_offset)
         args.append(ba)
+    if any(ba.kind == interop.KIND_MLX for ba in args):
+        # MLX work queued before the launch can still read an array that the kernel
+        # writes; `mx.eval` in `as_kernel_arg` doesn't wait for it.
+        interop.mlx_synchronize()
     for b in extra_bufs:
         bufs.append(b)
         offsets.append(0)
@@ -508,6 +513,8 @@ class CompiledKernel:
         if self._debug:
             self._prepare_debug(stream)
         bufs = [as_kernel_arg(values[i]) for i in self._ptr_idx]
+        if any(b.kind == interop.KIND_MLX for b in bufs):
+            interop.mlx_synchronize()
         scalars = self._pack_scalars(values)
         t0, t1 = stream.native.timed_run(
             self.pipeline, self._plan, [b.buffer for b in bufs] + self._extra_bufs,

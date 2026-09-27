@@ -279,6 +279,36 @@ def test_mlx_refusals():
         ex.add_kernel[(1,)](mx.ones((4,)), mx.ones((4,)), out, 4, BLOCK=1024)
 
 
+@enceladus.jit
+def _fill_kernel(x_ptr, n, value, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(x_ptr + offs, tl.full((BLOCK,), value, tl.float32), mask=offs < n)
+
+
+@NO_MLX
+def test_mlx_write_waits_for_queued_mlx_readers():
+    # MLX work queued with mx.async_eval reads `a` while the kernel overwrites `a` on
+    # Enceladus's queue; mx.eval(a) alone doesn't wait for that work.
+    n = 1 << 20
+
+    def reader(a):
+        acc = a * 0.5
+        for _ in range(32):
+            acc = acc + a
+        return acc
+
+    for seed in range(4):
+        a = mx.random.normal((n,), key=mx.random.key(seed))
+        expected = reader(a)
+        mx.eval(a, expected)
+        got = reader(a)
+        mx.async_eval(got)
+        _fill_kernel[(n // 1024,)](a, n, 0.0, BLOCK=1024)
+        mx.eval(got)
+        assert mx.array_equal(got, expected).item()
+        assert not mx.any(a).item()  # the fill ran
+
+
 def _matmul_fused(fw, pad, rng, dtype):
     ex = load_example("07_matmul_fused")
     a = rng.standard_normal((100, 64)).astype(dtype)

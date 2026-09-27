@@ -174,6 +174,19 @@ def torch_synchronize() -> None:
 
 # ---- MLX ----
 
+
+def mlx_synchronize() -> None:
+    """Waits for the GPU work queued on MLX's default stream, if MLX is imported.
+
+    `mx.eval(a)` waits only for the work that computes `a`. Work queued earlier that
+    reads `a`, for example through `mx.async_eval`, can still be running, and a kernel
+    that writes to `a` on Enceladus's queue would race with it.
+    """
+    mx = sys.modules.get("mlx.core")
+    if mx is not None:
+        mx.synchronize()
+
+
 _MLX_DTYPES = {
     "float32": np.dtype(np.float32), "float16": np.dtype(np.float16),
     "bool": np.dtype(np.bool_), "int8": np.dtype(np.int8), "int16": np.dtype(np.int16),
@@ -417,6 +430,7 @@ def as_tensor(obj: Any) -> Tensor:
         ba = _from_torch(obj)
     elif fw == KIND_MLX:
         ba = _from_mlx(obj)
+        mlx_synchronize()  # the tensor can write to the array's memory
     else:
         raise TypeError(f"expected a torch MPS tensor or an MLX array, not {type(obj).__name__}")
     if ba.byte_offset % ba.dtype.itemsize:
