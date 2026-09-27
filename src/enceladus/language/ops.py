@@ -1547,6 +1547,168 @@ def debug_barrier(ctx):
 
 
 # ---------------------------------------------------------------------------
+# Compiler hints
+# ---------------------------------------------------------------------------
+
+_HINT_KINDS = ("multiple_of", "max_contiguous")
+
+
+def _hint_values(fname: str, values: Any, rank: int) -> tuple[int, ...]:
+    """Returns the per-dimension values of a hint, checked against the input's rank."""
+    values = core.unwrap(values)
+    vals = tuple(core.unwrap(v) for v in values) if isinstance(values, (tuple, list)) \
+        else (values,)  # fmt: skip
+    out = tuple(_cint(v, f"each tl.{fname} value") for v in vals)
+    want = max(1, rank)
+    if len(out) != want:
+        what = "a scalar" if rank == 0 else f"a tile of rank {rank}"
+        raise CompilationError(
+            f"tl.{fname} got {len(out)} values for {what}, but it needs one value per "
+            f"dimension ({want}). Pass an int for a scalar or a 1D tile, and a tuple for a "
+            "tile with more dimensions."
+        )
+    if any(v <= 0 for v in out):
+        raise CompilationError(f"tl.{fname} values must be positive integers, but got {out}")
+    return out
+
+
+def _hint(ctx, input: Any, values: Any, kind: str) -> Any:
+    x = core.unwrap(input)
+    if isinstance(x, (int, np.integer)) and not isinstance(x, (bool, np.bool_)):
+        vals = _hint_values(kind, values, 0)
+        if kind == "multiple_of" and int(x) % vals[0]:
+            raise CompilationError(f"tl.multiple_of({int(x)}, {vals[0]}) is false: {int(x)} "
+                                   f"isn't a multiple of {vals[0]}.")  # fmt: skip
+        return input
+    if not isinstance(x, ir.Value) or not (semantic.is_pointer(x) or _is_int_value(x)):
+        raise CompilationError(
+            f"tl.{kind} needs an integer or pointer scalar or tile, but got {describe(x)}"
+        )
+    rank = len(ir.shape_of(x.type))
+    vals = _hint_values(kind, values, rank)
+    op = ctx.b.create("hint", [x], [x.type], {"kind": kind, "values": vals})
+    op.result.name_hint = x.name_hint
+    return op.result
+
+
+def _is_int_value(x: ir.Value) -> bool:
+    e = ir.elem_of(x.type)
+    return isinstance(e, ir.ScalarType) and e.name != "i1" and e.name[0] in "iu"
+
+
+def _hint_runs(values: np.ndarray, axis: int, size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Splits `values` along `axis` into aligned groups of `size` elements.
+
+    Returns the groups, moved to the last axis, and a boolean array that marks each
+    element that continues its predecessor in the group (it's one more than the element
+    before it).
+    """
+    v = np.moveaxis(values.astype(np.int64, copy=False), axis, -1)
+    g = v.reshape(v.shape[:-1] + (v.shape[-1] // size, size))
+    cont = np.zeros(g.shape, dtype=bool)
+    cont[..., 1:] = g[..., 1:] == g[..., :-1] + 1
+    return g, cont
+
+
+def _check_hint(x: Any, vals: tuple[int, ...], kind: str) -> None:
+    """Checks the part of a hint's promise that the compiler uses, and raises if it fails.
+
+    The compiler uses `p`, the largest power of two that divides each value. Along each
+    dimension, the values split into aligned groups of `p` elements, or of the whole
+    dimension if it's shorter. `tl.max_contiguous` then promises that each group holds
+    consecutive values. `tl.multiple_of` promises that each value that starts a group, or
+    that isn't one more than the value before it, is a multiple of `p`. That covers both
+    a tile of multiples and a run that starts at a multiple, such as
+    `pid * BLOCK + tl.arange(0, BLOCK)` with `BLOCK`. Pointer values count bytes.
+    """
+    if isinstance(x, IPointer):
+        data = x.offsets
+        base = x.flat.__array_interface__["data"][0] if x.flat.size else 0
+        size = x.elem.itemsize
+    else:
+        data = _itile(x).data
+        base, size = 0, 1
+    data = np.asarray(data)
+    pows = [v & -v for v in vals]
+    if data.ndim == 0:
+        ok = kind != "multiple_of" or (base + int(data) * size) % pows[0] == 0
+    else:
+        ok = True
+        for axis, p in enumerate(pows):
+            groups, cont = _hint_runs(data, axis, min(p, data.shape[axis]))
+            if kind == "max_contiguous":
+                ok &= bool(cont[..., 1:].all())
+            else:
+                ok &= bool(np.all((base + groups[~cont] * size) % p == 0))
+    if not ok:
+        from enceladus.compiler.errors import DeviceAssertionError
+
+        shown = vals[0] if len(vals) == 1 else vals
+        raise DeviceAssertionError(f"tl.{kind}(..., {shown}) doesn't hold for these values",
+                                   I.kernel_loc(), INTERP.program_id)  # fmt: skip
+
+
+def _i_hint(kind: str) -> Callable[..., Any]:
+    def run(input, values):
+        x = core.unwrap(input)
+        if isinstance(x, (int, np.integer)) and not isinstance(x, (bool, np.bool_)):
+            vals = _hint_values(kind, values, 0)
+            if kind == "multiple_of" and int(x) % vals[0]:
+                raise CompilationError(f"tl.multiple_of({int(x)}, {vals[0]}) is false: "
+                                       f"{int(x)} isn't a multiple of {vals[0]}.")  # fmt: skip
+            return input
+        if isinstance(x, IPointer):
+            rank = len(x.shape)
+        elif isinstance(x, ITile) and x.dtype.is_int() and not x.dtype.is_bool():
+            rank = len(x.shape)
+        else:
+            raise CompilationError(
+                f"tl.{kind} needs an integer or pointer scalar or tile, but got {describe(x)}"
+            )
+        vals = _hint_values(kind, values, rank)
+        if core.debug_enabled():
+            _check_hint(x, vals, kind)
+        return input
+
+    return run
+
+
+@builtin(interp=_i_hint("multiple_of"))
+def multiple_of(ctx, input, values):
+    """Promises the compiler that `input` holds multiples of `values`, and returns `input`.
+
+    Along each dimension, the promise covers the first value of every run of consecutive
+    values that the compiler proves or that `tl.max_contiguous` promises. With no such
+    runs, it covers every value. For example, after
+    `offs = tl.multiple_of(start + tl.arange(0, BLOCK), BLOCK)`, the compiler treats
+    `start` as a multiple of `BLOCK`. Pointer values count bytes, as in Triton.
+
+    Pass an int for a scalar or a 1D tile, and a tuple with one int per dimension
+    otherwise. The compiler uses the promise to emit vector loads and stores. A false
+    promise gives wrong results. With `ENCELADUS_DEBUG=1`, the interpreter checks the
+    promise and raises `enceladus.DeviceAssertionError` when it doesn't hold.
+    """
+    return _hint(ctx, input, values, "multiple_of")
+
+
+@builtin(interp=_i_hint("max_contiguous"))
+def max_contiguous(ctx, input, values):
+    """Promises the compiler that `input` holds runs of consecutive values, and returns it.
+
+    `tl.max_contiguous(x, c)` promises that along each dimension, every aligned group of
+    `c` elements (the elements at indices `k * c` to `k * c + c - 1`) holds consecutive
+    values, such as `7, 8, 9, 10`. The compiler uses the largest power of two that divides
+    `c`, capped at the dimension's size.
+
+    Pass an int for a 1D tile, and a tuple with one int per dimension otherwise. The
+    compiler uses the promise to emit vector loads and stores. A false promise gives wrong
+    results. With `ENCELADUS_DEBUG=1`, the interpreter checks the promise and raises
+    `enceladus.DeviceAssertionError` when it doesn't hold.
+    """
+    return _hint(ctx, input, values, "max_contiguous")
+
+
+# ---------------------------------------------------------------------------
 # Tile methods
 # ---------------------------------------------------------------------------
 

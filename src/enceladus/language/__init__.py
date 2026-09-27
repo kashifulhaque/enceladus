@@ -63,8 +63,10 @@ from enceladus.language.ops import (
     join,
     load,
     make_tensor_descriptor,
+    max_contiguous,
     maximum,
     minimum,
+    multiple_of,
     num_programs,
     permute,
     program_id,
@@ -96,7 +98,7 @@ __all__ = [
     "where", "zeros", "zeros_like",
     "associative_scan", "atomic_add", "atomic_and", "atomic_cas", "atomic_max", "atomic_min",
     "atomic_or", "atomic_xchg", "atomic_xor", "cumsum", "debug_barrier", "device_assert",
-    "device_print",
+    "device_print", "max_contiguous", "multiple_of",
 ]  # fmt: skip
 
 

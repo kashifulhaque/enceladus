@@ -651,6 +651,43 @@ Atomically stores `val` where memory equals `cmp`, and returns the old values.
 The comparison is bitwise, so for floats `-0.0` doesn't match `0.0`, and a NaN matches
 a NaN with the same bits. Memory ordering is relaxed.
 
+## Compiler hints
+
+These functions return their input unchanged and promise facts about its values, which let the compiler emit vector loads and stores.
+
+### `tl.multiple_of`
+
+**Signature:** `tl.multiple_of(input, values)`
+
+Promises the compiler that `input` holds multiples of `values`, and returns `input`.
+
+Along each dimension, the promise covers the first value of every run of consecutive
+values that the compiler proves or that `tl.max_contiguous` promises. With no such
+runs, it covers every value. For example, after
+`offs = tl.multiple_of(start + tl.arange(0, BLOCK), BLOCK)`, the compiler treats
+`start` as a multiple of `BLOCK`. Pointer values count bytes, as in Triton.
+
+Pass an int for a scalar or a 1D tile, and a tuple with one int per dimension
+otherwise. The compiler uses the promise to emit vector loads and stores. A false
+promise gives wrong results. With `ENCELADUS_DEBUG=1`, the interpreter checks the
+promise and raises `enceladus.DeviceAssertionError` when it doesn't hold.
+
+### `tl.max_contiguous`
+
+**Signature:** `tl.max_contiguous(input, values)`
+
+Promises the compiler that `input` holds runs of consecutive values, and returns it.
+
+`tl.max_contiguous(x, c)` promises that along each dimension, every aligned group of
+`c` elements (the elements at indices `k * c` to `k * c + c - 1`) holds consecutive
+values, such as `7, 8, 9, 10`. The compiler uses the largest power of two that divides
+`c`, capped at the dimension's size.
+
+Pass an int for a 1D tile, and a tuple with one int per dimension otherwise. The
+compiler uses the promise to emit vector loads and stores. A false promise gives wrong
+results. With `ENCELADUS_DEBUG=1`, the interpreter checks the promise and raises
+`enceladus.DeviceAssertionError` when it doesn't hold.
+
 ## Loops and compile-time helpers
 
 These functions control loops and run checks while the kernel compiles.

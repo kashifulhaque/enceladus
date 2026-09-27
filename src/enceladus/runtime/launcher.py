@@ -40,9 +40,10 @@ from enceladus.runtime.raw import (
 from enceladus.runtime.tensor import Tensor
 
 MAX_ELEMENT_INDEX = (1 << 31) - 1
-"""The largest element offset from an array argument's first element that a compiled
-kernel can address. Generated code holds pointer offsets in a signed 32-bit `int`
-(64-bit offsets, `idx64`, aren't implemented), so a larger offset wraps around."""
+"""The largest element offset from an array argument's first element that a kernel
+compiled with 32-bit offsets can address. A larger offset would wrap around, so
+`@enceladus.jit` compiles an `idx64` variant, with 64-bit index math, for any launch with
+an array argument that spans more elements."""
 # A buffer of at most this many bytes can't hold an element past MAX_ELEMENT_INDEX, so
 # launches check the exact span only of arguments in larger buffers.
 _INDEX_CHECK_BYTES = 1 << 31
@@ -252,6 +253,35 @@ def launch_synced(stream: Any, pipeline: Any, plan: Any, bufs_values: Sequence[A
     stream.synchronize()
 
 
+def _last_index(value: Any) -> int:
+    """Returns how many elements the last element of array `value` lies past its first."""
+    shape = tuple(value.shape)
+    if 0 in shape:
+        return -1
+    strides = interop.element_strides(value)
+    return sum((n - 1) * abs(s) for n, s in zip(shape, strides, strict=True))
+
+
+def needs_idx64(value: Any) -> bool:
+    """Returns whether array `value` needs 64-bit offsets: some element lies more than
+    `MAX_ELEMENT_INDEX` elements past its first.
+
+    It checks the exact span only of arrays in buffers larger than 2 GB, and of
+    non-contiguous NumPy arrays, so the common case costs one attribute read.
+    """
+    t = type(value)
+    if t is Tensor:
+        if value.buffer.nbytes <= _INDEX_CHECK_BYTES:
+            return False
+    elif t is np.ndarray:
+        if value.nbytes <= _INDEX_CHECK_BYTES and value.flags.c_contiguous:
+            return False
+    elif interop.framework_of(value) == interop.KIND_TORCH:
+        if value.untyped_storage().nbytes() <= _INDEX_CHECK_BYTES:
+            return False
+    return _last_index(value) > MAX_ELEMENT_INDEX
+
+
 def check_index_range(value: Any, name: str) -> None:
     """Refuses an array argument whose elements lie too far apart for 32-bit offsets.
 
@@ -259,17 +289,19 @@ def check_index_range(value: Any, name: str) -> None:
         ValueError: Some element of `value` is more than `MAX_ELEMENT_INDEX` elements
             past its first element.
     """
-    shape = tuple(value.shape)
-    if 0 in shape:
-        return
-    strides = interop.element_strides(value)
-    last = sum((n - 1) * abs(s) for n, s in zip(shape, strides, strict=True))
+    last = _last_index(value)
     if last > MAX_ELEMENT_INDEX:
         raise ValueError(
-            f"argument `{name}` spans {last + 1} elements, but a compiled kernel can address "
-            "at most 2^31 elements of each array argument, because it computes offsets "
-            "in 32 bits. Split the array, and launch the kernel on each part."
+            f"argument `{name}` spans {last + 1} elements, but this kernel was compiled with "
+            "32-bit offsets, which address at most 2^31 elements of each array argument. "
+            "Launch it with `kernel[grid](...)`, which compiles a variant with 64-bit "
+            "offsets for such arrays, or compile one with `kernel.warmup(...)` on the large "
+            "array."
         )
+
+
+def _no_check(value: Any, name: str) -> None:
+    """Accepts any span: a kernel with 64-bit offsets (`idx64`) addresses every element."""
 
 
 # ---- Compiled kernels ----
@@ -298,6 +330,8 @@ class CompiledKernel:
             if it has no `tl.dot`.
         dot_fallbacks: Why each `tl.dot` that `dot_backend="mpp"` asked for uses
             `simdgroup` instead.
+        idx64: Whether the kernel computes index math and offsets in 64 bits, so it can
+            address array arguments that span more than 2^31 elements.
     """
 
     name: str
@@ -316,8 +350,11 @@ class CompiledKernel:
     assert_buffer_index: int | None = None
     dot_backend: str | None = None
     dot_fallbacks: list[str] = field(default_factory=list)
+    idx64: bool = False
 
     def __post_init__(self) -> None:
+        # A kernel with 32-bit offsets refuses arrays that it can't address.
+        self._span_check = _no_check if self.idx64 else check_index_range
         self._ptr_idx = [i for i, a in enumerate(self.args) if a.is_pointer]
         self._scalar_idx = [i for i, a in enumerate(self.args) if not a.is_pointer]
         self._packer = struct.Struct("<" + "".join(self.args[i].struct_format
@@ -420,7 +457,8 @@ class CompiledKernel:
         if debug:
             self._prepare_debug(get_device().stream)
         tl = self._torch
-        # The PyTorch hot path: every array is an MPS tensor in storage small enough.
+        # The PyTorch hot path: every array is an MPS tensor in storage small enough. A
+        # tensor in larger storage takes `_launch_foreign`, which checks its span.
         if type(tl) is TorchLaunch and tl.try_launch(values, grid[0], grid[1], grid[2]):
             return
         stream = get_device().stream
@@ -431,7 +469,7 @@ class CompiledKernel:
             if type(a) is Tensor:
                 buf = a.buffer
                 if buf.nbytes > _INDEX_CHECK_BYTES:
-                    check_index_range(a, self.args[i].name)
+                    self._span_check(a, self.args[i].name)
                 bufs.append(buf)
                 offsets.append(a.offset * a.np_dtype.itemsize if a.offset else 0)
                 continue
@@ -441,7 +479,7 @@ class CompiledKernel:
             if isinstance(a, np.ndarray):
                 # Check before wrapping, so that a huge strided view never reaches the
                 # copy fallback.
-                check_index_range(a, self.args[i].name)
+                self._span_check(a, self.args[i].name)
                 if self.args[i].written:
                     check_writable_numpy(a, f"argument `{self.args[i].name}`")
             ba = as_kernel_arg(a)
@@ -469,7 +507,7 @@ class CompiledKernel:
         if kinds == {interop.KIND_TORCH}:
             for i in self._ptr_idx:
                 interop.torch_np_dtype(values[i])  # refuses CPU and float64 tensors
-                check_index_range(values[i], self.args[i].name)
+                self._span_check(values[i], self.args[i].name)
             tl = self._torch
             if tl is None and self.language_version > TORCH_LANGUAGE_VERSION:
                 tl = self._torch = (f"it needs MSL {self.language_version}, and compile_shader "
@@ -498,7 +536,7 @@ class CompiledKernel:
             self._fallback_logged = True
             log_fallback(self.name, reason)
         for i in self._ptr_idx:
-            check_index_range(values[i], self.args[i].name)
+            self._span_check(values[i], self.args[i].name)
             if self.args[i].written:
                 _check_writable(values[i], self.args[i].name)
                 mlx_lazy.consume(values[i])
@@ -535,7 +573,7 @@ class CompiledKernel:
         if self.pipeline is not self._checked_pipeline:
             self._check_pipeline()
         for i in self._ptr_idx:
-            check_index_range(values[i], self.args[i].name)
+            self._span_check(values[i], self.args[i].name)
         interop.torch_synchronize()
         stream = get_device().stream
         if self._debug:

@@ -35,6 +35,8 @@ from enceladus.compiler.pipeline import compile_module
 from enceladus.interpreter import interp
 from enceladus.language import core
 from enceladus.runtime import interop
+from enceladus.runtime.launcher import _INDEX_CHECK_BYTES, needs_idx64
+from enceladus.runtime.tensor import Tensor
 
 __all__ = [
     "JITFunction",
@@ -148,7 +150,8 @@ def arg_facts(value: Any) -> dict[str, Any]:
 
     Integers get `divisibility = 16` when `value % 16 == 0` and `equal_to_1` when
     `value == 1`. Arrays get `divisibility = 16` when their data pointer is 16-byte
-    aligned. Facts become IR attributes; they never remove an argument.
+    aligned, and `idx64` when an element lies more than 2^31 - 1 elements past the first,
+    which needs 64-bit offsets. Facts become IR attributes; they never remove an argument.
     """
     if isinstance(value, (bool, np.bool_, float, np.floating)) or isinstance(value, ir.Type):
         return {}
@@ -165,8 +168,15 @@ def arg_facts(value: Any) -> dict[str, Any]:
         if aligned is None:
             p = _data_ptr(value)
             aligned = p is not None and p % 16 == 0
-        return {"divisibility": 16} if aligned else {}
+        facts = {"divisibility": 16} if aligned else {}
+        if hasattr(value, "shape") and needs_idx64(value):
+            facts["idx64"] = True
+        return facts
     return {}
+
+
+# Facts that `do_not_specialize` keeps, because the kernel is wrong without them.
+_REQUIRED_FACTS = ("idx64",)
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +369,10 @@ class JITFunction:
                 types[p.name] = arg_type(v)
             except TypeError as e:
                 raise TypeError(f"{self.__name__}: argument `{p.name}`: {e}") from None
-            facts[p.name] = {} if p.do_not_specialize else arg_facts(v)
+            f = arg_facts(v)
+            if p.do_not_specialize:
+                f = {k: x for k, x in f.items() if k in _REQUIRED_FACTS}
+            facts[p.name] = f
         return Specialization(types, facts, consts)
 
     def ir(self, *args: Any, num_warps: int = 4, **kwargs: Any) -> ir.Module:
@@ -706,7 +719,11 @@ def _const_key(v: Any) -> Any:
 
 
 def _spec_key(v: Any, no_facts: bool) -> Any:
-    """Returns the part of the specialization key contributed by one runtime argument."""
+    """Returns the part of the specialization key contributed by one runtime argument.
+
+    An array that needs 64-bit offsets adds `"idx64"` to its part, even when `no_facts`
+    is true, because a kernel with 32-bit offsets can't address it.
+    """
     t = type(v)
     if t is bool:
         return "i1"
@@ -721,19 +738,32 @@ def _spec_key(v: Any, no_facts: bool) -> Any:
     if t is float:
         return "f32"
     if t.__name__ == "Tensor" and t.__module__ == "torch":
-        return interop.torch_spec_key(v, no_facts)
+        k = interop.torch_spec_key(v, no_facts)
+        if v.untyped_storage().nbytes() > _INDEX_CHECK_BYTES and needs_idx64(v):
+            return (*k, "idx64")
+        return k
     if t.__name__ == "array" and t.__module__ == "mlx.core":
-        return interop.mlx_spec_key(v, no_facts)
-    from enceladus.runtime.tensor import Tensor
-
+        # A strided MLX view can span past 2^31 elements of a small array's buffer, and MLX
+        # has no cheap contiguity flag, so every MLX array gets the exact span check.
+        k = interop.mlx_spec_key(v, no_facts)
+        return (*k, "idx64") if needs_idx64(v) else k
     if t is Tensor:
-        return (v.np_dtype, True if no_facts else v.data_ptr % 16 == 0)
+        k = (v.np_dtype, True if no_facts else v.data_ptr % 16 == 0)
+        if v.buffer.nbytes > _INDEX_CHECK_BYTES and needs_idx64(v):
+            return (*k, "idx64")
+        return k
     if t is np.ndarray:
-        return (v.dtype, True if no_facts else v.__array_interface__["data"][0] % 16 == 0)
+        k = (v.dtype, True if no_facts else v.__array_interface__["data"][0] % 16 == 0)
+        if (v.nbytes > _INDEX_CHECK_BYTES or not v.flags.c_contiguous) and needs_idx64(v):
+            return (*k, "idx64")
+        return k
     if interop.framework_of(v) == interop.KIND_TORCH:  # a torch.Tensor subclass
-        return interop.torch_spec_key(v, no_facts)
+        k = interop.torch_spec_key(v, no_facts)
+        return (*k, "idx64") if needs_idx64(v) else k
     ty = arg_type(v)
-    facts = {} if no_facts else arg_facts(v)
+    facts = arg_facts(v)
+    if no_facts:
+        facts = {k: x for k, x in facts.items() if k in _REQUIRED_FACTS}
     return (str(ty), tuple(sorted(facts.items())))
 
 

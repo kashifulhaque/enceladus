@@ -773,6 +773,18 @@ def _v_barrier(op: Op) -> None:
     _arity(op, 0, 0)
 
 
+def _v_hint(op: Op) -> None:
+    _arity(op, 1, 1)
+    t = op.operands[0].type
+    _check(_is_ptr(t) or _is_int(t), "operand must be an integer or a pointer")
+    _check(op.result.type == t, "result type must match the operand")
+    _check(op.attrs.get("kind") in ("multiple_of", "max_contiguous"), "unknown hint `kind`")
+    vals = op.attrs.get("values")
+    _check(isinstance(vals, tuple) and len(vals) == max(1, len(shape_of(t)))
+           and all(isinstance(v, int) and v > 0 for v in vals),
+           "`values` must hold one positive int per dimension")  # fmt: skip
+
+
 VERIFIERS: dict[str, Callable[[Op], None]] = {
     "const": _v_const,
     "splat": _v_splat,
@@ -816,6 +828,7 @@ VERIFIERS: dict[str, Callable[[Op], None]] = {
     "local_store": _v_local_store,
     "local_load": _v_local_load,
     "barrier": _v_barrier,
+    "hint": _v_hint,
 }
 """The verifier rule for every op in the IR."""
 

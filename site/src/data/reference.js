@@ -69,6 +69,9 @@ export const REFERENCE = [
     ["atomic_or(pointer, val, mask=None, sem=None, scope=None)", "Applies a bitwise OR atomically. Integers only."],
     ["atomic_xor(pointer, val, mask=None, sem=None, scope=None)", "Applies a bitwise XOR atomically. Integers only."],
     ["atomic_cas(pointer, cmp, val, sem=None, scope=None)", "Stores val where memory equals cmp bitwise, and returns the old values. Takes no mask."]]],
+  ["tl", "Compiler hints", "Each returns its input unchanged. A false promise gives wrong results; ENCELADUS_DEBUG=1 checks it in the interpreter.", [
+    ["multiple_of(input, values)", "Promises that input holds multiples of values, or runs of consecutive values that start at one. Pointers count bytes."],
+    ["max_contiguous(input, values)", "Promises that every aligned group of values elements holds consecutive values."]]],
   ["tl", "Loops and compile time", "", [
     ["range(start, end=None, step=None, num_stages=None, ...)", "A runtime for-loop range. Triton pipelining hints are accepted and ignored."],
     ["static_range(start, end=None, step=None)", "A loop range that the compiler unrolls. The bounds must be compile-time values."],

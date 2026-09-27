@@ -1558,9 +1558,12 @@ without it, except where the known gaps say otherwise.
 ### Known gaps
 
 - `multiple_of`, `max_contiguous`, `join`, `split`, and vector loads aren't implemented.
-  `join` and `split` are added in the [join, split, constant folding, and edge versioning](#join-split-constant-folding-and-edge-versioning) entry.
+  The hints and vector loads are added in the
+  [hints, vector loads, and 64-bit offsets](#hints-vector-loads-and-64-bit-offsets) entry, and `join` and
+  `split` in the
+  [join, split, constant folding, and edge versioning](#join-split-constant-folding-and-edge-versioning) entry.
 - Full 64-bit offsets aren't supported; offsets that need them are refused instead of
-  wrapping.
+  wrapping. The [hints, vector loads, and 64-bit offsets](#hints-vector-loads-and-64-bit-offsets) entry adds them.
 - Edge versioning and constant folding aren't implemented. Both are added in the
   [join, split, constant folding, and edge versioning](#join-split-constant-folding-and-edge-versioning) entry.
 - 64-bit atomics other than `uint64` `max` and `min`, and integer `tl.dot`, aren't
@@ -1953,8 +1956,8 @@ run, from the three quietest of six runs (20-40 rounds each):
   so their output doesn't repeat.
 - Folding doesn't evaluate math functions other than `floor` and `ceil`, `fma`, or
   bitcasts, and doesn't fold `tl.minimum` and `tl.maximum` of two zeros.
-- `multiple_of`, `max_contiguous`, vector loads, and 64-bit offsets remain open, as the
-  bug-fix pass lists.
+- `multiple_of`, `max_contiguous`, vector loads, and 64-bit offsets were open when this
+  entry was written; the [hints, vector loads, and 64-bit offsets](#hints-vector-loads-and-64-bit-offsets) entry adds them.
 
 ## Interop pass after M9
 
@@ -2104,3 +2107,143 @@ The same session measured the other rows once, with `bench_dispatch.py`:
   still race.
 - Raw `metal_kernel` launches on PyTorch tensors still rebuild the argument mask on each
   launch; they weren't measured.
+
+## Hints, vector loads, and 64-bit offsets
+
+This pass adds three planned features that earlier milestones deferred: the
+`tl.multiple_of` and `tl.max_contiguous` hints (M2), vector loads and stores (M2), and
+64-bit offsets for arrays past 2^31 elements (`idx64`, M2).
+
+### What was built
+
+**AxisInfo** (`compiler/passes/axis_info.py`)
+
+- The analysis now keeps every fact a sound lower bound, because vector accesses rely
+  on it. Three rules claimed too much before. `expand_dims` gave the new dimension a
+  divisibility of 2^30, so `rm[:, None] * stride + rn[None, :]` claimed aligned rows for
+  any stride. `mul` multiplied divisibilities of contiguous operands, so
+  `tl.arange(0, 16) * 8` claimed 2^30. Loop-carried values kept their initial
+  contiguity even when the loop body changed it. The rules now follow Triton's, with
+  one more correction: an add whose result is less contiguous than an operand keeps only
+  the divisibility at the result's block starts.
+- Loops run to a fixed point over their carried values, and loop results get the
+  carried facts. A loop counter gets the divisibility of its start and step.
+- New rules: constancy through elementwise ops and loads; constancy of comparisons
+  between a contiguous value and a constant one (`offs < n` is constant on blocks that
+  divide `n`, and only for `<`, `>=`, and their mirrors); value-preserving integer
+  casts.
+- `vector_width` returns how many elements one access can move.
+
+**Hints** (`language/ops.py`, `compiler/ir.py`)
+
+- `tl.multiple_of(x, values)` and `tl.max_contiguous(x, values)` take an int for a
+  scalar or 1D tile and a tuple per dimension otherwise, as in Triton. They lower to an
+  identity `hint` op that `axis_info` reads and that layouts and codegen treat as a
+  view, so the promise covers only the hint's result. For pointers, divisibility counts
+  bytes, as in Triton. A float tile, a wrong number of values, or a non-positive value is
+  a `CompilationError`.
+- The interpreter returns the input unchanged. With `ENCELADUS_DEBUG=1`, it checks the
+  part of the promise that the compiler uses (the largest power of two that divides
+  each value) and raises `DeviceAssertionError` at the hint's line. The check caught a
+  false promise in this pass's own test.
+
+**Vector loads and stores** (`compiler/codegen/msl.py`)
+
+- A pointer-tile `load` or `store` uses `vec<T, N>` accesses, N up to 4, when the
+  layout's first N registers step along one dimension, `axis_info` proves the
+  addresses contiguous and aligned to N elements, and the mask, if any, is constant
+  across each vector. Otherwise, the scalar path runs. Masked-off vectors take `other`
+  per element. `tl.dot` results store two elements per vector.
+- Misaligned vector loads read wrong data on this GPU, silently: with the alignment
+  check removed, the new differential test mismatches up to 99% of elements. That's why
+  the AxisInfo fixes had to come first.
+
+**64-bit offsets** (`compiler/passes/widen_index.py`, `runtime/launcher.py`,
+`runtime/jit.py`)
+
+- The launcher no longer refuses arrays that span more than 2^31 - 1 elements. Instead,
+  `arg_facts` and the in-memory key mark such an array `idx64`, including under
+  `do_not_specialize`, and the kernel compiles a variant for it. The check costs one
+  attribute read per array (about 0.05 µs for a PyTorch tensor), and the exact span is
+  computed only for buffers over 2 GB and non-contiguous NumPy arrays.
+- In an `idx64` variant, `widen_index_math` recomputes in 64 bits the signed 32-bit
+  math that feeds pointer offsets, plus the comparisons that read it, so
+  `pid * BLOCK + tl.arange(0, BLOCK)` and its mask `offs < n` stay exact past 2^31.
+  Pointer tiles use `long` offsets. The 32-bit path stays the default.
+- `CompiledKernel.idx64` (and `GeneratedKernel.idx64`, and `meta.json`) records the
+  variant. A kernel with 32-bit offsets still refuses a too-large array if you launch it
+  directly with `CompiledKernel.launch`.
+- A tensor descriptor over an `idx64` argument is a `CompilationError`, because
+  descriptor addressing computes in 32 bits.
+
+### Benchmarks
+
+Other agents shared the GPU during this pass, so single runs varied by up to 10x. Each
+row interleaves scalar and vector builds of the same script (A/B) 5-8 times. Each run
+reports the minimum of 30-50 GPU-timestamped repetitions, and the table shows the median
+over runs.
+
+| Kernel | Scalar ms | Vector ms | Speedup |
+|---|---|---|---|
+| Pointer-tile matmul, float16, 2048^3, 64x64x32 | 3.651 | 2.904 | 1.26x |
+| Vector add, int8, 256 MB per array | 4.106 | 3.479 | 1.18x |
+| Vector add, float32, 256 MB per array | 3.588 | 3.549 | 1.01x |
+| Vector add, float16, 256 MB per array | 1.760 | 1.722 | 1.02x |
+| Softmax, 4096 x 4096, float32 / float16 | 0.581 / 0.306 | 0.579 / 0.280 | noise |
+| LayerNorm, 4096 x 4096, float32 / float16 | 0.610 / 0.296 | 0.610 / 0.283 | noise |
+| RMSNorm, 4096 x 4096, float32 / float16 | 0.590 / 0.279 | 0.587 / 0.275 | noise |
+| 2D copy, 8192 x 8192, float32 / float16 | 2.381 / 1.162 | 2.361 / 1.159 | 1.00x |
+| Descriptor matmul, float16, 2048^3 | 2.971 | 2.969 | 1.00x |
+| Flash attention, float16, 4 x 16 x 2048 x 64 | 13.835 | 13.763 | 1.00x |
+
+The float16 softmax and LayerNorm medians favor vectors by 5-9%, but their scalar runs
+include outliers, and the minimum over runs is equal (0.27 ms both ways), so they count
+as noise. A variant that moved 16-byte `uint4` words for 8-bit and 16-bit types measured
+the same as `vec<T, 4>` and was dropped. `bench_elementwise.py` now includes an int8 row.
+
+Compile time, frontend to MSL, median of 200 in one process: vector add 0.40 ms with
+the old AxisInfo and 0.42 ms with the new one; the pointer-tile matmul 2.37 ms and
+2.52 ms. `@enceladus.jit` launch overhead measured 3.55 µs sustained, and 5.38 µs on
+PyTorch tensors, within the noise of earlier runs.
+
+### Tests
+
+- `tests/test_axis_info.py` (new, 33 cases): AxisInfo facts for 9 probes, each of which
+  the old analysis got wrong or that guards a new rule; a differential test of vector
+  and scalar accesses over 4 dtypes and 4 cases (aligned, odd row stride, unaligned
+  view, ragged mask) that also checks which accesses vectorize; the hints in both modes,
+  including the debug check of a false promise; and two misuse errors with their lines.
+- `tests/test_runtime.py`: the old span-refusal case became a test that fake arrays
+  past 2^31 elements (a 16 GB stand-in buffer and a strided NumPy view) compile an
+  `idx64` variant with `long` offsets, that the variant's mask is exact past 2^31 when
+  launched on small arrays, and that a 32-bit kernel still refuses the array. A
+  `@pytest.mark.slow` test increments every byte of a real 2^31 + 77-byte array (2 GB,
+  about 1 s) with 32-bit index math and checks the last bytes.
+- `uv run pytest -q`: 939 passed, 19 skipped, and 2 deselected in about 6 s. With
+  `ENCELADUS_DEBUG=1`: the same. `uv run pytest -q -m slow`: 2 passed.
+- Every example runs compiled and in the interpreter.
+
+### Deviations from the plan
+
+- The hints are an IR op rather than an attribute on the defining op, as in Triton, so
+  a hint inside an `if` doesn't leak to uses outside it. A hint in a `matmul2d`
+  epilogue makes that loop fall back to `simdgroup_matrix`.
+- The plan's `idx64` switched offsets to `long`. That alone would keep
+  `pid * BLOCK` wrapping in 32 bits, and the mask would disagree with the address, so
+  the variant also widens the index math. This differs from Triton, which computes the
+  same kernel in 32 bits; the results differ only where 32-bit signed math overflows,
+  which is undefined behavior in Metal.
+- The in-memory key marks `idx64` arrays by span in elements, not by size in bytes.
+
+### Known gaps
+
+- In an `idx64` variant, 32-bit offsets that a loop carries across iterations still
+  wrap, and tensor descriptors refuse `idx64` arguments.
+- The interpreter computes index math in 32 bits, so it differs from an `idx64`
+  variant where that math overflows. It's too slow for such arrays anyway.
+- AxisInfo has no rules for `//`, `%`, shifts, `trans`, `reshape`, or `where`, so
+  offsets built with them don't vectorize.
+- Masked accesses under a ragged bound stay scalar; there's no runtime check for a
+  fully true vector mask.
+- The debug check of a hint checks the power-of-two part of each value, not the full
+  promise.

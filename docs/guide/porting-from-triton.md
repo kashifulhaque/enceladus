@@ -71,6 +71,18 @@ The following behavior differs from Triton.
 - Tile dimensions are limited to 65,536, and a tile must fit in 256 registers per
   thread.
 
+### Indexing
+
+- An array argument can span more than 2^31 elements without casts in the kernel. For
+  such a launch, Enceladus compiles a variant that computes the signed 32-bit math
+  that feeds pointer offsets, and the comparisons that read it, in 64 bits. Triton
+  needs `pid.to(tl.int64) * BLOCK` for the same kernel. 32-bit offsets that a loop
+  carries from one iteration to the next still wrap, and tensor descriptors refuse such
+  arrays.
+- `tl.multiple_of` and `tl.max_contiguous` work as in Triton: the compiler trusts them
+  and emits vector loads and stores. With `ENCELADUS_DEBUG=1`, the interpreter checks
+  them and raises `enceladus.DeviceAssertionError` for a false promise.
+
 ### Atomics
 
 - Memory ordering is relaxed only. `sem` accepts only `None` and `"relaxed"`, and
@@ -112,8 +124,7 @@ The compiler refuses the following Triton features with an `enceladus.Compilatio
 - Block pointers: `tl.make_block_ptr`, `tl.advance`, and the `boundary_check` and
   `padding_option` arguments of `tl.load` and `tl.store`. Use tensor descriptors.
 - `while` loops, `break`, and `continue`.
-- `tl.multiple_of` and `tl.max_contiguous` hints, `tl.inline_asm_elementwise`,
-  `tl.dot_scaled`, and the `libdevice` functions.
+- `tl.inline_asm_elementwise`, `tl.dot_scaled`, and the `libdevice` functions.
 - `tl.join` and `tl.split` on tiles of pointers. Join or split the integer offsets
   instead.
 - Other `tl` functions that aren't in the [Language reference](language-reference.md),
