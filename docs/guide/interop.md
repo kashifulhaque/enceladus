@@ -11,15 +11,19 @@ for example `uv add "enceladus[torch]"`.
 
 ## Write framework-neutral host code
 
-Two helpers let one host function serve every kind of array:
+The following helpers let one host function serve every kind of array:
 
 - `enceladus.new_empty(like, shape=None, dtype=None)` allocates an array of the same
   kind and device as `like`: a NumPy array, an `enceladus.Tensor`, a PyTorch tensor, or
-  an MLX array. `shape` and `dtype` default to those of `like`, and `dtype` is in
-  `like`'s framework.
+  an MLX array. `shape` and `dtype` default to those of `like`. `dtype` can be a NumPy
+  dtype, such as `np.float32`, or a dtype of `like`'s framework.
+- `enceladus.new_zeros(like, shape=None, dtype=None)` does the same, and fills the
+  array with zeros.
 - `enceladus.element_strides(x)` returns the strides of any supported array in elements.
   NumPy reports strides in bytes and MLX doesn't expose them, so pass this function's
   result to kernels instead.
+- `enceladus.element_dtype(x)` returns the element type of any supported array as a
+  NumPy dtype, for host code that chooses an output type.
 
 The following program defines a function that adds two arrays of any supported kind and
 returns an array of the same kind, and calls it on each kind:

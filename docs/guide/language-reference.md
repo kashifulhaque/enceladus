@@ -146,7 +146,7 @@ Returns a tile of zeros with the shape and dtype of `input`.
 
 ## Memory
 
-These functions read and write device memory through pointers.
+These functions read and write device memory through pointers, and order the accesses of a program's threads.
 
 ### `tl.load`
 
@@ -167,6 +167,18 @@ doesn't support; use `tl.make_tensor_descriptor` instead.
 Stores `value` through a pointer or a tile of pointers where `mask` is true.
 
 `value` is converted to the pointee dtype and broadcast to the pointer's shape.
+
+### `tl.debug_barrier`
+
+**Signature:** `tl.debug_barrier()`
+
+Waits for every thread of the program and orders their device memory accesses.
+
+After the barrier, every thread of the program sees the device memory stores that any
+thread of the same program made before it. Use it when a program loads addresses that
+it stored earlier through a different arrangement of elements, such as a loop that
+stores a tile and loads it back transposed. The barrier doesn't order memory between
+programs; use atomics for that. The interpreter doesn't need it and ignores it.
 
 ## Tensor descriptors
 

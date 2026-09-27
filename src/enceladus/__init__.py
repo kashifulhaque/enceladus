@@ -13,7 +13,13 @@ from enceladus._C import MetalError
 from enceladus.runtime.autotuner import Config, autotune, heuristics
 from enceladus.runtime.debug import capture
 from enceladus.runtime.device import Capabilities, get_device
-from enceladus.runtime.interop import async_numpy, element_strides, new_empty
+from enceladus.runtime.interop import (
+    async_numpy,
+    element_dtype,
+    element_strides,
+    new_empty,
+    new_zeros,
+)
 from enceladus.runtime.raw import metal_kernel
 from enceladus.runtime.stream import synchronize
 from enceladus.runtime.tensor import (
@@ -36,3 +42,19 @@ from enceladus import language
 from enceladus.compiler.errors import CompilationError, DeviceAssertionError
 from enceladus.language.core import constexpr
 from enceladus.runtime.jit import JITFunction, cdiv, jit, next_power_of_2
+
+_LAZY_SUBMODULES = ("configs", "testing")
+
+
+def __getattr__(name: str):
+    # `enceladus.configs` and `enceladus.testing` import on first use, so `import enceladus`
+    # doesn't pay for them.
+    if name in _LAZY_SUBMODULES:
+        import importlib
+
+        return importlib.import_module(f"enceladus.{name}")
+    raise AttributeError(f"module 'enceladus' has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted([*globals(), *_LAZY_SUBMODULES])

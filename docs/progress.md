@@ -122,12 +122,12 @@ propagation; and flush-on-threshold with cross-batch dependencies.
 
 ### Known gaps
 
-- `multiple_of` and `max_contiguous` (M2), atomics and scans (M7), `device_print` and
-  `device_assert` (M9), `join`, and `split` aren't implemented.
+- `multiple_of`, `max_contiguous`, `join`, and `split` aren't implemented. Atomics and
+  scans arrived in M7, and `device_print` and `device_assert` in M9.
 - The dependency hash tracks globals referenced by bare names only, not `module.attr`
-  chains, and has no test.
+  chains, and has no test. Fixed in the [bug-fix pass after M9](#bug-fix-pass-after-m9).
 - In the interpreter, the loop variable is a Python `int`, so `//`, `%`, and overflow on
-  it follow Python rules rather than `i32` rules.
+  it follow Python rules rather than `i32` rules. Fixed in the [bug-fix pass after M9](#bug-fix-pass-after-m9).
 
 ## M2: Layouts, codegen, and elementwise kernels
 
@@ -430,6 +430,8 @@ only the per-step interior test, the edge-fragment helper, and the epilogue mask
   modes differ for denormal inputs.
 - In the interpreter, `n and tile` returns the tile when `n` is truthy. Compiled mode
   refuses it. `not tile` compiles to an elementwise not, and the interpreter raises.
+  Since the [bug-fix pass after M9](#bug-fix-pass-after-m9), both modes refuse `not`
+  on tiles, and the interpreter warns about `n and tile` by default.
 - `x[:, None] + y[None, :]` at shapes such as 2 x 512 is refused as needing more than 256
   registers, because the broadcast view holds every copy in registers.
 - `p - k` for an `int32` `k` of -2^31 still wraps around. Negating it in `int64` would
@@ -823,7 +825,7 @@ the staging rule, and the one-B-fragment loop each fail at least one test.
   their tests and benchmarks compiled a dot before tuning.
 - Persisted autotuning results are keyed by the kernel's source hash, not the compiler
   version, so a compiler change keeps old winners until you delete
-  `~/.cache/enceladus/autotune/<kernel-hash>/`.
+  `~/.cache/enceladus/autotune/<kernel-hash>/`. Fixed in the [bug-fix pass after M9](#bug-fix-pass-after-m9).
 - Causal attention masks every key block. Skipping the mask for blocks entirely below the
   diagonal, as Triton's tutorial does with two loops, isn't implemented; causal runs are
   within 1-7% of MLX without it.
@@ -1282,12 +1284,13 @@ Python version.
 ### Known gaps
 
 - `uv add enceladus` from PyPI is untested, because the package isn't published. The
-  install path was verified with local wheel files only.
+  install path was verified with local wheel files only. Outdated: the package is
+  published; see the [bug-fix pass after M9](#bug-fix-pass-after-m9).
 - The wheels were built on macOS 27 with a deployment target of 15.0 and weren't tested
   on a macOS 15 machine. No wheel exists for Python 3.14; users on 3.14 build from
-  source.
+  source. The 3.14 part is outdated: the release workflow builds 3.14 wheels.
 - README links into `docs/guide/` are relative, so they break on PyPI's project page.
-  Replace them with absolute URLs once the repository has a public home.
+  Outdated: the README links are absolute.
 - Guide numbers (bandwidth, launch costs, and TFLOPS) come from the M4 Pro and are
   labeled as such.
 - The snippet checker's capture example leaves a small `.gputrace` bundle in the
@@ -1382,12 +1385,14 @@ what's wrong in terms of the kernel's code, and says what to do.
   `while`, `print`, early `return`, and helpers that aren't `@enceladus.jit`, and
   reports Python's own `NameError`, `TypeError`, or `ZeroDivisionError` for some
   mistakes. Those errors carry a traceback through the kernel line, not a
-  `CompilationError`.
+  `CompilationError`. Since the [bug-fix pass after M9](#bug-fix-pass-after-m9), the interpreter warns about such kernels by
+  default and raises `CompilationError` for Python errors.
 - The compiler accepts chained comparisons such as `0 < x < 1` and `not` on tiles
   (elementwise), but the interpreter refuses them. This pass doesn't change what either
-  mode accepts.
+  mode accepts. Fixed in the [bug-fix pass after M9](#bug-fix-pass-after-m9): both modes refuse them on tiles.
 - The interpreter accepts `tl.dot` shapes that the compiler refuses (K not a multiple of
-  8, or a tile too small for `num_warps`).
+  8, or a tile too small for `num_warps`). Since the [bug-fix pass after M9](#bug-fix-pass-after-m9), it warns about them by
+  default.
 - The frontend turns a `TypeError`, `ValueError`, `KeyError`, or `AttributeError` raised
   while it evaluates a line into "evaluating this line at compile time raised ...". A
   compiler bug in a builtin handler looks like a user error there.
@@ -1428,3 +1433,138 @@ unchanged.
 - `mpp` is the largest gain at small and ragged shapes: tuned 32 x 32 `mpp` reaches 3.75
   (FP32) and 4.32 (FP16) TFLOPS at 513³, against 1.71 and 1.81 for simdgroup and 1.33 and
   1.39 for MLX.
+
+## Bug-fix pass after M9
+
+An audit of the runtime, the code generator, the cache and autotuner, the frontend, and
+the interpreter looked for silent miscompiles, crashes, leaks, and places where the
+interpreter and compiled mode disagree. Each fix has a regression test that fails
+without it, except where the known gaps say otherwise.
+
+### What changed
+
+**Runtime**
+
+- A buffer retain leaked on every read of `MTLBuffer.contents`, because Python threads
+  have no autorelease pool. Every native entry point runs inside `@autoreleasepool`.
+- Grids that overflow Metal's dispatch limits, and tensors of 2^31 elements or more,
+  raise errors instead of running wrong.
+- Launches and syncs from several threads are safe: the native stream locks around each
+  dispatch, flush, and sync, and waits without holding the lock.
+- A lost log sentinel no longer makes every later sync wait for the full timeout.
+- A failed command buffer resets the assert buffers, so a later sync doesn't report a
+  stale assert.
+- Writes through a read-only NumPy array raise an error. Float scalars out of range for
+  `float` or `half` round to infinity, as C converts. Empty views launch correctly.
+- A launch checks its threadgroup size against the pipeline's
+  `maxTotalThreadsPerThreadgroup`, which register use can lower. Committed command
+  buffers that completed without an error are pruned at each flush, so memory stays
+  bounded without syncs.
+- `dl_delete` does nothing while the interpreter finalizes.
+
+**Code generation**
+
+- A `tl.dot` operand loaded before a store to the same memory read the stored values.
+- `tl.tanh` uses an accurate prelude function, and `tl.sin` and `tl.cos` use Metal's
+  precise variants. The fast versions return 0 or NaN for large inputs.
+- Relaxed math mode keeps IEEE 754 NaN comparisons through `isunordered` guards.
+  `tl.argmax` and `tl.argmin` skip NaNs, like `tl.max` and `tl.min`.
+- Loop-carried staging buffers, 64-bit loop counters (including `uint64` counters), and
+  the `ENCELADUS_DEBUG` source-line comments were fixed.
+
+**Cache and autotuning**
+
+- The dependency hash (`_DependencyFinder`) covers module and class attribute chains,
+  tuples, and the source, closures, and globals of plain helper functions. Float keys
+  compare by bit pattern.
+- `meta.json` is written atomically, a corrupt cache entry counts as a miss, and
+  `compiler_hash` covers every compiler source file.
+- Autotune keys include the compiler version and apply the signature's defaults, equal
+  key values such as `np.int64(1000)` and `1000` share a key, and dtypes are
+  normalized. `restore_value` restores before every run. The
+  results file is locked. `Autotuner` and `Heuristics` support `explain` and `warmup`.
+  The dot-backend fallback is logged on a cache hit too. Unused spill-cliff code was
+  removed.
+
+**Frontend**
+
+- A `for` target shadows an outer name correctly, and the loop counter type follows the
+  bounds.
+- A literal that doesn't fit its destination type is an error instead of a silent
+  narrowing, including float literals stored to or loaded as integers.
+- Negation of `int1`, pointer `tl.where` with one base, and several error messages were
+  fixed.
+- Chained comparisons on tiles and `not` on tiles are refused. Scalar comparison chains
+  short-circuit, as in Python.
+
+**Interpreter**
+
+- Loop variables are typed scalars, through a source rewrite. Unsigned literals wrap,
+  `argmax` handles NaN, pointer `tl.where` works, and Python errors become
+  `CompilationError`.
+- Examples 07 and 08 work with PyTorch and MLX arrays. `benchmarks/run_all.py` finds
+  every benchmark and doesn't overwrite earlier reports.
+
+**Follow-up fixes**
+
+- `uint64` scalars of 2^63 or more: Python ints in [2^63, 2^64) and every `np.uint64`
+  argument type as `u64` (`jit.arg_type` and `_spec_key`), in both modes and on the
+  PyTorch path.
+- Values the dependency hash can't track: the frontend refuses attributes of objects
+  other than modules, classes, and constant values, and callable objects other than
+  functions, `@enceladus.jit` functions, `functools.partial` and `functools.cache`
+  wrappers, builtins, and classes. `jit.is_tracked` mirrors `_DependencyFinder.token`.
+- Float literals out of range for an integer store or `other=` value raise
+  `CompilationError` in both modes.
+- The interpreter runs the compiler's checks, including codegen, once per
+  specialization by default. A refused kernel gets one warning that names the line;
+  `ENCELADUS_VERIFY=1` raises and `ENCELADUS_VERIFY=0` skips the check. Kernels without
+  readable source aren't checked.
+- Examples 03, 05, 06, 09, and 10 work with PyTorch and MLX arrays. New host helpers
+  support them: `enceladus.new_zeros`, `enceladus.element_dtype`, and NumPy dtypes in
+  `enceladus.new_empty`.
+- `tl.debug_barrier()` orders a program's device memory accesses across its threads. It
+  compiles to `threadgroup_barrier(mem_device | mem_threadgroup)`, and the interpreter
+  ignores it. Control flow depends only on uniform scalars, so every thread reaches it.
+
+### Tests
+
+- `uv run pytest -q`: 906 passed, 19 skipped, and 1 deselected in about 8 s. With
+  `ENCELADUS_DEBUG=1`: the same counts in about 10 s. `uv run pytest -q -m slow`: 1
+  passed.
+- The follow-up fixes added a `uint64` loop test in both modes, four untracked-global
+  error cases, float-literal cases in both modes, a verification warning test, five
+  examples in the framework test (72 cases), and a store-barrier-reload test that fails
+  on the GPU without the barrier.
+- Every example runs compiled and in the interpreter, and every benchmark runs.
+
+### Deviations from the plan
+
+- Behavior changes: literal narrowing, chained comparisons on tiles, `not` on tiles, and
+  untracked globals are refused where they were accepted.
+- Interpreted launches check each specialization with the compiler, which adds about
+  4 µs per launch and one compile per specialization.
+- Example 03's kernel takes separate input and output row strides.
+- Trade-offs:
+  - `tl.sin` and `tl.cos` take up to 3.3 times as long in compute-bound code.
+  - `tl.tanh` takes 1.7 times as long as the old, inaccurate fast `tanh`.
+  - Interpreter loops over scalars only are about 200 times slower, about 4 µs per
+    iteration, because loop variables are typed scalars.
+  - `@enceladus.jit` launches on PyTorch tensors measured 5.05-5.23 µs, against
+    4.95-5.04 µs before the pass.
+
+### Known gaps
+
+- `multiple_of`, `max_contiguous`, `join`, `split`, and vector loads aren't implemented.
+- Full 64-bit offsets aren't supported; offsets that need them are refused instead of
+  wrapping.
+- Edge versioning and constant folding aren't implemented.
+- 64-bit atomics other than `uint64` `max` and `min`, and integer `tl.dot`, aren't
+  supported.
+- MLX arrays aren't evaluated lazily; launches synchronize.
+- The `dl_delete` finalization guard has no test.
+- A plain helper function that reads an attribute of an untracked object still gets a
+  token that holds only for the process, because the frontend doesn't see inside the
+  helper.
+- Converting an out-of-range runtime float to an integer type differs between modes:
+  the GPU saturates and the interpreter wraps. Both are undefined in C.

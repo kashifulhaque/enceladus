@@ -18,6 +18,11 @@
 #define RETAIN(x) ((__bridge_retained void *)(x))
 #define BORROW(T, p) ((__bridge T)(p))
 
+// Every entry point that sends Objective-C messages runs inside @autoreleasepool.
+// Python threads never drain a pool of their own, so an object that Metal or ARC
+// autoreleases outside a pool leaks for the life of the process. Reading
+// MTLBuffer.contents, for example, autoreleases a retain of the buffer.
+
 static void copy_str(NSString *s, char *out, size_t n) {
     if (!out || n == 0) return;
     out[0] = 0;
@@ -32,12 +37,16 @@ static void copy_std(const std::string &s, char *out, size_t n) {
 // ---- Device ----------------------------------------------------------------
 
 void *fr_device_default(void) {
-    id<MTLDevice> d = MTLCreateSystemDefaultDevice();
-    return d ? RETAIN(d) : NULL;
+    @autoreleasepool {
+        id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+        return d ? RETAIN(d) : NULL;
+    }
 }
 
 void fr_device_name(void *dev, char *out, size_t n) {
-    copy_str(BORROW(id<MTLDevice>, dev).name, out, n);
+    @autoreleasepool {
+        copy_str(BORROW(id<MTLDevice>, dev).name, out, n);
+    }
 }
 
 void fr_device_architecture(void *dev, char *out, size_t n) {
@@ -47,22 +56,26 @@ void fr_device_architecture(void *dev, char *out, size_t n) {
 }
 
 void fr_device_query(void *dev, fr_device_info *out) {
-    id<MTLDevice> d = BORROW(id<MTLDevice>, dev);
-    memset(out, 0, sizeof *out);
-    out->max_threadgroup_memory = d.maxThreadgroupMemoryLength;
-    MTLSize t = d.maxThreadsPerThreadgroup;
-    out->max_threads_per_threadgroup = t.width;
-    out->max_buffer_length = d.maxBufferLength;
-    out->recommended_max_working_set = d.recommendedMaxWorkingSetSize;
-    out->max_concurrent_compilations = d.maximumConcurrentCompilationTaskCount;
-    for (int i = 1; i <= 10; ++i)
-        out->supports_apple[i] = [d supportsFamily:(MTLGPUFamily)(1000 + i)] ? 1 : 0;
-    out->supports_metal3 = [d supportsFamily:(MTLGPUFamily)5001] ? 1 : 0;
-    out->supports_metal4 = [d supportsFamily:(MTLGPUFamily)5002] ? 1 : 0;
+    @autoreleasepool {
+        id<MTLDevice> d = BORROW(id<MTLDevice>, dev);
+        memset(out, 0, sizeof *out);
+        out->max_threadgroup_memory = d.maxThreadgroupMemoryLength;
+        MTLSize t = d.maxThreadsPerThreadgroup;
+        out->max_threads_per_threadgroup = t.width;
+        out->max_buffer_length = d.maxBufferLength;
+        out->recommended_max_working_set = d.recommendedMaxWorkingSetSize;
+        out->max_concurrent_compilations = d.maximumConcurrentCompilationTaskCount;
+        for (int i = 1; i <= 10; ++i)
+            out->supports_apple[i] = [d supportsFamily:(MTLGPUFamily)(1000 + i)] ? 1 : 0;
+        out->supports_metal3 = [d supportsFamily:(MTLGPUFamily)5001] ? 1 : 0;
+        out->supports_metal4 = [d supportsFamily:(MTLGPUFamily)5002] ? 1 : 0;
+    }
 }
 
 void *fr_queue_new(void *dev) {
-    return RETAIN([BORROW(id<MTLDevice>, dev) newCommandQueue]);
+    @autoreleasepool {
+        return RETAIN([BORROW(id<MTLDevice>, dev) newCommandQueue]);
+    }
 }
 
 void fr_retain(void *obj) {
@@ -257,10 +270,12 @@ void *fr_pipeline_new(void *dev, void *fn, char *err, size_t errlen) {
 }
 
 void fr_pipeline_query(void *p, fr_pipeline_info *out) {
-    id<MTLComputePipelineState> pso = BORROW(id<MTLComputePipelineState>, p);
-    out->thread_execution_width = (uint32_t)pso.threadExecutionWidth;
-    out->max_total_threads_per_threadgroup = (uint32_t)pso.maxTotalThreadsPerThreadgroup;
-    out->static_threadgroup_memory = (uint32_t)pso.staticThreadgroupMemoryLength;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = BORROW(id<MTLComputePipelineState>, p);
+        out->thread_execution_width = (uint32_t)pso.threadExecutionWidth;
+        out->max_total_threads_per_threadgroup = (uint32_t)pso.maxTotalThreadsPerThreadgroup;
+        out->static_threadgroup_memory = (uint32_t)pso.staticThreadgroupMemoryLength;
+    }
 }
 
 int fr_pipeline_bindings(void *p, fr_binding *out, int cap) {
@@ -300,17 +315,23 @@ int fr_pipeline_bindings(void *p, fr_binding *out, int cap) {
 // ---- Buffers ---------------------------------------------------------------
 
 void *fr_buffer_new(void *dev, size_t nbytes) {
-    id<MTLBuffer> b = [BORROW(id<MTLDevice>, dev) newBufferWithLength:(nbytes ? nbytes : 16)
-                                                              options:MTLResourceStorageModeShared];
-    return b ? RETAIN(b) : NULL;
+    @autoreleasepool {
+        id<MTLBuffer> b =
+            [BORROW(id<MTLDevice>, dev) newBufferWithLength:(nbytes ? nbytes : 16)
+                                                    options:MTLResourceStorageModeShared];
+        return b ? RETAIN(b) : NULL;
+    }
 }
 
 void *fr_buffer_nocopy(void *dev, void *ptr, size_t nbytes) {
-    id<MTLBuffer> b = [BORROW(id<MTLDevice>, dev) newBufferWithBytesNoCopy:ptr
-                                                                    length:nbytes
-                                                                   options:MTLResourceStorageModeShared
-                                                               deallocator:nil];
-    return b ? RETAIN(b) : NULL;
+    @autoreleasepool {
+        id<MTLBuffer> b =
+            [BORROW(id<MTLDevice>, dev) newBufferWithBytesNoCopy:ptr
+                                                          length:nbytes
+                                                         options:MTLResourceStorageModeShared
+                                                     deallocator:nil];
+        return b ? RETAIN(b) : NULL;
+    }
 }
 
 void *fr_buffer_from_mtl(void *mtl_buffer) {
@@ -319,8 +340,17 @@ void *fr_buffer_from_mtl(void *mtl_buffer) {
     return mtl_buffer;
 }
 
-void *fr_buffer_contents(void *buf) { return BORROW(id<MTLBuffer>, buf).contents; }
-size_t fr_buffer_length(void *buf) { return BORROW(id<MTLBuffer>, buf).length; }
+void *fr_buffer_contents(void *buf) {
+    @autoreleasepool {
+        return BORROW(id<MTLBuffer>, buf).contents;
+    }
+}
+
+size_t fr_buffer_length(void *buf) {
+    @autoreleasepool {
+        return BORROW(id<MTLBuffer>, buf).length;
+    }
+}
 
 // ---- Streams ---------------------------------------------------------------
 
@@ -329,16 +359,22 @@ struct fr_committed {
     std::string kernels;  // comma-separated kernel names, for error messages
 };
 
+// `mu` guards every field after it. Python releases the GIL while a thread syncs, so
+// another thread can dispatch or flush at the same time.
 struct fr_stream {
     id<MTLCommandQueue> queue;
     id<MTLSharedEvent> event;
     MTLCommandBufferDescriptor *desc;
+    std::mutex mu;
     id<MTLCommandBuffer> cb;
     id<MTLComputeCommandEncoder> enc;
     uint64_t next_value = 0;
     int pending = 0;
     std::vector<std::string> names;  // kernels in the open command buffer (copies)
-    std::vector<fr_committed> committed;  // since the previous sync
+    // Committed command buffers that no sync has waited for yet. Each one retains the
+    // buffers it uses, so a flush drops the ones that completed without an error; the
+    // list stays short when the host never syncs.
+    std::vector<fr_committed> committed;
     id<MTLComputePipelineState> log_sentinel;  // see fr_stream_set_log_sentinel
     bool log_marked = false;
     uint64_t log_sentinels = 0;
@@ -352,13 +388,6 @@ void *fr_stream_new(void *queue) {
         s->desc = [MTLCommandBufferDescriptor new];
         s->desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
         return s;
-    }
-}
-
-static void stream_open(fr_stream *s) {
-    @autoreleasepool {
-        s->cb = [s->queue commandBufferWithDescriptor:s->desc];
-        s->enc = [s->cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
     }
 }
 
@@ -379,16 +408,30 @@ static inline void encode(id<MTLComputeCommandEncoder> enc, void *pso, const fr_
         threadsPerThreadgroup:MTLSizeMake(tg[0], tg[1], tg[2])];
 }
 
-void fr_stream_dispatch(void *stream, void *pso, const char *name, const fr_launch_plan *plan,
-                        void *const *bufs, const uint64_t *offsets, const void *scalar_bytes,
-                        const uint32_t grid[3], const uint32_t tg[3]) {
-    fr_stream *s = (fr_stream *)stream;
-    if (!s->enc) stream_open(s);
+// The *_locked helpers expect the caller to hold s->mu inside an autorelease pool.
+
+static void dispatch_locked(fr_stream *s, void *pso, const char *name, const fr_launch_plan *plan,
+                            void *const *bufs, const uint64_t *offsets, const void *scalar_bytes,
+                            const uint32_t grid[3], const uint32_t tg[3]) {
+    if (!s->enc) {
+        s->cb = [s->queue commandBufferWithDescriptor:s->desc];
+        s->enc = [s->cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    }
     encode(s->enc, pso, plan, bufs, offsets, scalar_bytes, grid, tg);
     // Copy the name: the pipeline that owns it can be freed before the next flush.
     const char *n = name ? name : "<unnamed>";
     if (s->names.empty() || s->names.back() != n) s->names.emplace_back(n);
     ++s->pending;
+}
+
+void fr_stream_dispatch(void *stream, void *pso, const char *name, const fr_launch_plan *plan,
+                        void *const *bufs, const uint64_t *offsets, const void *scalar_bytes,
+                        const uint32_t grid[3], const uint32_t tg[3]) {
+    fr_stream *s = (fr_stream *)stream;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(s->mu);
+        dispatch_locked(s, pso, name, plan, bufs, offsets, scalar_bytes, grid, tg);
+    }
 }
 
 static std::string join_names(const std::vector<std::string> &names) {
@@ -406,35 +449,73 @@ static std::string join_names(const std::vector<std::string> &names) {
 }
 
 void fr_stream_set_log_sentinel(void *stream, void *pso) {
-    ((fr_stream *)stream)->log_sentinel = BORROW(id<MTLComputePipelineState>, pso);
+    fr_stream *s = (fr_stream *)stream;
+    std::lock_guard<std::mutex> lock(s->mu);
+    s->log_sentinel = BORROW(id<MTLComputePipelineState>, pso);
 }
 
-void fr_stream_mark_logging(void *stream) { ((fr_stream *)stream)->log_marked = true; }
+void fr_stream_mark_logging(void *stream) {
+    fr_stream *s = (fr_stream *)stream;
+    std::lock_guard<std::mutex> lock(s->mu);
+    s->log_marked = true;
+}
 
-uint64_t fr_stream_log_sentinels(void *stream) { return ((fr_stream *)stream)->log_sentinels; }
+uint64_t fr_stream_log_sentinels(void *stream) {
+    fr_stream *s = (fr_stream *)stream;
+    std::lock_guard<std::mutex> lock(s->mu);
+    return s->log_sentinels;
+}
+
+static void flush_locked(fr_stream *s) {
+    // Drop the leading command buffers that completed without an error. Stop at the
+    // first other one, so that a sync still reports every failure.
+    size_t done = 0;
+    while (done < s->committed.size() &&
+           s->committed[done].cb.status == MTLCommandBufferStatusCompleted)
+        ++done;
+    if (done) s->committed.erase(s->committed.begin(), s->committed.begin() + done);
+    if (!s->enc) return;
+    if (s->log_marked && s->log_sentinel) {
+        // The serial encoder runs this after every earlier dispatch, so its message
+        // is the last one this command buffer logs.
+        [s->enc setComputePipelineState:s->log_sentinel];
+        [s->enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        ++s->log_sentinels;
+    }
+    s->log_marked = false;
+    [s->enc endEncoding];
+    [s->cb encodeSignalEvent:s->event value:++s->next_value];
+    [s->cb commit];
+    s->committed.push_back({s->cb, join_names(s->names)});
+    s->enc = nil;
+    s->cb = nil;
+    s->names.clear();
+    s->pending = 0;
+}
 
 void fr_stream_flush(void *stream) {
     fr_stream *s = (fr_stream *)stream;
-    if (!s->enc) return;
     @autoreleasepool {
-        if (s->log_marked && s->log_sentinel) {
-            // The serial encoder runs this after every earlier dispatch, so its message
-            // is the last one this command buffer logs.
-            [s->enc setComputePipelineState:s->log_sentinel];
-            [s->enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-            ++s->log_sentinels;
-        }
-        s->log_marked = false;
-        [s->enc endEncoding];
-        [s->cb encodeSignalEvent:s->event value:++s->next_value];
-        [s->cb commit];
-        s->committed.push_back({s->cb, join_names(s->names)});
-        s->enc = nil;
-        s->cb = nil;
-        s->names.clear();
-        s->pending = 0;
+        std::lock_guard<std::mutex> lock(s->mu);
+        flush_locked(s);
     }
+}
+
+// Command buffers that one waiter owns, and the event value that the last of them
+// signals.
+struct fr_wait_set {
+    std::vector<fr_committed> cbs;
+    uint64_t target = 0;
+};
+
+// Moves every committed command buffer into a wait set, so that the caller can wait
+// without holding the lock.
+static fr_wait_set take_committed_locked(fr_stream *s) {
+    fr_wait_set w;
+    w.cbs.swap(s->committed);
+    w.target = s->next_value;
+    return w;
 }
 
 static std::string describe_error(id<MTLCommandBuffer> cb, const std::string &kernels) {
@@ -456,20 +537,21 @@ static std::string describe_error(id<MTLCommandBuffer> cb, const std::string &ke
     return msg;
 }
 
-// Waits for everything committed so far and collects errors. Returns 0 on success.
-static int stream_wait(fr_stream *s, char *err, size_t errlen) {
+// Waits for the command buffers in `w` and collects errors. Returns 0 on success. It
+// reads only the stream's immutable fields, so the caller must not hold s->mu.
+static int wait_set(fr_stream *s, const fr_wait_set &w, char *err, size_t errlen) {
+    if (w.cbs.empty()) return 0;
     int rc = 0;
-    if (!s->committed.empty()) {
-        uint64_t target = s->next_value;
-        id<MTLCommandBuffer> last = s->committed.back().cb;
+    @autoreleasepool {
+        id<MTLCommandBuffer> last = w.cbs.back().cb;
         // Spin on the shared event, which was the fastest wait. A failed command
         // buffer may never signal, so also watch the last buffer's status.
-        for (unsigned spins = 0; s->event.signaledValue < target; ++spins) {
+        for (unsigned spins = 0; s->event.signaledValue < w.target; ++spins) {
             if (last.status >= MTLCommandBufferStatusCompleted) break;
             if (spins > 2000) usleep(spins > 20000 ? 200 : 10);
         }
         std::string msg;
-        for (auto &c : s->committed) {
+        for (auto &c : w.cbs) {
             // The event fires when GPU work ends; the status settles a moment later.
             while (c.cb.status < MTLCommandBufferStatusCompleted) usleep(1);
             if (c.cb.status == MTLCommandBufferStatusError && msg.empty()) {
@@ -478,7 +560,6 @@ static int stream_wait(fr_stream *s, char *err, size_t errlen) {
             }
         }
         if (rc) copy_std(msg, err, errlen);
-        s->committed.clear();
     }
     return rc;
 }
@@ -486,11 +567,20 @@ static int stream_wait(fr_stream *s, char *err, size_t errlen) {
 int fr_stream_sync(void *stream, char *err, size_t errlen) {
     fr_stream *s = (fr_stream *)stream;
     if (err && errlen) err[0] = 0;
-    fr_stream_flush(s);
-    return stream_wait(s, err, errlen);
+    fr_wait_set w;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(s->mu);
+        flush_locked(s);
+        w = take_committed_locked(s);
+    }
+    return wait_set(s, w, err, errlen);
 }
 
-int fr_stream_pending(void *stream) { return ((fr_stream *)stream)->pending; }
+int fr_stream_pending(void *stream) {
+    fr_stream *s = (fr_stream *)stream;
+    std::lock_guard<std::mutex> lock(s->mu);
+    return s->pending;
+}
 
 void fr_stream_free(void *stream) {
     fr_stream *s = (fr_stream *)stream;
@@ -500,26 +590,50 @@ void fr_stream_free(void *stream) {
     delete s;
 }
 
+// Waits for `w`, then writes the GPU start and end times of `cb`, or zeros if `cb` is
+// nil. Returns 0 on success.
+static int wait_and_time(fr_stream *s, id<MTLCommandBuffer> cb, const fr_wait_set &w,
+                         double *gpu_start, double *gpu_end, char *err, size_t errlen) {
+    int rc = wait_set(s, w, err, errlen);
+    @autoreleasepool {
+        *gpu_start = cb ? cb.GPUStartTime : 0;
+        *gpu_end = cb ? cb.GPUEndTime : 0;
+    }
+    return rc;
+}
+
 int fr_stream_timed_run(void *stream, void *pso, const char *name, const fr_launch_plan *plan,
                         void *const *bufs, const uint64_t *offsets, const void *scalar_bytes,
                         const uint32_t grid[3], const uint32_t tg[3], double *gpu_start,
                         double *gpu_end, char *err, size_t errlen) {
     fr_stream *s = (fr_stream *)stream;
-    fr_stream_dispatch(s, pso, name, plan, bufs, offsets, scalar_bytes, grid, tg);
-    // Anything already pending would be timed too; callers sync first.
-    return fr_stream_flush_timed(s, gpu_start, gpu_end, err, errlen);
+    if (err && errlen) err[0] = 0;
+    id<MTLCommandBuffer> cb;
+    fr_wait_set w;
+    @autoreleasepool {
+        // Hold the lock from the dispatch through the commit, so that no other thread's
+        // dispatch lands in the timed command buffer. Anything already pending would be
+        // timed too; callers sync first.
+        std::lock_guard<std::mutex> lock(s->mu);
+        dispatch_locked(s, pso, name, plan, bufs, offsets, scalar_bytes, grid, tg);
+        cb = s->cb;
+        flush_locked(s);
+        w = take_committed_locked(s);
+    }
+    return wait_and_time(s, cb, w, gpu_start, gpu_end, err, errlen);
 }
 
 int fr_stream_flush_timed(void *stream, double *gpu_start, double *gpu_end, char *err,
                           size_t errlen) {
     fr_stream *s = (fr_stream *)stream;
     if (err && errlen) err[0] = 0;
-    *gpu_start = *gpu_end = 0;
-    if (!s->enc) return stream_wait(s, err, errlen);
-    id<MTLCommandBuffer> cb = s->cb;
-    fr_stream_flush(s);
-    int rc = stream_wait(s, err, errlen);
-    *gpu_start = cb.GPUStartTime;
-    *gpu_end = cb.GPUEndTime;
-    return rc;
+    id<MTLCommandBuffer> cb;
+    fr_wait_set w;
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(s->mu);
+        cb = s->cb;  // nil when no command buffer is open
+        flush_locked(s);
+        w = take_committed_locked(s);
+    }
+    return wait_and_time(s, cb, w, gpu_start, gpu_end, err, errlen);
 }

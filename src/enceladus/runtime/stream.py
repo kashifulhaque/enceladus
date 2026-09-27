@@ -55,6 +55,8 @@ class Stream:
         self.log_queue: _C.Queue | None = None
         # Kernels with device asserts launched since the previous sync, by id.
         self._assert_kernels: dict[int, Any] = {}
+        # Sentinels that the stream committed but the logging queue never received.
+        self._lost_sentinels = 0
 
     @property
     def pending(self) -> int:
@@ -94,20 +96,30 @@ class Stream:
             enceladus.DeviceAssertionError: A `tl.device_assert` failed in a kernel that
                 ran since the previous sync.
         """
+        # Take what belongs to the work launched so far before waiting for it. Launches
+        # register these after they dispatch, so each entry's dispatch is in the wait
+        # below. Another thread can launch during the wait; what it registers stays for
+        # a later sync.
+        keepalive, self._keepalive = self._keepalive, []
+        callbacks, self._after_sync = self._after_sync, []
+        asserts, self._assert_kernels = self._assert_kernels, {}
         failed = True
         try:
             self.native.sync()
             failed = False
         finally:
-            callbacks, self._after_sync = self._after_sync, []
-            self._keepalive.clear()
+            keepalive.clear()
             if self.log_queue is not None:
                 # A failed command buffer might never log its sentinel.
                 self._forward_logs(0.1 if failed else LOG_TIMEOUT)
+            if failed:
+                # The command buffer error is what this sync reports. Reset the assert
+                # buffers, so that a later sync doesn't report a stale assert.
+                _reset_asserts(asserts)
         for fn in callbacks:
             fn()
-        if self._assert_kernels:
-            self._check_asserts()
+        if asserts:
+            _check_asserts(asserts)
 
     # ---- device printing ----
 
@@ -140,12 +152,17 @@ class Stream:
 
     def _forward_logs(self, timeout: float) -> None:
         q = self.log_queue
-        expected = self.native.log_sentinels
-        complete = expected == 0 or q.wait_log_sentinels(expected, timeout)
+        expected = self.native.log_sentinels - self._lost_sentinels
+        complete = expected <= 0 or q.wait_log_sentinels(expected, timeout)
         lines = q.drain_logs()
         if not complete:
-            lines.append("enceladus: some tl.device_print output didn't arrive in time and "
-                         "might appear after a later sync")  # fmt: skip
+            # A sentinel can go missing, for example when kernels print more than the log
+            # buffer holds or a command buffer fails. Stop waiting for it, or every later
+            # sync would wait the full timeout too.
+            self._lost_sentinels += max(expected - q.log_sentinels, 0)
+            lines.append("enceladus: some tl.device_print output didn't arrive in time. It "
+                         "might appear after a later sync, or Metal might have dropped it "
+                         "because the kernels printed more than the log buffer holds.")  # fmt: skip
         if lines:
             sys.stderr.write("".join(line + "\n" for line in lines))
             sys.stderr.flush()
@@ -156,16 +173,23 @@ class Stream:
         """Checks `kernel.assert_buffer` for a failed device assert at the next sync."""
         self._assert_kernels[id(kernel)] = kernel
 
-    def _check_asserts(self) -> None:
-        kernels, self._assert_kernels = self._assert_kernels, {}
-        error = None
-        for k in kernels.values():
-            words = (ctypes.c_uint32 * 5).from_address(k.assert_buffer.ptr)
-            if words[0] and error is None:
-                error = k.assert_error(words[1], (words[2], words[3], words[4]))
-            ctypes.memset(words, 0, ctypes.sizeof(words))
-        if error is not None:
-            raise error
+
+def _check_asserts(kernels: dict[int, Any]) -> None:
+    """Raises the first failed device assert in `kernels`, and resets their buffers."""
+    error = None
+    for k in kernels.values():
+        words = (ctypes.c_uint32 * 5).from_address(k.assert_buffer.ptr)
+        if words[0] and error is None:
+            error = k.assert_error(words[1], (words[2], words[3], words[4]))
+        ctypes.memset(words, 0, ctypes.sizeof(words))
+    if error is not None:
+        raise error
+
+
+def _reset_asserts(kernels: dict[int, Any]) -> None:
+    """Clears the assert buffers of `kernels` without reporting what they hold."""
+    for k in kernels.values():
+        ctypes.memset(k.assert_buffer.ptr, 0, 5 * ctypes.sizeof(ctypes.c_uint32))
 
 
 def synchronize() -> None:

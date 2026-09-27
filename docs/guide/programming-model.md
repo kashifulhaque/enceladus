@@ -186,7 +186,8 @@ def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
 - `interpret=True` runs every launch in the NumPy interpreter. By default, the
   `ENCELADUS_INTERPRET` environment variable decides.
 - `math_mode="fast"` lets the Metal compiler assume that no value is infinite or NaN.
-  The default, `"relaxed"`, keeps infinities and NaNs.
+  The default, `"relaxed"`, keeps infinities and NaNs, and comparisons with a NaN
+  follow IEEE 754: they're false, except `!=`.
 
 ## Control flow and helper functions
 
@@ -248,7 +249,10 @@ the size) or when the CPU needs results.
 To wait for all launched work, call `enceladus.synchronize()`. Errors from the GPU,
 such as a failed `tl.device_assert` or a failed command buffer, surface at the next
 synchronization as `enceladus.DeviceAssertionError` or `enceladus.MetalError`.
-Launch kernels from one thread at a time; the stream isn't thread-safe.
+You can launch kernels and call `enceladus.synchronize()` from several threads, because
+the stream locks around each launch and each sync. One step isn't locked: the first
+launch of a kernel that calls `tl.device_print` moves the stream to a logging queue.
+While that launch runs, don't launch kernels from other threads.
 
 What a launch waits for depends on the kinds of arrays that you pass:
 

@@ -55,25 +55,65 @@ def use_counts(module: ir.Module) -> dict[int, int]:
     return uses
 
 
+MEMORY_WRITES = frozenset(("store", "desc_store", "atomic_rmw", "atomic_cas"))
+
+
+def _writes_memory(op: ir.Op) -> bool:
+    return any(o.name in MEMORY_WRITES for o in op.walk())
+
+
+def written_between(load: ir.Op, use: ir.Op) -> bool:
+    """Returns whether memory can be written after `load` runs and before `use` runs.
+
+    A direct operand reads device memory at its `dot`, not at its `desc_load`, so the two
+    reads agree only when nothing writes memory in between. Enceladus doesn't track which
+    buffers alias, so any store or atomic counts, whatever it writes.
+
+    The check is conservative. From the block that holds `use` up to the block that holds
+    `load`, it looks at the ops before `use` in each block. When a `for` loop sits between
+    them, a write anywhere in that loop counts, because a later iteration runs after it.
+    A write in the other branch of an `if` doesn't count.
+    """
+    blk = load.parent
+    x = use
+    while x.parent is not blk:
+        inner = x.parent
+        region = inner.parent if inner is not None else None
+        owner = region.parent if region is not None else None
+        if owner is None:
+            return True  # `load` isn't in an enclosing block of `use`
+        if owner.name == "if":
+            if any(_writes_memory(o) for o in inner.ops[: inner.ops.index(x)]):
+                return True
+        elif _writes_memory(owner):
+            return True
+        x = owner
+    start, end = blk.ops.index(load), blk.ops.index(x)
+    return any(_writes_memory(o) for o in blk.ops[start + 1 : end])
+
+
 def find_direct_operands(module: ir.Module, plan: LayoutPlan) -> set[int]:
     """Returns ids of `desc_load` and `trans` values that dots read from device memory.
 
     A left operand loaded outside the dot's loop stays in registers instead (see
     `passes.layouts.hoisted_a_operands`), and a right operand that `stages_b` picks goes
-    through threadgroup memory, so neither is direct.
+    through threadgroup memory, so neither is direct. Neither is an operand whose memory
+    can be written between its load and the dot (see `written_between`).
     """
     uses = use_counts(module)
     out: set[int] = set()
 
-    def direct(v: ir.Value) -> bool:
+    def direct(v: ir.Value, dot: ir.Op) -> bool:
         src = v.defining_op
         if src is not None and src.name == "trans" and uses.get(id(v)) == 1:
             inner = src.operands[0].defining_op
             if inner is not None and inner.name == "desc_load" and \
-                    uses.get(id(src.operands[0])) == 1:  # fmt: skip
+                    uses.get(id(src.operands[0])) == 1 and \
+                    not written_between(inner, dot):  # fmt: skip
                 out.update((id(v), id(src.operands[0])))
                 return True
-        elif src is not None and src.name == "desc_load" and uses.get(id(v)) == 1:
+        elif src is not None and src.name == "desc_load" and uses.get(id(v)) == 1 and \
+                not written_between(src, dot):  # fmt: skip
             out.add(id(v))
             return True
         return False
@@ -82,9 +122,9 @@ def find_direct_operands(module: ir.Module, plan: LayoutPlan) -> set[int]:
         if op.name != "dot":
             continue
         a, b = op.operands[:2]
-        a_direct = id(a) not in plan.hoisted and direct(a)
+        a_direct = id(a) not in plan.hoisted and direct(a, op)
         if not stages_b(plan, op, a_direct):
-            direct(b)
+            direct(b, op)
     return out
 
 

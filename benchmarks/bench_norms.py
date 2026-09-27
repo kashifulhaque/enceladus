@@ -37,7 +37,7 @@ def main() -> None:
         nbytes = 2 * M * N * x.itemsize
         for block in (1024, 4096):
             def run_ln(block=block):
-                ln.layernorm_kernel[(M,)](x, y, w, b, mean, rstd, N, N, 1e-5, BLOCK=block,
+                ln.layernorm_kernel[(M,)](x, y, w, b, mean, rstd, N, N, N, 1e-5, BLOCK=block,
                                           num_warps=8)  # fmt: skip
 
             ms = do_bench(run_ln, rep=20, return_mode="min")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import struct
 from typing import Any
 
@@ -77,6 +78,48 @@ def compile_pipeline(
     return _C.pipeline(dev.native, lib, name)
 
 
+MAX_THREADS_PER_DIM = (1 << 32) - 1
+"""The most threads a dispatch can run along one dimension.
+
+Metal computes thread positions in 32 bits, so a larger dispatch wraps around and runs
+the wrong number of threads without an error.
+"""
+
+
+def check_grid(grid: tuple[int, int, int], tg: tuple[int, int, int]) -> None:
+    """Checks that a dispatch of `grid` threadgroups of `tg` threads fits Metal's limits.
+
+    Raises:
+        ValueError: A dimension of `tg` is 0, or a dimension of the grid needs more than
+            `MAX_THREADS_PER_DIM` threads.
+    """
+    for i in range(3):
+        if tg[i] < 1:
+            raise ValueError(f"threads_per_group {tg} must be at least 1 in every dimension")
+        if grid[i] * tg[i] > MAX_THREADS_PER_DIM:
+            raise ValueError(
+                f"grid {grid} with {tg} threads per threadgroup runs {grid[i] * tg[i]} threads "
+                f"in dimension {i}, which exceeds Metal's limit of 2^32 - 1. Launch fewer "
+                "programs, for example by giving each program a larger block."
+            )
+
+
+def check_writable_numpy(a: Any, what: str) -> None:
+    """Refuses to write through a read-only NumPy array.
+
+    A read-only array can view memory that must not change, such as a `bytes` object or
+    the single element behind `np.broadcast_to`. The GPU would write it anyway.
+
+    Raises:
+        ValueError: `a` is a NumPy array that isn't writeable.
+    """
+    if isinstance(a, np.ndarray) and not a.flags.writeable:
+        raise ValueError(
+            f"{what} is a read-only NumPy array, and the kernel writes to it. Pass a "
+            "writeable array, for example `np.array(x)`, which copies."
+        )
+
+
 def _dim3(v: Any, what: str) -> tuple[int, int, int]:
     if isinstance(v, (int, np.integer)):
         v = (int(v),)
@@ -128,6 +171,7 @@ class MetalKernel:
         if not (isinstance(key, tuple) and len(key) == 2):
             raise TypeError("launch a raw kernel with kernel[grid, threads_per_group](*args)")
         grid, tg = _dim3(key[0], "grid"), _dim3(key[1], "threads_per_group")
+        check_grid(grid, tg)
         if tg[0] * tg[1] * tg[2] > self._max_threads:
             raise ValueError(
                 f"threads_per_group {tg} exceeds the pipeline limit of {self._max_threads}. "
@@ -153,7 +197,13 @@ class MetalKernel:
         b = self._bindings[i]
         fmt = _SCALAR_FORMATS.get(b["data_type"])
         if fmt is not None:
-            return struct.pack("<" + fmt, value)
+            try:
+                return struct.pack("<" + fmt, value)
+            except OverflowError:
+                if fmt not in ("f", "e"):
+                    raise
+                # Out of range for float or half: round to infinity, as C converts.
+                return struct.pack("<" + fmt, math.copysign(math.inf, float(value)))
         if b["data_type"] == _MTL_BFLOAT:
             import ml_dtypes
 
@@ -171,7 +221,7 @@ class MetalKernel:
             )
         stream = get_device().stream
         bufs, offsets, scalar_parts, mask = [], [], [], []
-        sync = False
+        host: list[Any] = []  # BufferArgs over host memory
         for i, a in enumerate(args):
             if type(a) is Tensor:  # fast path for the common case
                 bufs.append(a.buffer)
@@ -181,16 +231,13 @@ class MetalKernel:
                 if interop.framework_of(a) is not None:
                     self._launch_foreign(grid, tg, args)
                     return
+                if self._bindings[i]["access"] != "read":
+                    check_writable_numpy(a, f"argument {i} ('{self._bindings[i]['name']}')")
                 ba = as_kernel_arg(a)
                 bufs.append(ba.buffer)
                 offsets.append(ba.byte_offset)
                 mask.append(True)
-                if ba.needs_sync:
-                    sync = True
-                else:
-                    stream.keep_alive(ba.owner)
-                if ba.writeback is not None:
-                    stream.after_sync(ba.writeback)
+                host.append(ba)
             else:
                 scalar_parts.append(self._pack(i, a))
                 mask.append(False)
@@ -199,8 +246,8 @@ class MetalKernel:
         stream.native.dispatch(
             self.pipeline, plan, bufs, offsets, b"".join(scalar_parts), grid, tg
         )
-        if sync:
-            stream.synchronize()
+        if host:
+            after_dispatch(stream, host)
 
 
     def _launch_foreign(self, grid: tuple, tg: tuple, args: tuple) -> None:
@@ -240,10 +287,32 @@ class MetalKernel:
         if reason is not None and not self._fallback_logged:
             self._fallback_logged = True
             log_fallback(self.name, reason)
+        for i, a in enumerate(args):
+            if mask[i] and self._bindings[i]["access"] != "read":
+                check_writable_numpy(a, f"argument {i} ('{self._bindings[i]['name']}')")
         scalars = b"".join(self._pack(i, a) for i, a in enumerate(args) if not mask[i])
         launch_synced(get_device().stream, self.pipeline, self._plans.get(mask) or
                       self._plan(mask), [a for a, m in zip(args, mask, strict=True) if m],
                       scalars, grid, tg)  # fmt: skip
+
+
+def after_dispatch(stream: Any, host: list[Any]) -> None:
+    """Keeps host memory alive for a dispatch, and syncs if the launch must wait.
+
+    This runs after the dispatch, not before: a sync on another thread between the two
+    would otherwise release the memory, or run a copy-back, before the dispatch that
+    uses it has run.
+    """
+    sync = False
+    for ba in host:
+        if ba.needs_sync:
+            sync = True
+        else:
+            stream.keep_alive(ba.owner)
+        if ba.writeback is not None:
+            stream.after_sync(ba.writeback)
+    if sync:
+        stream.synchronize()
 
 
 class _Launcher:

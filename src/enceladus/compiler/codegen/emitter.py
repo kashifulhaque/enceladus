@@ -81,8 +81,15 @@ class Emitter:
         self._lines: list[str] = []
         self._level = 0
         self._indent = indent
+        # A comment that goes before the next line, if any line follows, and the last
+        # comment that did. Codegen uses them for source locations in debug mode.
+        self.note: str | None = None
+        self.last_note: str | None = None
 
     def line(self, text: str = "") -> None:
+        if self.note is not None:
+            self.last_note, self.note = self.note, None
+            self._lines.append(self._indent * self._level + "// " + self.last_note)
         self._lines.append(self._indent * self._level + text if text else "")
 
     def lines(self, text: str) -> None:

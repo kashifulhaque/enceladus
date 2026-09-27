@@ -27,8 +27,10 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
      ["program_id", "num_programs"]),
     ("Tile creation", "These functions create tiles. Shapes hold compile-time powers of two.",
      ["arange", "full", "zeros", "full_like", "zeros_like"]),
-    ("Memory", "These functions read and write device memory through pointers.",
-     ["load", "store"]),
+    ("Memory",
+     "These functions read and write device memory through pointers, and order the "
+     "accesses of a program's threads.",
+     ["load", "store", "debug_barrier"]),
     ("Tensor descriptors",
      "Tensor descriptors carry a shape and strides, so block loads and stores check their "
      "own bounds.",

@@ -39,7 +39,7 @@ def to_framework(a: np.ndarray, fw: str, pad: int):
 
 
 def to_numpy(a) -> np.ndarray:
-    if isinstance(a, np.ndarray):
+    if isinstance(a, (np.ndarray, int, float)):
         return a
     if isinstance(a, torch.Tensor):
         return a.cpu().numpy()
@@ -71,18 +71,50 @@ def _matmul_desc(fw, pad, rng, dtype):
     return ex.matmul_desc, ex.reference, (a, b)
 
 
+def _layernorm(fw, pad, rng, dtype):
+    ex = load_example("03_layernorm")
+    x = rng.standard_normal((37, 300)).astype(dtype)
+    w, b = (rng.standard_normal(300).astype(dtype) for _ in range(2))
+    return ex.layernorm, ex.reference, (x, w, b)
+
+
+def _fused_gelu(fw, pad, rng, dtype):
+    ex = load_example("05_fused_gelu")
+    x, bias = rng.standard_normal((37, 300)).astype(dtype), rng.standard_normal(300).astype(dtype)
+    return ex.fused_gelu, ex.reference, (x, bias, 0.75)
+
+
+def _rmsnorm(fw, pad, rng, dtype):
+    ex = load_example("06_rmsnorm")
+    x, w = rng.standard_normal((37, 300)).astype(dtype), rng.standard_normal(300).astype(dtype)
+    return ex.rmsnorm, ex.reference, (x, w)
+
+
+def _histogram(fw, pad, rng, dtype):
+    ex = load_example("09_histogram")
+    return ex.histogram, ex.reference, (rng.standard_normal(10_007).astype(dtype), 48, -3.0, 3.0)
+
+
+def _cumsum(fw, pad, rng, dtype):
+    ex = load_example("10_cumsum")
+    return ex.cumsum, ex.reference, (rng.standard_normal((37, 300)).astype(dtype),)
+
+
 @pytest.mark.parametrize("fw", FRAMEWORKS)
 @pytest.mark.parametrize("pad", [0, 3])  # 3 rows gives offsets that aren't 16-byte aligned
-@pytest.mark.parametrize("case", [_vector_add, _softmax, _matmul, _matmul_desc])
+@pytest.mark.parametrize("case", [_vector_add, _softmax, _layernorm, _matmul, _matmul_desc,
+                                  _fused_gelu, _rmsnorm, _histogram, _cumsum])  # fmt: skip
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
 def test_examples_on_framework_arrays(fw, pad, case, dtype, monkeypatch):
     run, reference, host = case(fw, pad, np.random.default_rng(0), dtype)
-    args = [to_framework(a, fw, pad) for a in host]
+    args = [to_framework(a, fw, pad) if isinstance(a, np.ndarray) else a for a in host]
 
     def run_np(*framework_args):
         out = run(*framework_args)
-        assert type(out) is type(framework_args[0])  # the output is the caller's kind
-        return to_numpy(out)
+        outs = out if isinstance(out, tuple) else (out,)
+        # Each output is the caller's kind of array.
+        assert all(type(o) is type(framework_args[0]) for o in outs)
+        return tuple(to_numpy(o) for o in outs) if isinstance(out, tuple) else to_numpy(out)
 
     synced = []
     real = launcher.launch_synced
@@ -216,3 +248,31 @@ def test_mlx_refusals():
     out = mx.broadcast_to(mx.array([0.0]), (4,))
     with pytest.raises(ValueError, match="broadcast MLX array"):
         ex.add_kernel[(1,)](mx.ones((4,)), mx.ones((4,)), out, 4, BLOCK=1024)
+
+
+def _matmul_fused(fw, pad, rng, dtype):
+    ex = load_example("07_matmul_fused")
+    a = rng.standard_normal((100, 64)).astype(dtype)
+    b = rng.standard_normal((64, 96)).astype(dtype)
+    return ex.matmul_bias_gelu, ex.reference, (a, b, rng.standard_normal(96).astype(dtype))
+
+
+def _attention(fw, pad, rng, dtype):
+    ex = load_example("08_flash_attention")
+    q, k, v = (rng.standard_normal((1, 2, 64, 32)).astype(dtype) for _ in range(3))
+    return ex.attention, ex.reference, (q, k, v)
+
+
+@pytest.mark.parametrize("fw", FRAMEWORKS)
+@pytest.mark.parametrize("case", [_matmul_fused, _attention])
+def test_fused_examples_allocate_outputs_in_the_input_framework(fw, case, monkeypatch):
+    # The wrappers allocate their outputs themselves; they must not assume NumPy.
+    test_examples_on_framework_arrays(fw, 0, case, np.float16, monkeypatch)
+
+
+def test_torch_launch_refuses_a_grid_that_overflows_thread_positions():
+    ex = load_example("01_vector_add")
+    x = torch.ones(8, device="mps")
+    # 1024 threads per program: 2^22 programs is 2^32 threads, which Metal runs as none.
+    with pytest.raises(ValueError, match="exceeds Metal's limit"):
+        ex.add_kernel[(1 << 22,)](x, x, x, 8, BLOCK=1024, num_warps=32)

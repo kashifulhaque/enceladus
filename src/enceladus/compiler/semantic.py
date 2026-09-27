@@ -24,6 +24,7 @@ The rules follow Triton:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -262,11 +263,47 @@ def operand_dtype(x: Any) -> core.dtype | Literal:
     raise CompilationError(f"expected a number or a tile, but got {describe(x)}")
 
 
+def literal_fits(value: Literal, dt: core.dtype) -> bool:
+    """Returns whether a literal keeps its value as a `dt` value.
+
+    An `int` or `bool` literal fits a float type. A `float` literal fits only a float type.
+    """
+    if dt.is_floating():
+        return True
+    if isinstance(value, float):
+        return False
+    lo, hi = int_range(dt)
+    return lo <= int(value) <= hi
+
+
 def coerce_literal(value: Literal, dt: core.dtype) -> Literal:
+    """Converts a literal to the Python value of a `dt` constant.
+
+    A float truncates toward zero, like a C cast. An integer outside the range of `dt` but
+    within its bit width, such as -1 for `uint32`, keeps its two's-complement bits.
+
+    Raises:
+        CompilationError: The value has no representation in `dt`, such as NaN or 1e10
+            for `int32`, or 300 for `int8`.
+    """
     if dt.is_bool():
         return bool(value)
     if dt.is_int():
-        return int(value)  # Truncates a float toward zero, like a C cast.
+        lo, hi = int_range(dt)
+        if isinstance(value, float):
+            if not math.isfinite(value) or not lo <= math.trunc(value) <= hi:
+                raise CompilationError(
+                    f"can't convert the float {value!r} to {dt!r}, which holds integers from "
+                    f"{lo} to {hi}. Use a value in that range, or a wider or floating-point type."
+                )
+            return int(value)
+        bits = dt.primitive_bitwidth
+        if not -(1 << (bits - 1)) <= value < (1 << bits):
+            raise CompilationError(
+                f"the integer {value} doesn't fit in {dt!r}, which holds integers from {lo} to "
+                f"{hi}. Use a value in that range, or a wider type."
+            )
+        return int(value)
     return float(value)
 
 
@@ -326,7 +363,17 @@ def broadcast_to(b: ir.Builder, v: ir.Value, shape: tuple[int, ...]) -> ir.Value
     shape = tuple(shape)
     if not shape:
         if is_tile(v):
-            raise CompilationError(f"can't broadcast a tile of shape {v.type.shape} to a scalar")
+            if not v.type.shape:
+                raise CompilationError(
+                    "a tile of shape () can't be used where a scalar is expected. Use a scalar "
+                    "instead: for example, pass the value itself rather than tl.full((), ...), "
+                    "or give the tile the shape (1,) and use a tile of pointers."
+                )
+            raise CompilationError(
+                f"can't broadcast a tile of shape {v.type.shape} to a scalar. Reduce the tile "
+                "to a scalar first, for example with tl.sum or tl.max, or use a tile of "
+                "pointers of the same shape."
+            )
         return v
     if not is_tile(v):
         return splat(b, v, shape)
@@ -409,6 +456,8 @@ def unary(b: ir.Builder, op: str, x: Any, name: str | None = None) -> ir.Value:
         )
     if op == "not" and not dt.is_int():
         raise CompilationError(f"`~` needs an integer or boolean operand, but got {dt}")
+    if op == "neg" and dt.is_bool():
+        v = cast(b, v, core.int32)  # Arithmetic on int1 computes in int32: -True is -1.
     return b.create("unary", [v], [v.type], {"op": op}).result
 
 
@@ -427,6 +476,8 @@ def where(b: ir.Builder, cond: Any, x: Any, y: Any) -> ir.Value:
     if is_pointer(x) or is_pointer(y):
         if not (is_pointer(x) and is_pointer(y) and ir.elem_of(x.type) == ir.elem_of(y.type)):
             raise CompilationError("tl.where needs two pointers of the same type, or no pointers")
+        if _shape(c) or _shape(x) or _shape(y):
+            return _where_pointers(b, c, x, y)
         xv, yv = x, y
     else:
         dt = computation_dtype("select", operand_dtype(x), operand_dtype(y))
@@ -434,3 +485,69 @@ def where(b: ir.Builder, cond: Any, x: Any, y: Any) -> ir.Value:
     shape = broadcast_shapes(broadcast_shapes(_shape(c), _shape(xv)), _shape(yv))
     c, xv, yv = (broadcast_to(b, v, shape) for v in (c, xv, yv))
     return b.create("select", [c, xv, yv], [xv.type]).result
+
+
+# The ops through which a pointer derives from another pointer, peeled by `_where_pointers`.
+_POINTER_STEPS = frozenset(["addptr", "splat", "broadcast", "expand_dims"])
+
+
+def _pointer_chain(v: ir.Value) -> list[ir.Value]:
+    """Returns `v` and the pointers it derives from, down to the first that no step made."""
+    chain = [v]
+    while (op := v.defining_op) is not None and op.name in _POINTER_STEPS:
+        v = op.operands[0]
+        chain.append(v)
+    return chain
+
+
+def _pointer_offset(b: ir.Builder, chain: list[ir.Value]) -> ir.Value | None:
+    """Emits the element offset of `chain[0]` from `chain[-1]`, or returns `None` for 0.
+
+    The offset has the shape of `chain[0]`, or a shape that broadcasts to it.
+    """
+    offs: list[ir.Value] = []
+    for v in reversed(chain[:-1]):
+        op = v.defining_op
+        if op.name == "addptr":
+            offs.append(op.operands[1])
+        elif op.name == "expand_dims":
+            offs = [expand_dims(b, o, op.attrs["axis"]) if is_tile(o) else o for o in offs]
+    if not offs:
+        return None
+    # Offsets of mixed types add in int64, so a negative offset can't wrap in an unsigned type.
+    dts = {dtype_of(o) for o in offs}
+    dt = dts.pop() if len(dts) == 1 else core.int64
+    total = cast(b, offs[0], dt)
+    for o in offs[1:]:
+        total = binary(b, "add", total, cast(b, o, dt))
+    return total
+
+
+def _where_pointers(b: ir.Builder, c: ir.Value, x: ir.Value, y: ir.Value) -> ir.Value:
+    """Emits `tl.where` on pointers as one base pointer plus a selected offset.
+
+    Codegen represents a tile of pointers as one base pointer and a tile of offsets, so both
+    pointers must derive from a common base pointer, such as `x_ptr` in
+    `tl.where(c, x_ptr + i, x_ptr + 500 + i)`.
+    """
+    xc, yc = _pointer_chain(x), _pointer_chain(y)
+    y_ids = {id(v): i for i, v in enumerate(yc)}
+    common = next((i for i, v in enumerate(xc) if id(v) in y_ids), None)
+    if common is None:
+        names = [f"`{ch[-1].name_hint}`" if ch[-1].name_hint else "another pointer"
+                 for ch in (xc, yc)]  # fmt: skip
+        raise CompilationError(
+            f"tl.where on tiles can choose only between pointers into the same array, but "
+            f"these derive from {names[0]} and {names[1]}. Load from each pointer and choose "
+            "between the loaded values with tl.where instead."
+        )
+    root = xc[common]
+    ox = _pointer_offset(b, xc[: common + 1])
+    oy = _pointer_offset(b, yc[: y_ids[id(root)] + 1])
+    dts = {dtype_of(o) for o in (ox, oy) if o is not None} or {core.int32}
+    dt = dts.pop() if len(dts) == 1 else core.int64
+    ox, oy = (const(b, 0, dt) if o is None else cast(b, o, dt) for o in (ox, oy))
+    shape = broadcast_shapes(broadcast_shapes(_shape(c), _shape(ox)), _shape(oy))
+    c, ox, oy = (broadcast_to(b, v, shape) for v in (c, ox, oy))
+    off = b.create("select", [c, ox, oy], [ox.type]).result
+    return _pointer_binary(b, "add", root, off)

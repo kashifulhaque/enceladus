@@ -12,9 +12,9 @@ Environment variables:
 
 from __future__ import annotations
 
-import ast
 import dataclasses
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import enceladus
 from enceladus.compiler.codegen.msl import KernelArg
-from enceladus.compiler.frontend import build_ir, is_jit_function
+from enceladus.compiler.frontend import build_ir
 from enceladus.compiler.pipeline import compile_module
 from enceladus.language import core
 from enceladus.runtime import cache, dot_backend
@@ -31,6 +31,8 @@ from enceladus.runtime.launcher import CompiledKernel
 
 if TYPE_CHECKING:
     from enceladus.runtime.jit import JITFunction, Specialization
+
+log = logging.getLogger("enceladus")
 
 
 def _key(fn: JITFunction, spec: Specialization, num_warps: int, dot_warps,
@@ -42,20 +44,43 @@ def _key(fn: JITFunction, spec: Specialization, num_warps: int, dot_warps,
         return cache.stable_hash(*parts)
     # A debug build stores the file and line of each tl.device_assert, so a kernel that
     # moved within its file, or to another file, must not reuse an entry with stale lines.
-    return cache.stable_hash(*parts, "debug", *_source_locations(fn, set()))
+    return cache.stable_hash(*parts, "debug", *_source_locations(fn))
 
 
-def _source_locations(fn: JITFunction, seen: set[int]) -> list[str]:
-    """Returns `file:first_line` of `fn` and of every @enceladus.jit function it references."""
-    seen.add(id(fn))
-    src = fn.source_info()
-    out = [f"{src.file}:{src.first_line}"]
-    g = fn.fn.__globals__
-    for name in sorted({n.id for n in ast.walk(src.tree) if isinstance(n, ast.Name)}):
-        v = core.unwrap(g.get(name))
-        if is_jit_function(v) and id(v) not in seen:
-            out += _source_locations(v, seen)
+def _source_locations(fn: JITFunction) -> list[str]:
+    """Returns `file:first_line` of `fn` and of every @enceladus.jit function it reaches."""
+    fn.cache_key  # noqa: B018 - computing the key finds the reachable functions
+    out = []
+    for f in (fn, *fn._jit_deps):
+        src = f.source_info()
+        out.append(f"{src.file}:{src.first_line}")
     return out
+
+
+def _from_cache_entry(key: str, meta_text: str, msl: str) -> CompiledKernel | None:
+    """Returns the kernel that a disk cache entry describes, or `None` if the entry is
+    corrupt or incomplete, which the caller treats as a miss and overwrites."""
+    try:
+        meta = json.loads(meta_text)
+        ck = CompiledKernel(
+            meta["name"], msl, cache.read_entry(key, "ir.txt") or "",
+            [KernelArg(**a) for a in meta["args"]], meta["num_warps"],
+            meta["threadgroup_memory_bytes"],
+            language_version=tuple(meta.get("language_version", (3, 2))),
+            enable_logging=meta.get("enable_logging", False),
+            asserts=meta.get("asserts", []),
+            assert_buffer_index=meta.get("assert_buffer_index"),
+            dot_backend=meta.get("dot_backend"),
+            dot_fallbacks=list(meta.get("dot_fallbacks", [])),
+        )  # fmt: skip
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        log.debug("enceladus: ignoring the corrupt cache entry %s: %s", key[:32], e)
+        return None
+    # Codegen logs each MPP fallback; log them again when the disk cache skips codegen.
+    for reason in ck.dot_fallbacks:
+        log.debug("enceladus: %s: a tl.dot uses the simdgroup backend (cached): %s",
+                  ck.name, reason)  # fmt: skip
+    return ck
 
 
 def build_module(fn: JITFunction, spec: Specialization, num_warps: int,
@@ -89,18 +114,7 @@ def compile_specialization(fn: JITFunction, spec: Specialization, num_warps: int
     meta_text = cache.read_entry(key, "meta.json")
     msl = cache.read_entry(key, "kernel.metal")
     if meta_text and msl and not dump:
-        meta = json.loads(meta_text)
-        ck = CompiledKernel(
-            meta["name"], msl, cache.read_entry(key, "ir.txt") or "",
-            [KernelArg(**a) for a in meta["args"]], meta["num_warps"],
-            meta["threadgroup_memory_bytes"],
-            language_version=tuple(meta.get("language_version", (3, 2))),
-            enable_logging=meta.get("enable_logging", False),
-            asserts=meta.get("asserts", []),
-            assert_buffer_index=meta.get("assert_buffer_index"),
-            dot_backend=meta.get("dot_backend"),
-            dot_fallbacks=list(meta.get("dot_fallbacks", [])),
-        )  # fmt: skip
+        ck = _from_cache_entry(key, meta_text, msl)
     if ck is None:
         module = build_module(fn, spec, num_warps, dot_warps, debug, backend)
         gen = compile_module(module, dev.caps.max_threadgroup_memory)

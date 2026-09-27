@@ -13,7 +13,8 @@ export const REFERENCE = [
     ["zeros_like(input)", "Returns zeros with the shape and dtype of input."]]],
   ["tl", "Memory", "", [
     ["load(pointer, mask=None, other=None, boundary_check=(), padding_option='', cache_modifier='', eviction_policy='', volatile=False)", "Loads through a pointer or pointer tile. Masked-off lanes return other, or 0. Cache and eviction hints are accepted and ignored."],
-    ["store(pointer, value, mask=None, boundary_check=(), cache_modifier='', eviction_policy='')", "Stores where mask is true. The value is converted to the pointee dtype and broadcast."]]],
+    ["store(pointer, value, mask=None, boundary_check=(), cache_modifier='', eviction_policy='')", "Stores where mask is true. The value is converted to the pointee dtype and broadcast."],
+    ["debug_barrier()", "Waits for every thread of the program and makes their earlier device memory stores visible to all of them."]]],
   ["tl", "Tensor descriptors", "", [
     ["make_tensor_descriptor(base, shape, strides, block_shape, padding_option='zero')", "Creates a bounds-checked block descriptor over a pointer. The last stride must be 1."],
     ["desc.load(offsets)", "Loads the block at element offsets. Elements outside the array are zero."],
@@ -93,7 +94,9 @@ export const REFERENCE = [
     ["synchronize()", "Waits for all work on the default stream."],
     ["async_numpy(enabled=True)", "Lets launches with NumPy arrays return before the GPU finishes."],
     ["element_strides(obj)", "Returns strides in elements for Enceladus, NumPy, PyTorch, or MLX arrays."],
-    ["new_empty(like, shape=None, dtype=None)", "Allocates an array of the same framework and device as like."],
+    ["element_dtype(obj)", "Returns the element type of an Enceladus, NumPy, PyTorch, or MLX array as a NumPy dtype."],
+    ["new_empty(like, shape=None, dtype=None)", "Allocates an array of the same framework and device as like. dtype can be a NumPy dtype."],
+    ["new_zeros(like, shape=None, dtype=None)", "Like new_empty, and fills the array with zeros."],
     ["get_device()", "Returns the process-wide Metal device and its capabilities."],
     ["capture(path)", "A context manager that records GPU work to a .gputrace bundle."]]],
   ["host", "Tensors", "An enceladus.Tensor lives in memory that the CPU and GPU share. Slicing returns a view.", [

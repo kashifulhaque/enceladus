@@ -52,8 +52,17 @@ struct Pipeline : Handle {
     Pipeline(void *p_, std::string n) : Handle(p_), name(std::move(n)) {}
 };
 struct Buffer : Handle {
-    using Handle::Handle;
+    // A buffer's contents address and length never change, so they're read once. Reading
+    // them costs an Objective-C call, and Enceladus reads `ptr` on every @jit launch.
+    void *contents = nullptr;
+    size_t length = 0;
     nb::object owner;  // keeps borrowed memory (numpy, DLPack) alive
+    explicit Buffer(void *p_) : Handle(p_) {
+        if (p_) {
+            contents = fr_buffer_contents(p_);
+            length = fr_buffer_length(p_);
+        }
+    }
 };
 
 struct LaunchPlan {
@@ -160,6 +169,17 @@ static void prepare(DispatchArgs &a, const LaunchPlan &plan, nb::handle bufs, nb
     a.scalars = scalars.c_str();
     read_dim3(grid, a.grid);
     read_dim3(tg, a.tg);
+    // Metal computes thread positions in 32 bits per dimension, so a larger launch wraps
+    // around and runs the wrong number of threads without an error.
+    for (int i = 0; i < 3; ++i) {
+        if (a.tg[i] == 0)
+            throw std::invalid_argument("threads_per_group dimensions must be at least 1");
+        if ((uint64_t)a.grid[i] * a.tg[i] > 0xFFFFFFFFull)
+            throw std::invalid_argument(
+                "grid[" + std::to_string(i) + "] * threads_per_group[" + std::to_string(i) +
+                "] is " + std::to_string((uint64_t)a.grid[i] * a.tg[i]) +
+                " threads, which exceeds Metal's limit of 2^32 - 1 threads per dimension");
+    }
 }
 
 // ---- DLPack ------------------------------------------------------------------
@@ -209,13 +229,25 @@ struct DLContext {
     std::vector<int64_t> shape, strides;
 };
 
+static bool is_finalizing() {
+#if PY_VERSION_HEX >= 0x030D0000
+    return Py_IsFinalizing();
+#else
+    return _Py_IsFinalizing();
+#endif
+}
+
 template <typename M>
 static void dl_delete(M *m) {
     auto *ctx = static_cast<DLContext *>(m->manager_ctx);
-    // Consumers can call the deleter from any thread, with or without the GIL.
-    PyGILState_STATE s = PyGILState_Ensure();
-    Py_XDECREF(ctx->owner);
-    PyGILState_Release(s);
+    // Consumers can call the deleter from any thread, with or without the GIL, and
+    // possibly during or after interpreter shutdown. Taking the GIL then can hang or
+    // crash, so leak the owner reference instead; the process is exiting anyway.
+    if (Py_IsInitialized() && !is_finalizing()) {
+        PyGILState_STATE s = PyGILState_Ensure();
+        Py_XDECREF(ctx->owner);
+        PyGILState_Release(s);
+    }
     delete ctx;
     delete m;
 }
@@ -405,8 +437,8 @@ NB_MODULE(_C, m) {
 
     nb::class_<Buffer>(m, "Buffer")
         .def_prop_ro("handle", &Buffer::addr)
-        .def_prop_ro("ptr", [](Buffer &b) { return (uintptr_t)fr_buffer_contents(b.p); })
-        .def_prop_ro("nbytes", [](Buffer &b) { return fr_buffer_length(b.p); })
+        .def_prop_ro("ptr", [](Buffer &b) { return (uintptr_t)b.contents; })
+        .def_prop_ro("nbytes", [](Buffer &b) { return b.length; })
         // None for memory that Metal allocated; otherwise the object that owns it.
         .def_prop_ro("owner", [](Buffer &b) { return b.owner.is_valid() ? b.owner : nb::none(); });
 
@@ -469,12 +501,18 @@ NB_MODULE(_C, m) {
         .def("sync",
              [](Stream &s) {
                  std::unique_ptr<char[]> err(new char[FR_ERR_LEN]);
+                 // Take the borrowed buffers before releasing the GIL. Dispatches hold
+                 // the GIL, so each of these buffers belongs to a dispatch that this sync
+                 // waits for. Buffers that other threads dispatch during the wait stay
+                 // in `s.borrowed` until a later sync. `done` releases its references
+                 // when it goes out of scope, with the GIL held again.
+                 std::unordered_map<PyObject *, nb::object> done;
+                 done.swap(s.borrowed);
                  int rc;
                  {
                      nb::gil_scoped_release nogil;
                      rc = fr_stream_sync(s.s, err.get(), FR_ERR_LEN);
                  }
-                 s.borrowed.clear();  // the GPU has finished with every buffer
                  if (rc) throw MetalError(err.get());
              })
         .def(

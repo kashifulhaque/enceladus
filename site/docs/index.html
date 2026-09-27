@@ -30,8 +30,7 @@
   <p>Enceladus is alpha software. Keep the following in mind:</p>
   <ul class="tight">
     <li>All published performance numbers come from one M4 Pro. Wheels target macOS 15 but have been tested only on later releases.</li>
-    <li>No wheel is published for Python 3.14, so 3.14 builds from source.</li>
-    <li>Without <code>ENCELADUS_VERIFY=1</code>, the interpreter accepts some constructs that the compiler refuses, such as <code>while</code> and a <code>tl.dot</code> whose K isn't a multiple of 8.</li>
+    <li>The interpreter runs some kernels that the compiler refuses, such as a <code>tl.dot</code> whose K isn't a multiple of 8. It warns about them unless <code>ENCELADUS_VERIFY=0</code>, and raises the compiler's error when <code>ENCELADUS_VERIFY=1</code>.</li>
     <li>MLX launches are always synchronous, at about 100 µs each.</li>
     <li><code>atomic_add</code> doesn't support <code>float16</code> or <code>bfloat16</code>.</li>
   </ul>

@@ -1,5 +1,6 @@
 """The Enceladus language, conventionally imported as `import enceladus.language as tl`."""
 
+from enceladus.compiler.errors import CompilationError as _CompilationError
 from enceladus.language import math
 from enceladus.language.core import (
     bfloat16,
@@ -51,6 +52,7 @@ from enceladus.language.ops import (
     cdiv,
     clamp,
     cumsum,
+    debug_barrier,
     device_assert,
     device_print,
     dot,
@@ -91,5 +93,22 @@ __all__ = [
     "static_range", "store", "sum", "tanh", "trans", "uint8", "uint16", "uint32", "uint64",
     "where", "zeros", "zeros_like",
     "associative_scan", "atomic_add", "atomic_and", "atomic_cas", "atomic_max", "atomic_min",
-    "atomic_or", "atomic_xchg", "atomic_xor", "cumsum", "device_assert", "device_print",
+    "atomic_or", "atomic_xchg", "atomic_xor", "cumsum", "debug_barrier", "device_assert",
+    "device_print",
 ]  # fmt: skip
+
+
+class _MissingNameError(_CompilationError, AttributeError):
+    """A missing `tl` name: a `CompilationError` in a kernel that `hasattr` still handles."""
+
+
+def __getattr__(name: str):
+    if name.startswith("__"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name in ("float64", "double", "fp64"):
+        msg = "Enceladus has no float64 type. Use tl.float32 instead."
+    else:
+        msg = (f"module `{__name__}` has no attribute `{name}`. Check the spelling. Some Triton "
+               "functions don't exist in Enceladus; the language reference lists the supported "
+               "ones.")
+    raise _MissingNameError(msg)

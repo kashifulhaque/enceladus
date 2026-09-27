@@ -1,7 +1,9 @@
 """Histogram of float data with `tl.atomic_add`.
 
 Each program bins `BLOCK` values and adds one count per value to a shared histogram in
-device memory. Values outside `[lo, hi)` are skipped.
+device memory. Values outside `[lo, hi)` are skipped. `histogram` accepts NumPy arrays,
+`enceladus.Tensor` objects, PyTorch tensors on the `mps` device, and MLX arrays, and
+returns an array of the same kind.
 
 Run the demo with `uv run python examples/09_histogram.py`.
 """
@@ -22,11 +24,10 @@ def histogram_kernel(x_ptr, hist_ptr, n, lo, inv_width, NUM_BINS: tl.constexpr,
     tl.atomic_add(hist_ptr + b, 1, mask=ok)
 
 
-def histogram(x: np.ndarray, num_bins: int, lo: float, hi: float,
-              block: int = 1024) -> np.ndarray:  # fmt: skip
+def histogram(x, num_bins: int, lo: float, hi: float, block: int = 1024):
     """Returns the `int32` counts of `x` in `num_bins` equal bins over `[lo, hi)`."""
-    hist = np.zeros(num_bins, np.int32)
-    n = x.size
+    hist = enceladus.new_zeros(x, (num_bins,), np.int32)
+    n = int(np.prod(x.shape))
     histogram_kernel[(enceladus.cdiv(n, block),)](
         x, hist, n, float(lo), num_bins / (hi - lo), NUM_BINS=num_bins, BLOCK=block,
     )  # fmt: skip

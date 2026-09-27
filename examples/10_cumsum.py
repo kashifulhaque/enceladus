@@ -1,7 +1,9 @@
 """Row-wise cumulative sum with `tl.cumsum`, one block of rows per program.
 
 Each program loads a `BLOCK_M x BLOCK_N` tile that covers `BLOCK_M` whole rows and scans
-it along the rows. Set `reverse=True` for a suffix sum.
+it along the rows. Set `reverse=True` for a suffix sum. `cumsum` accepts NumPy arrays,
+`enceladus.Tensor` objects, PyTorch tensors on the `mps` device, and MLX arrays, and
+returns an array of the same kind.
 
 Run the demo with `uv run python examples/10_cumsum.py`.
 """
@@ -23,19 +25,18 @@ def cumsum_kernel(out_ptr, in_ptr, n_rows, n_cols, stride_in, stride_out,
     tl.store(out_ptr + rows[:, None] * stride_out + cols[None, :], y, mask=mask)
 
 
-def cumsum(x: np.ndarray, reverse: bool = False) -> np.ndarray:
+def cumsum(x, reverse: bool = False):
     """Returns the cumulative sum of each row of a 2D array.
 
     Integers narrower than 32 bits sum in `int32`, as in `tl.cumsum`.
     """
     m, n = x.shape
-    out_dtype = np.int32 if x.dtype.kind in "iub" and x.dtype.itemsize < 4 else x.dtype
-    out = np.empty((m, n), out_dtype)
+    dt = enceladus.element_dtype(x)
+    out = enceladus.new_empty(x, dtype=np.int32 if dt.kind in "iub" and dt.itemsize < 4 else dt)
     block_n = enceladus.next_power_of_2(n)
     block_m = max(1, min(16, 4096 // block_n))
-    item_in, item_out = x.itemsize, out.itemsize
     cumsum_kernel[(enceladus.cdiv(m, block_m),)](
-        out, x, m, n, x.strides[0] // item_in, out.strides[0] // item_out,
+        out, x, m, n, enceladus.element_strides(x)[0], enceladus.element_strides(out)[0],
         REVERSE=reverse, BLOCK_M=block_m, BLOCK_N=block_n,
     )  # fmt: skip
     return out
