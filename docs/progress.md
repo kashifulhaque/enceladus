@@ -1568,3 +1568,125 @@ without it, except where the known gaps say otherwise.
   helper.
 - Converting an out-of-range runtime float to an integer type differs between modes:
   the GPU saturates and the interpreter wraps. Both are undefined in C.
+
+## Integer `tl.dot` and 64-bit atomics
+
+This entry covers two features that earlier entries listed as gaps: integer `tl.dot`,
+and 64-bit atomics beyond `uint64` `max` and `min`.
+
+### What was built
+
+- `tl.dot` takes `int8`, `uint8`, `int16`, `uint16`, `int32`, and `uint32` operands of
+  one dtype and accumulates in `int32`, as in Triton. The result is exact: products and
+  sums wrap modulo 2^32, in both modes. `out_dtype` defaults to `None`, which means
+  `float32` for float operands and `int32` for integer operands.
+- `int8` and `uint8` dots, in `emit_int_dot` in `compiler/codegen/dot.py`:
+  - `simdgroup_matrix` has no integer types, so operands convert to `half`, which holds
+    every 8-bit integer exactly. They stage through threadgroup memory, or come from
+    registers when the left operand is loaded outside the loop.
+  - Fragments multiply-accumulate into float32 partial sums. A float32 sum is exact
+    while every partial sum stays within 2^24, and an 8-bit product is at most 2^14
+    (`int8`) or 255^2 (`uint8`). So the partial sums add into the `int32` accumulator
+    and restart from zero at least every 1,024 (`int8`) or 256 (`uint8`) steps of K.
+    With the usual BK of 32 or 64, that's once per `tl.dot`.
+- 16-bit and 32-bit integer dots stage both operands in their own type and run scalar
+  `uint` multiply-adds, because float32 can't hold their products.
+- The integer accumulator is a plain register array in the `simd_acc` layout, so
+  epilogues, reductions, and stores work unchanged. The in-place accumulator rule is the
+  same as for float dots.
+- Integer dots never take the `mpp` backend; `explain` and the debug log give the
+  reason.
+- 64-bit atomics: the supported set is unchanged, because Metal offers nothing more
+  (see the probe results). The errors for other 64-bit atomics now say which ones exist
+  and suggest a replacement per operation:
+  - `add`: two `uint32` halves, adding the carry of the low half to the high half.
+  - `int64` `max` and `min`: store values as `uint64` with the sign bit flipped, which
+    keeps the order, and use `uint64` `max` and `min`.
+  - `and`, `or`, and `xor`: apply the operation to each `uint32` half.
+  - `xchg` and `cas`: 32-bit elements.
+
+### Metal probe results
+
+These results come from compiling raw MSL with `enceladus.metal_kernel` on the M4 Pro
+(Apple9, macOS 27, `GPUCompiler` 32023):
+
+- 64-bit atomics, in MSL 3.2, 4.0, and 4.1: only `atomic_max_explicit` and
+  `atomic_min_explicit` on `device atomic_ulong` compile, and they return `void`.
+  `atomic_long` doesn't exist. `atomic_fetch_{add,sub,max,min,and,or,xor}_explicit`,
+  `atomic_exchange_explicit`, `atomic_load_explicit`, `atomic_store_explicit`, and
+  `atomic_compare_exchange_weak_explicit` on `atomic_ulong` have no overload, and
+  `atomic_compare_exchange_strong_explicit` doesn't exist. Calling the compiler builtins
+  directly (`__metal_atomic_fetch_add_explicit`, `__metal_atomic_compare_exchange_weak_explicit`,
+  and `__metal_atomic_fetch_max_explicit` on `ulong`) fails with "invalid parameter
+  type". Threadgroup `atomic_ulong` max doesn't compile. The header
+  (`metal_atomic`) enables `ulong` only for device max and min. There's no 64-bit
+  compare-and-swap, so no other 64-bit atomic can be built as a real atomic, and none
+  was added. A two-word emulation wouldn't be atomic, so it's refused.
+- `simdgroup_matrix`: `half` operands with a `float` accumulator give exact results for
+  `int8` and `uint8` values, including sums of exactly 2^24 and odd sums just under it
+  (the tests check both).
+- Metal 4 `matmul2d` (MPP): the header lists `int8 x int8 -> int32` and
+  `uint8 x uint8 -> int32` (the element types must be `int8_t` and `uint8_t`; `char`
+  fails a `static_assert`). On this Apple9 GPU it compiles and runs at about 6.0 TOPS
+  at 4096³, the same rate as `float16`, but it isn't exact: `int8` sums past 2^24 came
+  back rounded (3,052 off in the test case), and `uint8` with random data was already
+  wrong (up to 270 off). It evidently converts to floating point and accumulates in
+  float32 without chunking.
+
+### Benchmarks
+
+`benchmarks/bench_matmul.py` has an `int8` row per shape (TOPS, minimum and median of 3
+interleaved rounds of 10 runs), taken while other agents shared the GPU:
+
+| Shape | `int8` 64x64x32 w4 | `int8` 64x64x64 w4 | `int8` 128x64x32 w8 | `float16` simdgroup 64x64x32 w4 |
+|---|---|---|---|---|
+| 4096³ | 4.71 / 4.49 | 4.92 / 4.49 | 4.47 / 4.40 | 5.70 / 5.63 |
+| 2000³ | 4.28 / 3.49 | 4.49 / 3.90 | 4.17 / 3.87 | 4.51 / 3.66 |
+| 513³ | 2.38 / 1.60 | 2.19 / 1.39 | 2.12 / 1.78 | 1.80 / 1.76 |
+| 1024 x 4096 x 1024 | 4.43 / 4.40 | 4.83 / 4.80 | 4.73 / 4.71 | 5.76 / 5.74 |
+
+- Exact `int8` reaches 83-86% of `float16` `simdgroup` at 4096³. Converting the same
+  `int8` tiles to `float16` in the kernel, which is inexact past 2^24, measured 4.95
+  TOPS at 64x64x32, so the int32 flush costs about 8%.
+- `int16` and `int32` dots run at about 1.5 TOPS at 1024³ and 2048³, about a third of
+  `int8`.
+- MLX matmul accepts only floating-point types, and PyTorch MPS `int8` matmul returns
+  `int8`, so there's no comparable number. MPP `int8` (inexact here) measured 5.96 TOPS.
+
+### Tests
+
+- `uv run pytest -q`: 973 passed, 19 skipped, and 1 deselected in about 7 s. With
+  `ENCELADUS_DEBUG=1`: the same counts in about 14 s.
+- `test_integer_dot`: every integer operand width except 16-bit and 32-bit unsigned,
+  with full-range values, through descriptor loads, pointer loads, and a left operand in
+  registers, on aligned and ragged shapes, against the interpreter and NumPy.
+- `test_integer_dot_is_exact_past_float32_precision`: sums above 2^24 that are odd, for
+  `int8` (K = 2048) and for `uint8` with BK = 512, which needs two partial sums per
+  `tl.dot`, from threadgroup memory and from registers. Removing the `uint8` chunking
+  fails it.
+- The in-place accumulator test runs for `int8` too; dropping the clobber check fails
+  5 of its cases.
+- The `uint64` contention test covers `atomic_min` as well as `atomic_max`. The
+  unsupported-atomic test checks the `int64` and `uint64` `atomic_add` hints in both
+  modes. The error test covers a float accumulator with `int8` operands.
+
+### Deviations from the plan
+
+- The plan gave integer `tl.dot` to the M8 MPP backend. MPP isn't exact for integers on
+  Apple9, so integer dots use the `simdgroup` backend with chunked float32 partial sums
+  instead.
+- Unlike Triton, which ignores `out_dtype` for integer operands, a float `out_dtype` or
+  accumulator with integer operands is an error.
+- `02-apple-gpu-and-metal.md` said that Apple9 has full 64-bit atomics. It now notes the
+  probe result.
+
+### Known gaps
+
+- `int8` operands always go through threadgroup memory or registers; there's no direct
+  device-to-fragment path, because `simdgroup_load` needs `half` memory. A per-lane
+  converting load could close part of the gap to `float16`.
+- `matmul_configs` doesn't accept `int8`, so the matmul autotuner has no integer list.
+- Mixed operand dtypes, such as `int8` with `uint8`, and `int64` operands are refused.
+- 64-bit atomics other than `uint64` `max` and `min` stay unsupported, because Metal has
+  no 64-bit compare-and-swap. `uint64` `max` and `min` still can't return old values
+  and need Apple9.
