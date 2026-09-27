@@ -1,4 +1,4 @@
-"""Constant folding, algebraic identities, common-subexpression elimination, and DCE.
+"""Constant folding, algebraic identities, loop-invariant hoisting, CSE, and DCE.
 
 `fold` rewrites ops whose result is known at compile time:
 
@@ -385,6 +385,60 @@ def fold(module: ir.Module) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Loop-invariant scalars
+# ---------------------------------------------------------------------------
+
+# Scalar ops that are safe to compute once before a loop instead of in every iteration.
+# None of them traps on the GPU, so computing one for a loop that runs no iterations is
+# harmless.
+_HOISTABLE = frozenset(
+    """const program_id num_programs binary cmp unary fma select cast bitcast addptr
+    make_desc""".split()
+)
+
+
+def hoist(module: ir.Module) -> int:
+    """Moves loop-invariant scalar ops out of `for` bodies, innermost loops first.
+
+    An op moves when it's pure, produces scalars (or a descriptor), and reads only values
+    defined outside the loop. Index math such as `pid_m * BM` in `desc.load([pid_m * BM,
+    k])` then sits before the loop, where edge versioning can read it.
+
+    Returns:
+        The number of ops moved.
+    """
+    moved = 0
+
+    def run(block: ir.Block) -> None:
+        nonlocal moved
+        kept: list[ir.Op] = []
+        for op in block.ops:
+            for r in op.regions:
+                run(r.block)
+            if op.name == "for":
+                body = op.regions[0].block
+                inside = {id(a) for a in body.args}
+                stay = []
+                for inner in body.ops:
+                    scalar = all(not isinstance(r.type, ir.TileType) for r in inner.results)
+                    if inner.name in _HOISTABLE and scalar and not inner.regions and \
+                            not any(id(v) in inside for v in inner.operands):  # fmt: skip
+                        inner.parent = block
+                        kept.append(inner)
+                        moved += 1
+                        continue
+                    for sub in inner.walk():
+                        inside.update(id(r) for r in sub.results)
+                    stay.append(inner)
+                body.ops = stay
+            kept.append(op)
+        block.ops = kept
+
+    run(module.body)
+    return moved
+
+
+# ---------------------------------------------------------------------------
 # CSE and DCE
 # ---------------------------------------------------------------------------
 
@@ -455,7 +509,8 @@ def dce(module: ir.Module) -> int:
 
 
 def simplify(module: ir.Module) -> None:
-    """Folds constants and identities, then runs CSE and DCE."""
+    """Folds constants and identities, hoists loop-invariant scalars, then runs CSE and DCE."""
     fold(module)
+    hoist(module)
     cse(module)
     dce(module)

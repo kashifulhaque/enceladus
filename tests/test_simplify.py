@@ -6,6 +6,7 @@ from conftest import check_kernel
 
 import enceladus
 import enceladus.language as tl
+from enceladus.compiler import ir
 from enceladus.compiler.passes.simplify import simplify
 
 B = 8
@@ -162,3 +163,42 @@ def test_identities_keep_the_dtype(dtype):
     mod = _identities.ir(x, x, B=B, INT=np.dtype(dtype).kind in "iu")
     simplify(mod)
     assert not any(op.name == "binary" for op in mod.walk())
+
+
+@enceladus.jit
+def _loop_invariants(x_ptr, out_ptr, n, B: tl.constexpr):
+    r = tl.arange(0, B)
+    x = tl.load(x_ptr + r)
+    acc = tl.zeros((B,), tl.float32)
+    s = 1
+    for i in range(n):
+        for j in range(2):
+            # `n * 3 + 1` is invariant in both loops, `i * 2` only in the inner one, and
+            # `s` changes every iteration.
+            acc += x * (n * 3 + 1) + i * 2 + j
+        s = s * 2 + 1
+    tl.store(out_ptr + r, acc + s)
+
+
+def test_loop_invariant_scalars_leave_their_loops():
+    x = np.arange(B, dtype=np.float32)
+    n = 3
+
+    def run(x):
+        out = np.zeros(B, np.float32)
+        _loop_invariants[(1,)](x, out, n, B=B)
+        return out
+
+    def reference(x):
+        acc = sum(x * (3 * n + 1) + 2 * i + j for i in range(n) for j in range(2))
+        return (acc + 2 ** (n + 1) - 1).astype(np.float32)
+
+    check_kernel(run, (x,), reference)
+    mod = _loop_invariants.ir(x, x, n, B=B)
+    simplify(mod)
+    outer = next(op for op in mod.body.ops if op.name == "for")
+    inner = next(op for op in outer.regions[0].block.ops if op.name == "for")
+    scalar_ops = lambda loop: [op.attrs.get("op") for op in loop.regions[0].block.ops  # noqa: E731
+                               if op.name == "binary" and not ir.shape_of(op.result.type)]
+    assert scalar_ops(inner) == []  # `i * 2` and its conversion moved to the outer loop
+    assert scalar_ops(outer) == ["mul", "mul", "add"]  # `i * 2` and `s * 2 + 1` stay
