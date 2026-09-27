@@ -127,6 +127,8 @@ typedef struct {
     fr_scalar_slot scalars[FR_MAX_BINDINGS];
 } fr_launch_plan;
 
+// The fr_stream_* functions are thread-safe: a stream serializes its own state, and a
+// sync waits without holding the stream's lock.
 void *fr_stream_new(void *queue);
 void fr_stream_free(void *stream);
 // Encodes one dispatch into the stream's open command buffer. grid is in
@@ -135,7 +137,8 @@ void fr_stream_free(void *stream);
 void fr_stream_dispatch(void *stream, void *pso, const char *name, const fr_launch_plan *plan,
                         void *const *bufs, const uint64_t *offsets, const void *scalar_bytes,
                         const uint32_t grid[3], const uint32_t tg[3]);
-// Ends the encoder and commits the command buffer, then signals the shared event.
+// Ends the encoder and commits the command buffer, then signals the shared event. Also
+// releases committed command buffers that completed without an error.
 void fr_stream_flush(void *stream);
 // Flushes and waits. Returns 0 on success; nonzero with a message in err if any
 // command buffer since the previous sync failed.

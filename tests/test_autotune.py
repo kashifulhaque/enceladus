@@ -1,5 +1,7 @@
 """Tests for `@enceladus.autotune` and `@enceladus.heuristics`."""
 
+from concurrent.futures import ThreadPoolExecutor
+
 import ml_dtypes
 import numpy as np
 import pytest
@@ -138,6 +140,80 @@ def test_saved_result_missing_from_configs_is_retuned():
     out = enceladus.zeros(4096)
     second[_grid](x, out, 4096)
     assert second.config_for(x, out, 4096).kwargs["BLOCK"] == 1024
+
+
+@enceladus.jit
+def _scale_copy(x_ptr, out_ptr, n, alpha=2.0, BLOCK: tl.constexpr = 256):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * alpha, mask=mask)
+
+
+def test_key_argument_can_take_its_default():
+    tuned = Autotuner(_scale_copy, CONFIGS[1:], key=["n", "alpha"], rep=3, warmup_ms=1)
+    x, out = enceladus.randn(4096), enceladus.zeros(4096)
+    tuned[_grid](x, out, 4096)
+    np.testing.assert_array_equal(out.numpy(), x.numpy() * 2)
+    assert tuned.config_for(x, out, 4096) is tuned.config_for(x, out, 4096, 2.0) is not None
+
+
+_X32 = np.zeros(8, np.float32)
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        ((_X32, _X32, np.int64(1 << 20)), (_X32, _X32, np.int64(1000)), False),
+        ((_X32, _X32, np.int64(1000)), (_X32, _X32, 1000), True),
+        ((_X32, _X32, np.array(1 << 20)), (_X32, _X32, np.array(1000)), False),
+        ((_X32, _X32, 8), (_X32, _X32.astype(np.float16), 8), False),
+        ((_X32, _X32, 8), (enceladus.from_numpy(_X32), _X32, 8), True),
+    ],
+    ids=["numpy_scalar_values", "numpy_scalar_is_int", "0d_array_values", "dtype",
+         "tensor_and_array"],
+)  # fmt: skip
+def test_key_distinguishes_values_and_normalizes_dtypes(a, b, same):
+    tuned = Autotuner(_accumulate, CONFIGS, key=["n"])
+    assert (tuned._key(dict(zip(tuned.arg_names, a, strict=False))) ==
+            tuned._key(dict(zip(tuned.arg_names, b, strict=False)))) == same  # fmt: skip
+
+
+def test_restore_value_resets_before_every_benchmark_run():
+    seen = set()
+    config = enceladus.Config({"BLOCK": 256},
+                              pre_hook=lambda a: seen.add(float(a["out_ptr"]._view()[0])))
+    tuned = Autotuner(_accumulate, [config], key=["n"], restore_value=["out_ptr"], rep=3,
+                      warmup_ms=1)  # fmt: skip
+    x, out = enceladus.ones(4096), enceladus.full(4096, 5.0)
+    tuned[_grid](x, out, 4096)
+    # Every run, benchmarked or real, starts from the original values.
+    assert seen == {5.0}
+    np.testing.assert_array_equal(out.numpy(), 6.0)
+
+
+def test_concurrent_saves_keep_every_result():
+    tuners = [Autotuner(_accumulate, CONFIGS, key=["n"]) for _ in range(16)]
+    for i, t in enumerate(tuners):
+        t.best[f"key{i}"] = CONFIGS[i % len(CONFIGS)]
+    with ThreadPoolExecutor(len(tuners)) as pool:
+        list(pool.map(Autotuner._save, tuners))
+    fresh = Autotuner(_accumulate, CONFIGS, key=["n"])
+    fresh._load()
+    assert sorted(fresh._saved) == sorted(f"key{i}" for i in range(16))
+
+
+def test_explain_and_warmup_use_the_tuned_config():
+    configs = [enceladus.Config({"BLOCK": 256}, num_warps=2),
+               enceladus.Config({"BLOCK": 1024}, num_warps=8)]  # fmt: skip
+    tuned = Autotuner(_accumulate, configs, key=["n"], rep=3, warmup_ms=1)
+    x, out = enceladus.randn(1 << 16), enceladus.zeros(1 << 16)
+    # Before tuning, they use the first candidate and don't benchmark.
+    assert "num_warps=2 " in tuned.explain(x, out, 1 << 16)
+    assert not tuned.best
+    tuned[_grid](x, out, 1 << 16)
+    best = tuned.config_for(x, out, 1 << 16)
+    assert f"num_warps={best.num_warps} " in tuned.explain(x, out, 1 << 16)
+    assert tuned.warmup(x, out, 1 << 16).num_warps == best.num_warps
 
 
 def test_heuristics_compute_constexprs():

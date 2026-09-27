@@ -1,5 +1,8 @@
 """RMSNorm forward, one row per program: `x * rsqrt(mean(x^2) + eps) * w`.
 
+`rmsnorm` accepts NumPy arrays, `enceladus.Tensor` objects, PyTorch tensors on the `mps`
+device, and MLX arrays, and returns an array of the same kind.
+
 Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/06_rmsnorm.py`.
 """
 
@@ -21,12 +24,16 @@ def rmsnorm_kernel(x_ptr, w_ptr, out_ptr, stride_x, stride_out, n_cols, eps,
     tl.store(out_ptr + row * stride_out + cols, x * rstd * w, mask=mask)
 
 
-def rmsnorm(x: np.ndarray, w: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """Returns RMSNorm of each row of a 2D array, in the input dtype."""
+def rmsnorm(x, w, eps: float = 1e-6):
+    """Returns RMSNorm of each row of a 2D array, in the input dtype.
+
+    The rows can be strided, but the elements within a row must be contiguous.
+    """
     m, n = x.shape
-    out = np.empty_like(x)
-    rmsnorm_kernel[(m,)](x, w, out, x.strides[0] // x.itemsize, out.strides[0] // out.itemsize,
-                         n, eps, BLOCK=enceladus.next_power_of_2(n))  # fmt: skip
+    out = enceladus.new_empty(x)
+    rmsnorm_kernel[(m,)](x, w, out, enceladus.element_strides(x)[0],
+                         enceladus.element_strides(out)[0], n, eps,
+                         BLOCK=enceladus.next_power_of_2(n))  # fmt: skip
     return out
 
 

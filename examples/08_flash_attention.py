@@ -70,10 +70,6 @@ def attention_kernel(q_ptr, k_ptr, v_ptr, o_ptr, sm_scale, N_CTX, stride_h, stri
     o_desc.store([start_m * BLOCK_M, 0], acc.to(o_desc.dtype))
 
 
-def _alloc_like(q):
-    return np.empty_like(q) if isinstance(q, np.ndarray) else enceladus.empty(q.shape, q.dtype)
-
-
 def _check(q, k, v):
     if not (q.shape == k.shape == v.shape) or len(q.shape) != 4:
         raise ValueError("q, k, and v must all have shape (batch, heads, seq_len, head_dim)")
@@ -98,7 +94,7 @@ def attention(q, k, v, causal: bool = False, sm_scale: float | None = None, o=No
     """
     _check(q, k, v)
     z, h, n, d = q.shape
-    o = _alloc_like(q) if o is None else o
+    o = enceladus.new_empty(q) if o is None else o
     scale = 1.0 / math.sqrt(d) if sm_scale is None else sm_scale
     grid = (enceladus.cdiv(n, block_m), z * h)
     attention_kernel[grid](q, k, v, o, scale, n, n * d, d, HEAD_DIM=d, BLOCK_M=block_m,
@@ -124,7 +120,7 @@ def attention_tuned(q, k, v, causal: bool = False, sm_scale: float | None = None
     """Returns the same result as `attention`, using the fastest configuration for the shape."""
     _check(q, k, v)
     z, h, n, d = q.shape
-    o = _alloc_like(q) if o is None else o
+    o = enceladus.new_empty(q) if o is None else o
     scale = 1.0 / math.sqrt(d) if sm_scale is None else sm_scale
     grid = lambda meta: (enceladus.cdiv(n, meta["BLOCK_M"]), z * h)  # noqa: E731
     attention_tuned_kernel[grid](q, k, v, o, scale, n, n * d, d, HEAD_DIM=d, CAUSAL=causal)

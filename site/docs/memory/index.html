@@ -26,7 +26,7 @@ c.store([pid_m * BM, pid_n * BN], acc)  # skips elements outside the array</code
 <section class="doc prose" id="streams">
   <h2>Streams and synchronization</h2>
   <p>Launches go to a <em>stream</em>, an ordered queue of GPU work like a CUDA stream. Kernels on the stream run in launch order, so each kernel sees the writes of the kernels before it. The stream submits a Metal command buffer every 64 launches, or sooner when the CPU needs results.</p>
-  <p>To wait for all launched work, call <code>enceladus.synchronize()</code>. A failed <code>tl.device_assert</code> or command buffer surfaces at the next synchronization as <code>enceladus.DeviceAssertionError</code> or <code>enceladus.MetalError</code>. The stream isn't thread-safe, so launch kernels from one thread at a time.</p>
+  <p>To wait for all launched work, call <code>enceladus.synchronize()</code>. A failed <code>tl.device_assert</code> or command buffer surfaces at the next synchronization as <code>enceladus.DeviceAssertionError</code> or <code>enceladus.MetalError</code>. You can launch kernels and synchronize from several threads, because the stream locks around each launch and each sync. The first launch of a kernel that calls <code>tl.device_print</code> moves the stream to a logging queue without a lock, so don't launch from other threads while it runs.</p>
   <p>When a launch waits depends on the arrays that you pass, as the following table shows:</p>
   <div class="table-wrap"><table>
     <thead><tr><th>Array arguments</th><th>Where the kernel runs</th><th>When results are visible</th></tr></thead>

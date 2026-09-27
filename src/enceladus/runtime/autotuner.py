@@ -1,7 +1,7 @@
 """`@enceladus.autotune`, `@enceladus.heuristics`, and `enceladus.Config`.
 
 The autotuner compiles every candidate configuration in parallel (Metal compilation
-releases the GIL), times each with GPU timestamps, rejects probable register-spill
+releases the GIL), times each with GPU timestamps, logs probable register-spill
 cliffs, and remembers the winner per key, in memory and on disk under
 `~/.cache/enceladus/autotune/<kernel-hash>/<architecture>.json`.
 
@@ -10,6 +10,9 @@ Set `ENCELADUS_PRINT_AUTOTUNING=1` to print each winner as a pasteable `enceladu
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import inspect
 import json
 import logging
 import os
@@ -28,7 +31,7 @@ from enceladus.runtime.device import get_device
 from enceladus.runtime.tensor import Tensor, from_numpy
 
 log = logging.getLogger("enceladus.autotune")
-SPILL_FACTOR = 3.0  # configs slower than this multiple of the median are rejected
+SPILL_FACTOR = 3.0  # configs slower than this multiple of the median are logged as spills
 
 
 @dataclass
@@ -105,6 +108,46 @@ def _innermost(fn: Any):
     return fn
 
 
+def _named_args(jit: Any, args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Returns the launch arguments by name, with the signature's defaults applied."""
+    named = {p.name: p.default for p in jit.params if p.default is not inspect.Parameter.empty}
+    named.update(zip(jit.arg_names, args, strict=False))
+    named.update(kwargs)
+    return named
+
+
+def _key_value(v: Any) -> str:
+    """Returns the part of an autotuning key for one key argument.
+
+    Arrays and tensors contribute their shape. Scalars, including NumPy scalars and 0-d
+    arrays, contribute their value, so `np.int64(1000)` and `1000` share a key.
+    """
+    if isinstance(v, np.generic):
+        return repr(v.item())
+    shape = getattr(v, "shape", None)
+    if shape is not None and hasattr(v, "dtype"):
+        if len(shape) == 0 and hasattr(v, "item"):
+            return repr(v.item())
+        return str(list(shape))
+    return repr(v)
+
+
+def _key_dtype(v: Any) -> str | None:
+    """Returns the Enceladus element type of an array argument, or `None` for a non-array.
+
+    A NumPy array, an `enceladus.Tensor`, and a PyTorch or MLX tensor of the same element
+    type share a key.
+    """
+    from enceladus.runtime.jit import _elem_dtype, _is_array_like
+
+    if not _is_array_like(v):
+        return None
+    try:
+        return str(_elem_dtype(v))
+    except (TypeError, ValueError):
+        return str(v.dtype)
+
+
 class Heuristics:
     """Computes constexpr values from the other arguments. Created by `@enceladus.heuristics`."""
 
@@ -115,8 +158,7 @@ class Heuristics:
         self.arg_names = self.jit.arg_names
 
     def resolve(self, args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
-        named = dict(zip(self.arg_names, args, strict=False))
-        named.update(kwargs)
+        named = _named_args(self.jit, args, kwargs)
         extra = {k: f(named) for k, f in self.values.items()}
         return {**kwargs, **extra}
 
@@ -127,7 +169,13 @@ class Heuristics:
         self.fn.run(*args, grid=grid, **self.resolve(args, kwargs))
 
     def warmup(self, *args: Any, **kwargs: Any):
+        """Compiles the kernel with the computed constexprs, as `JITFunction.warmup` does."""
         return self.fn.warmup(*args, **self.resolve(args, kwargs))
+
+    def explain(self, *args: Any, **kwargs: Any) -> str:
+        """Reports the compiler's decisions with the computed constexprs, as
+        `JITFunction.explain` does."""
+        return self.fn.explain(*args, **self.resolve(args, kwargs))
 
 
 def heuristics(values: dict[str, Callable[[dict[str, Any]], Any]]):
@@ -215,28 +263,32 @@ class Autotuner:
         return cfg
 
     def _save(self) -> None:
+        """Merges this autotuner's results into the results file.
+
+        An exclusive lock around the read, merge, and write keeps concurrent processes
+        from losing each other's results, and the atomic write keeps readers from seeing
+        a partial file.
+        """
         p = self._path()
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
-            data = {}
-            if p.exists():
-                data = json.loads(p.read_text())
-            data.update({k: c.to_json() for k, c in self.best.items()})
-            tmp = p.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
-            tmp.replace(p)
-        except (OSError, ValueError) as e:
+            with open(p.with_suffix(".lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                data: dict[str, Any] = {}
+                with contextlib.suppress(OSError, ValueError):
+                    loaded = json.loads(p.read_text())
+                    if isinstance(loaded, dict):
+                        data = loaded
+                data.update({k: c.to_json() for k, c in self.best.items()})
+                cache.write_atomic(p, json.dumps(data, indent=1, sort_keys=True))
+        except OSError as e:
             log.debug("couldn't save autotuning results: %s", e)
 
     # ---- tuning ----
 
     def _key(self, named: dict[str, Any]) -> str:
-        parts = []
-        for k in self.key:
-            v = named[k]
-            parts.append(repr(v) if not hasattr(v, "dtype") else f"{list(v.shape)}")
-        dtypes = [str(getattr(named[n], "dtype", "")) for n in self.arg_names
-                  if hasattr(named.get(n), "dtype")]  # fmt: skip
+        parts = [_key_value(named[k]) for k in self.key]
+        dtypes = [d for n in self.arg_names if (d := _key_dtype(named.get(n))) is not None]
         return "|".join(parts) + "|" + ",".join(dtypes)
 
     def __getitem__(self, grid: Any) -> Callable[..., None]:
@@ -244,9 +296,43 @@ class Autotuner:
 
     def config_for(self, *args: Any, **kwargs: Any) -> Config | None:
         """Returns the tuned config for these launch arguments, or None if not tuned yet."""
-        named = dict(zip(self.arg_names, args, strict=False))
-        named.update(kwargs)
-        return self.best.get(self._key(named))
+        return self.best.get(self._key(_named_args(self.jit, args, kwargs)))
+
+    def _config_without_tuning(self, args: tuple, kwargs: dict[str, Any]) -> Config:
+        """Returns the tuned config for these arguments, from memory or from disk, or the
+        first candidate if they haven't been tuned. It never benchmarks."""
+        if not self._loaded:
+            self._load()
+        named = _named_args(self.jit, args, kwargs)
+        key = self._key(named)
+        with self._lock:
+            cfg = self.best.get(key)
+            if cfg is None:
+                cfg = self._from_saved(key, named)
+                if cfg is not None:
+                    self.best[key] = cfg
+        return cfg if cfg is not None else self._candidates(named)[0]
+
+    def warmup(self, *args: Any, **kwargs: Any):
+        """Compiles the kernel without benchmarking or launching it.
+
+        It uses the tuned config for these arguments, or the first candidate config if
+        they haven't been tuned.
+
+        Returns:
+            A `CompiledKernel`, as `JITFunction.warmup` returns.
+        """
+        cfg = self._config_without_tuning(args, kwargs)
+        return self.fn.warmup(*args, **kwargs, **cfg.kwargs, **cfg.launch_options())
+
+    def explain(self, *args: Any, **kwargs: Any) -> str:
+        """Prints and returns the compiler's decisions, as `JITFunction.explain` does.
+
+        It uses the tuned config for these arguments, or the first candidate config if
+        they haven't been tuned, and never benchmarks.
+        """
+        cfg = self._config_without_tuning(args, kwargs)
+        return self.fn.explain(*args, **kwargs, **cfg.kwargs, **cfg.launch_options())
 
     def _resolve(self, args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
         return self.fn.resolve(args, kwargs) if isinstance(self.fn, Heuristics) else kwargs
@@ -254,8 +340,7 @@ class Autotuner:
     def run(self, *args: Any, grid: Any, **kwargs: Any) -> None:
         if not self._loaded:
             self._load()
-        named = dict(zip(self.arg_names, args, strict=False))
-        named.update(kwargs)
+        named = _named_args(self.jit, args, kwargs)
         key = self._key(named)
         cfg = self.best.get(key)
         if cfg is None:
@@ -276,7 +361,7 @@ class Autotuner:
         model = self.prune.get("perf_model")
         top_k = self.prune.get("top_k")
         if model is not None and top_k:
-            scored = sorted(configs, key=lambda c: model(**named, **c.kwargs,
+            scored = sorted(configs, key=lambda c: model(**{**named, **c.kwargs},
                                                           num_warps=c.num_warps))  # fmt: skip
             n = int(top_k * len(configs)) if isinstance(top_k, float) else int(top_k)
             configs = scored[: max(1, n)]
@@ -313,8 +398,7 @@ class Autotuner:
         for i, e in errors.items():
             warnings.warn(f"{self.jit.__name__}: skipping {configs[i]}: {e}", stacklevel=4)
 
-        named_bench = dict(zip(self.arg_names, bench_args, strict=False))
-        named_bench.update(bench_kwargs)
+        named_bench = _named_args(self.jit, bench_args, bench_kwargs)
         saved = {n: named_bench[n].numpy().copy() for n in self.restore_value
                  if isinstance(named_bench.get(n), Tensor)}  # fmt: skip
         timings: dict[int, float] = {}
@@ -323,6 +407,11 @@ class Autotuner:
                 continue
 
             def launch(cfg=cfg) -> None:
+                # do_bench waits for each run's command buffer before it calls this again,
+                # so these host writes can't race the previous run. Restoring before every
+                # run keeps in-place kernels from accumulating across repetitions.
+                for n, v in saved.items():
+                    named_bench[n]._view()[...] = v
                 for n in self.reset_to_zero:
                     t = named_bench[n]
                     if isinstance(t, Tensor):
@@ -351,12 +440,14 @@ class Autotuner:
                 f"every autotuning config of {self.jit.__name__} failed to compile or run; the "
                 f"first error was: {first}"
             ) from first
+        # Log probable register-spill cliffs. They can't win, because the fastest config
+        # is never slower than the median, so there's nothing to filter out.
         med = statistics.median(timings.values())
-        valid = {i: t for i, t in timings.items() if t <= SPILL_FACTOR * med}
-        for i in set(timings) - set(valid):
-            log.debug("rejecting %s: %.3f ms against a median of %.3f ms (likely spilling)",
-                      configs[i], timings[i], med)  # fmt: skip
-        best_i = min(valid, key=valid.get)
+        for i in sorted(timings):
+            if timings[i] > SPILL_FACTOR * med:
+                log.debug("%s: %.3f ms against a median of %.3f ms (likely spilling)",
+                          configs[i], timings[i], med)  # fmt: skip
+        best_i = min(timings, key=timings.get)
         best = configs[best_i]
         self.best[key] = best
         self.timings[key] = {str(configs[i]): t for i, t in timings.items()}
@@ -385,7 +476,8 @@ def autotune(
         prune_configs_by: Optional `{"early_config_prune": fn(configs, named_args)}`, and
             `{"perf_model": fn(**args), "top_k": n}` to benchmark only the top `n`.
         reset_to_zero: Arguments zeroed before each benchmark run and after tuning.
-        restore_value: Arguments restored to their original values after tuning.
+        restore_value: Arguments restored to their original values before each
+            benchmark run and after tuning.
         warmup_ms: GPU warm-up time before measuring each config.
         rep: Timed repetitions per config.
     """

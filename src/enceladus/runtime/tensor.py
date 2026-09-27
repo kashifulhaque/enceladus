@@ -207,6 +207,10 @@ class Tensor:
                 "Tensor indexing supports only slices that give a view; "
                 "use .numpy() to read single elements"
             )
+        if v.size == 0:
+            # An empty view has no element to locate in the buffer, and the NumPy view of
+            # an empty tensor doesn't point into the buffer at all.
+            return Tensor(self.buffer, v.shape, self.np_dtype, None, self.offset)
         if any(s < 0 for s in v.strides):
             raise ValueError(
                 "Tensor indexing doesn't support negative strides. Reverse the data with "

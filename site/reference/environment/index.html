@@ -16,7 +16,7 @@
       <tr><td><code>ENCELADUS_CACHE_DIR</code></td><td>Moves the disk cache from <code>~/.cache/enceladus</code>.</td></tr>
       <tr><td><code>ENCELADUS_ALWAYS_COMPILE=1</code></td><td>Ignores the disk cache and saved autotuning results.</td></tr>
       <tr><td><code>ENCELADUS_OVERRIDE_DIR</code></td><td>Loads <code>DIR/KERNEL_NAME.metal</code> instead of the generated MSL.</td></tr>
-      <tr><td><code>ENCELADUS_VERIFY=1</code></td><td>Verifies the IR after every compiler pass, including for interpreted launches.</td></tr>
+      <tr><td><code>ENCELADUS_VERIFY</code></td><td>Controls the compiler's checks on interpreted launches: unset warns about kernels that compiled mode refuses, <code>1</code> raises the error, and <code>0</code> skips the check. <code>1</code> also verifies the IR after every compiler pass.</td></tr>
       <tr><td><code>ENCELADUS_PRINT_AUTOTUNING=1</code></td><td>Prints each autotuning winner as a pasteable <code>enceladus.Config(...)</code>.</td></tr>
       <tr><td><code>ENCELADUS_FLUSH_EVERY</code></td><td>Sets the number of launches per command buffer. The default is 64.</td></tr>
       <tr><td><code>MTL_CAPTURE_ENABLED=1</code></td><td>A Metal variable that <code>enceladus.capture</code> needs at process start.</td></tr>

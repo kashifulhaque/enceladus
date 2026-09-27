@@ -1,17 +1,24 @@
 """Tests for the native runtime, buffers, streams, and raw MSL kernels."""
 
+import ctypes
+import dataclasses
 import gc
 import os
 import subprocess
 import sys
 import textwrap
+import time
+from types import SimpleNamespace
 
 import ml_dtypes
 import numpy as np
 import pytest
+from conftest import execution_mode
 
 import enceladus
 import enceladus.language as tl
+from enceladus.runtime import launcher
+from enceladus.runtime import stream as stream_module
 from enceladus.runtime.device import PAGE_SIZE
 
 VADD = """
@@ -134,6 +141,17 @@ def test_errors_raise_python_exceptions(vadd):
         vadd[(1,), (2048,)]
     with pytest.raises(TypeError, match="float64"):
         vadd[(1,), (32,)](np.zeros(8), x, x, 8)
+    # Metal computes thread positions in 32 bits: 2^32 threads would silently run none.
+    with pytest.raises(ValueError, match="exceeds Metal's limit"):
+        vadd[(1 << 27,), (32,)]
+    vadd[((1 << 27) - 1,), (32,)]  # the largest grid is accepted
+    with pytest.raises(ValueError, match="at least 1"):
+        vadd[(1,), (0,)]
+    with pytest.raises(ValueError, match="exceeds Metal's limit"):  # the native check
+        enceladus.get_device().stream.native.dispatch(
+            vadd.pipeline, vadd._plan((True, True, True, False)), [x.buffer] * 3, None,
+            bytes(4), (1 << 27,), (32, 1, 1),
+        )  # fmt: skip
     enceladus.synchronize()  # the stream is still usable
 
 
@@ -222,3 +240,224 @@ def test_stream_outlives_a_freed_kernel():
     r = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True,
                        timeout=60)  # fmt: skip
     assert r.returncode == 0, r.stderr.decode()[-2000:]
+
+
+INC = """
+#include <metal_stdlib>
+kernel void inc(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] += 1; }
+"""
+
+_cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+_cf.CFGetRetainCount.restype = ctypes.c_long
+_cf.CFGetRetainCount.argtypes = [ctypes.c_void_p]
+
+
+def _retains(t: enceladus.Tensor) -> int:
+    return _cf.CFGetRetainCount(t.buffer.handle)
+
+
+@enceladus.jit
+def _add_one(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=m) + 1.0, mask=m)
+
+
+def test_launches_release_their_buffers():
+    t = enceladus.zeros(1024)
+    _add_one[(1,)](t, t, 1024, BLOCK=1024)
+    enceladus.synchronize()
+    base = _retains(t)
+    # Every @jit launch reads the buffer's address, which once leaked one retain each.
+    for _ in range(50):
+        _add_one[(1,)](t, t, 1024, BLOCK=1024)
+    repr(t)
+    assert _retains(t) - base < 5
+    # A committed command buffer retains its buffers. Later flushes release the ones
+    # that completed, without waiting for a sync.
+    stream = enceladus.get_device().stream
+    other = enceladus.zeros(1024)
+    _add_one[(1,)](t, t, 1024, BLOCK=1024)
+    stream.flush()
+    deadline = time.monotonic() + 5
+    while _retains(t) > base and time.monotonic() < deadline:
+        _add_one[(1,)](other, other, 1024, BLOCK=1024)
+        stream.flush()
+        time.sleep(0.001)
+    assert _retains(t) <= base
+    enceladus.synchronize()
+
+
+_THREADS_SCRIPT = f"""
+import threading
+import numpy as np
+import enceladus
+k = enceladus.metal_kernel({INC!r}, "inc")
+stop = threading.Event()
+def syncer():
+    while not stop.is_set():
+        enceladus.synchronize()
+def launch(t):
+    for _ in range(20000):
+        k[(4,), (256,)](t)
+ts = [enceladus.zeros(1024) for _ in range(2)]
+syncers = [threading.Thread(target=syncer) for _ in range(2)]
+launchers = [threading.Thread(target=launch, args=(t,)) for t in ts]
+for th in syncers + launchers:
+    th.start()
+for th in launchers:
+    th.join()
+stop.set()
+for th in syncers:
+    th.join()
+for t in ts:
+    np.testing.assert_array_equal(t.numpy(), 20000)
+"""
+
+
+def test_concurrent_launches_and_syncs():
+    # It runs in its own process, so that a crash or a hang fails only this test.
+    r = subprocess.run([sys.executable, "-c", _THREADS_SCRIPT], capture_output=True,
+                       timeout=30)  # fmt: skip
+    assert r.returncode == 0, r.stderr.decode()[-2000:]
+
+
+class _BigBuffer:
+    """Stands in for a buffer of 16 GB, which the launch must refuse before binding."""
+
+    ptr, nbytes = 0, 1 << 34
+
+
+@pytest.mark.parametrize("case", ["grid", "pipeline_threads", "span", "read_only"])
+def test_jit_refuses_launches_it_would_run_wrong(case):
+    x, out = enceladus.ones(8), enceladus.zeros(8)
+    if case == "grid":
+        # 128 threads per program: 2^25 programs is 2^32 threads.
+        with pytest.raises(ValueError, match="exceeds Metal's limit"):
+            _add_one[(1 << 25,)](x, out, 8, BLOCK=8)
+    elif case == "pipeline_threads":
+        ck = _add_one.warmup(x, out, 8, BLOCK=8)
+        small = SimpleNamespace(max_total_threads_per_threadgroup=64, name=ck.name)
+        with pytest.raises(ValueError, match="allows at most 64"):
+            dataclasses.replace(ck, pipeline=small).launch((1, 1, 1), (x, out, 8))
+    elif case == "span":
+        # Offsets are 32-bit ints, so the last element must be at most 2^31 - 1 away.
+        huge = enceladus.Tensor(_BigBuffer(), ((1 << 31) + 1,), "float32")
+        with pytest.raises(ValueError, match="spans 2147483649 elements"):
+            _add_one[(1,)](huge, out, 8, BLOCK=8)
+        one = np.zeros(1, np.float32)
+        view = np.lib.stride_tricks.as_strided(one, shape=(2, 8), strides=(8 << 30, 4))
+        with pytest.raises(ValueError, match="spans 2147483656 elements"):
+            _add_one[(1,)](x, view, 8, BLOCK=8)
+        edge = np.lib.stride_tricks.as_strided(one, shape=(1 << 31,), strides=(4,))
+        launcher.check_index_range(edge, "edge")  # exactly 2^31 elements fit
+    else:
+        # A kernel may read a read-only array, but it must not write one.
+        ro = np.frombuffer(bytes(32), np.float32)
+        host = np.zeros(8, np.float32)
+        _add_one[(1,)](ro, host, 8, BLOCK=8)
+        np.testing.assert_array_equal(host, 1.0)
+        with pytest.raises(ValueError, match="read-only NumPy array"):
+            _add_one[(1,)](x, ro, 8, BLOCK=8)
+        with pytest.raises(ValueError, match="read-only NumPy array"):
+            _add_one[(1,)](x, np.broadcast_to(np.zeros(1, np.float32), (8,)), 8, BLOCK=8)
+        assert not np.frombuffer(ro.tobytes(), np.float32).any()
+
+
+def test_raw_kernel_refuses_to_write_read_only_arrays(vadd):
+    ro = np.frombuffer(np.arange(8, dtype=np.float32).tobytes(), np.float32)
+    out = np.zeros(8, np.float32)
+    vadd[(1,), (32,)](ro, ro, out, 8)  # `device const` inputs may be read-only
+    np.testing.assert_array_equal(out, np.arange(8) * 2)
+    with pytest.raises(ValueError, match=r"argument 2 \('o'\) is a read-only"):
+        vadd[(1,), (32,)](out, out, ro, 8)
+
+
+@enceladus.jit
+def _scale(out_ptr, a):
+    tl.store(out_ptr + tl.arange(0, 4), tl.full((4,), 1.0, tl.float32) * a)
+
+
+@pytest.mark.filterwarnings("ignore:overflow encountered")
+@pytest.mark.parametrize("mode", ["interpret", "compiled"])
+@pytest.mark.parametrize("value", [1e40, -1e40, np.float64(1e39), 2.5])
+def test_float_scalars_convert_like_c(mode, value):
+    out = np.zeros(4, np.float32)
+    with execution_mode(mode):
+        _scale[(1,)](out, value)
+    expected = np.float32(value) if abs(value) < 3.4e38 else np.copysign(np.inf, value)
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_empty_views_stay_inside_their_buffer():
+    for t, key in [(enceladus.zeros(8), slice(8, None)), (enceladus.zeros(0), slice(None)),
+                   (enceladus.zeros((4, 0)), slice(1, None))]:  # fmt: skip
+        v = t[key]
+        assert v.numel == 0 and v.buffer is t.buffer
+        assert 0 <= v.byte_offset <= t.buffer.nbytes
+
+
+@enceladus.jit
+def _checked_copy(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    tl.device_assert(x >= 0, "negative input", mask=m)
+    tl.store(out_ptr + offs, x, mask=m)
+
+
+class _NativeProxy:
+    """Wraps the native stream to inject a failure the GPU won't produce on demand."""
+
+    def __init__(self, native, fail_sync=False, lost_sentinels=0):
+        self._native, self._fail_sync, self._lost = native, fail_sync, lost_sentinels
+
+    def __getattr__(self, name):
+        return getattr(self._native, name)
+
+    @property
+    def log_sentinels(self):
+        return self._native.log_sentinels + self._lost
+
+    def sync(self):
+        self._native.sync()
+        if self._fail_sync:
+            raise enceladus.MetalError("injected command buffer failure")
+
+
+def test_failed_sync_leaves_no_stale_device_assert(monkeypatch):
+    monkeypatch.setenv("ENCELADUS_DEBUG", "1")
+    stream = enceladus.get_device().stream
+    out = enceladus.zeros(4)
+    _checked_copy[(1,)](enceladus.full(4, -1.0), out, 4, BLOCK=4)  # the assert fails
+    monkeypatch.setattr(stream, "native", _NativeProxy(stream.native, fail_sync=True))
+    with pytest.raises(enceladus.MetalError, match="injected"):
+        enceladus.synchronize()
+    monkeypatch.setattr(stream, "native", stream.native._native)
+    _checked_copy[(1,)](enceladus.ones(4), out, 4, BLOCK=4)
+    enceladus.synchronize()  # reports nothing: the failed sync reset the assert
+    np.testing.assert_array_equal(out.numpy(), 1.0)
+
+
+@enceladus.jit
+def _print_pid(x_ptr):
+    tl.device_print("pid", tl.program_id(0))
+
+
+def test_a_lost_log_sentinel_delays_only_one_sync(monkeypatch, capfd):
+    stream = enceladus.get_device().stream
+    x = enceladus.zeros(1)
+    _print_pid[(1,)](x)
+    enceladus.synchronize()  # moves the stream to the logging queue
+    monkeypatch.setattr(stream_module, "LOG_TIMEOUT", 0.2)
+    monkeypatch.setattr(stream, "_lost_sentinels", 0)
+    # Metal drops a sentinel, for example when the log buffer overflows.
+    monkeypatch.setattr(stream, "native", _NativeProxy(stream.native, lost_sentinels=1))
+    _print_pid[(1,)](x)
+    enceladus.synchronize()
+    assert "didn't arrive in time" in capfd.readouterr().err
+    _print_pid[(3,)](x)
+    enceladus.synchronize()
+    err = capfd.readouterr().err
+    assert "didn't arrive in time" not in err
+    assert sum(line.startswith("pid") for line in err.splitlines()) == 3

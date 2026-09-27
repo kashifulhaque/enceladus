@@ -18,20 +18,35 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import logging
+import math
 import struct
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from enceladus import _C
 from enceladus.compiler.codegen.msl import KernelArg, scalar_slots
 from enceladus.runtime import interop
 from enceladus.runtime.device import get_device
 from enceladus.runtime.interop import as_kernel_arg
+from enceladus.runtime.raw import (
+    MAX_THREADS_PER_DIM,
+    after_dispatch,
+    check_grid,
+    check_writable_numpy,
+)
 from enceladus.runtime.tensor import Tensor
 
-MAX_GRID = (1 << 32) - 1
+MAX_ELEMENT_INDEX = (1 << 31) - 1
+"""The largest element offset from an array argument's first element that a compiled
+kernel can address. Generated code holds pointer offsets in a signed 32-bit `int`
+(64-bit offsets, `idx64`, aren't implemented), so a larger offset wraps around."""
+# A buffer of at most this many bytes can't hold an element past MAX_ELEMENT_INDEX, so
+# launches check the exact span only of arguments in larger buffers.
+_INDEX_CHECK_BYTES = 1 << 31
 # The MSL language version that `torch.mps.compile_shader` compiles with (torch 2.14).
 TORCH_LANGUAGE_VERSION = (4, 0)
 
@@ -180,19 +195,43 @@ def launch_synced(stream: Any, pipeline: Any, plan: Any, bufs_values: Sequence[A
     `extra_bufs` are native buffers bound after the arguments, such as an error buffer.
     """
     interop.torch_synchronize()
-    bufs, offsets = [], []
+    bufs, offsets, args = [], [], []
     for a in bufs_values:
         ba = as_kernel_arg(a)
         bufs.append(ba.buffer)
         offsets.append(ba.byte_offset)
-        stream.keep_alive(ba.owner)
-        if ba.writeback is not None:
-            stream.after_sync(ba.writeback)
+        args.append(ba)
     for b in extra_bufs:
         bufs.append(b)
         offsets.append(0)
     stream.native.dispatch(pipeline, plan, bufs, offsets, scalars, grid, tg)
+    # Register keep-alives and copy-backs after the dispatch, so that a sync on another
+    # thread can't release the memory or copy back before the dispatch runs.
+    for ba in args:
+        stream.keep_alive(ba.owner)
+        if ba.writeback is not None:
+            stream.after_sync(ba.writeback)
     stream.synchronize()
+
+
+def check_index_range(value: Any, name: str) -> None:
+    """Refuses an array argument whose elements lie too far apart for 32-bit offsets.
+
+    Raises:
+        ValueError: Some element of `value` is more than `MAX_ELEMENT_INDEX` elements
+            past its first element.
+    """
+    shape = tuple(value.shape)
+    if 0 in shape:
+        return
+    strides = interop.element_strides(value)
+    last = sum((n - 1) * abs(s) for n, s in zip(shape, strides, strict=True))
+    if last > MAX_ELEMENT_INDEX:
+        raise ValueError(
+            f"argument `{name}` spans {last + 1} elements, but a compiled kernel can address "
+            "at most 2^31 elements of each array argument, because it computes offsets "
+            "in 32 bits. Split the array, and launch the kernel on each part."
+        )
 
 
 # ---- Compiled kernels ----
@@ -256,6 +295,8 @@ class CompiledKernel:
             buf_index.append(self.assert_buffer_index)
         self._plan = _C.LaunchPlan(buf_index, scalar_slots(self.args))
         self._tg = (self.num_warps * 32, 1, 1)
+        self._max_grid0 = MAX_THREADS_PER_DIM // self._tg[0]
+        self._checked_pipeline: Any = None  # the pipeline that `_check_pipeline` accepted
         self._torch: TorchLaunch | str | None = None  # a reason string if unavailable
         self._fallback_logged = False
         self._debug = self.enable_logging or self.assert_buffer is not None
@@ -281,15 +322,61 @@ class CompiledKernel:
         loc = Loc(a["file"], a["line"], a.get("col", 1)) if a["file"] else None
         return DeviceAssertionError(a["message"], loc, program_id)
 
+    def _check_pipeline(self) -> None:
+        """Checks that the pipeline can run a threadgroup of `num_warps * 32` threads.
+
+        Raises:
+            ValueError: The pipeline allows fewer threads per threadgroup, for example
+                because the kernel uses too many registers.
+        """
+        limit = self.pipeline.max_total_threads_per_threadgroup
+        if limit < self._tg[0]:
+            raise ValueError(
+                f"kernel `{self.name}` launches {self._tg[0]} threads per threadgroup "
+                f"(num_warps={self.num_warps}), but its Metal pipeline allows at most {limit}. "
+                "Use a smaller num_warps."
+            )
+        self._checked_pipeline = self.pipeline
+
+    def _pack_scalars(self, values: Sequence[Any]) -> bytes:
+        """Packs the scalar arguments, converting them as C converts to the parameter type.
+
+        A float outside the range of `float32` (or `float16`) packs as an infinity of the
+        same sign, which is also what the interpreter computes.
+
+        Raises:
+            OverflowError: An integer is out of range for its parameter type.
+        """
+        vals = [values[i] for i in self._scalar_idx]
+        try:
+            return self._packer.pack(*vals)
+        except (OverflowError, struct.error):
+            pass
+        for k, i in enumerate(self._scalar_idx):
+            a = self.args[i]
+            try:
+                struct.pack("<" + a.struct_format, vals[k])
+            except OverflowError:
+                if a.struct_format not in ("f", "e"):
+                    raise OverflowError(
+                        f"argument `{a.name}` = {vals[k]} is out of range for {a.dtype}"
+                    ) from None
+                vals[k] = math.copysign(math.inf, float(vals[k]))
+            except struct.error as e:
+                raise OverflowError(
+                    f"argument `{a.name}` = {vals[k]} is out of range for {a.dtype}: {e}"
+                ) from None
+        return self._packer.pack(*vals)
+
     def launch(self, grid: tuple[int, int, int], values: Sequence[Any]) -> None:
         """Launches with runtime argument values in signature order."""
         if grid[0] == 0 or grid[1] == 0 or grid[2] == 0:
             return
-        if grid[0] > MAX_GRID or grid[1] > MAX_GRID or grid[2] > MAX_GRID:
-            raise ValueError(
-                f"grid {grid} exceeds the device limit of {MAX_GRID} per dimension. Launch "
-                "fewer programs, for example by giving each program a larger block."
-            )
+        if (grid[0] > self._max_grid0 or grid[1] > MAX_THREADS_PER_DIM
+                or grid[2] > MAX_THREADS_PER_DIM):  # fmt: skip
+            check_grid(grid, self._tg)  # raises
+        if self.pipeline is not self._checked_pipeline:
+            self._check_pipeline()
         debug = self._debug
         if debug:
             self._prepare_debug(get_device().stream)
@@ -300,37 +387,50 @@ class CompiledKernel:
                 a = values[i]
                 if type(a) is not tensor_type or not a.is_mps:
                     break
+                if a.untyped_storage().nbytes() > _INDEX_CHECK_BYTES:
+                    check_index_range(a, self.args[i].name)
             else:
                 tl.launch(values, (grid[0] * self._tg[0], grid[1], grid[2]), self._tg)
                 return
         stream = get_device().stream
         bufs, offsets = [], []
-        sync = False
+        host: list[Any] = []  # BufferArgs over host memory
         for i in self._ptr_idx:
             a = values[i]
             if type(a) is Tensor:
-                bufs.append(a.buffer)
+                buf = a.buffer
+                if buf.nbytes > _INDEX_CHECK_BYTES:
+                    check_index_range(a, self.args[i].name)
+                bufs.append(buf)
                 offsets.append(a.offset * a.np_dtype.itemsize if a.offset else 0)
                 continue
             if interop.framework_of(a) is not None:
                 self._launch_foreign(grid, values)
                 return
+            if isinstance(a, np.ndarray):
+                # Check before wrapping, so that a huge strided view never reaches the
+                # copy fallback.
+                check_index_range(a, self.args[i].name)
+                if self.args[i].written:
+                    check_writable_numpy(a, f"argument `{self.args[i].name}`")
             ba = as_kernel_arg(a)
             bufs.append(ba.buffer)
             offsets.append(ba.byte_offset)
-            if ba.needs_sync:
-                sync = True
-            else:
-                stream.keep_alive(ba.owner)
-            if ba.writeback is not None:
-                stream.after_sync(ba.writeback)
+            host.append(ba)
         if debug and self._extra_bufs:
             bufs += self._extra_bufs
             offsets += [0] * len(self._extra_bufs)
-        scalars = self._packer.pack(*[values[i] for i in self._scalar_idx])
+        try:
+            scalars = self._packer.pack(*[values[i] for i in self._scalar_idx])
+        except (OverflowError, struct.error):
+            scalars = self._pack_scalars(values)
         stream.native.dispatch(self.pipeline, self._plan, bufs, offsets, scalars, grid, self._tg)
-        if sync:
-            stream.synchronize()
+        if debug and self.assert_buffer is not None:
+            # Watch again after the dispatch, in case a sync on another thread took the
+            # watch that `_prepare_debug` registered before the dispatch.
+            stream.watch_asserts(self)
+        if host:
+            after_dispatch(stream, host)
 
     def _launch_foreign(self, grid: tuple[int, int, int], values: Sequence[Any]) -> None:
         """Launches a kernel that has at least one PyTorch or MLX array argument."""
@@ -338,6 +438,7 @@ class CompiledKernel:
         if kinds == {interop.KIND_TORCH}:
             for i in self._ptr_idx:
                 interop.torch_np_dtype(values[i])  # refuses CPU and float64 tensors
+                check_index_range(values[i], self.args[i].name)
             tl = self._torch
             if tl is None and self.language_version > TORCH_LANGUAGE_VERSION:
                 tl = self._torch = (f"it needs MSL {self.language_version}, and compile_shader "
@@ -361,21 +462,27 @@ class CompiledKernel:
             self._fallback_logged = True
             log_fallback(self.name, reason)
         for i in self._ptr_idx:
+            check_index_range(values[i], self.args[i].name)
             if self.args[i].written:
                 _check_writable(values[i], self.args[i].name)
-        scalars = self._packer.pack(*[values[i] for i in self._scalar_idx])
+        scalars = self._pack_scalars(values)
         launch_synced(get_device().stream, self.pipeline, self._plan,
                       [values[i] for i in self._ptr_idx], scalars, grid, self._tg,
                       self._extra_bufs)  # fmt: skip
 
     def timed_launch(self, grid: tuple[int, int, int], values: Sequence[Any]) -> float:
         """Runs one launch in its own command buffer and returns its GPU time in seconds."""
+        check_grid(grid, self._tg)
+        if self.pipeline is not self._checked_pipeline:
+            self._check_pipeline()
+        for i in self._ptr_idx:
+            check_index_range(values[i], self.args[i].name)
         interop.torch_synchronize()
         stream = get_device().stream
         if self._debug:
             self._prepare_debug(stream)
         bufs = [as_kernel_arg(values[i]) for i in self._ptr_idx]
-        scalars = self._packer.pack(*[values[i] for i in self._scalar_idx])
+        scalars = self._pack_scalars(values)
         t0, t1 = stream.native.timed_run(
             self.pipeline, self._plan, [b.buffer for b in bufs] + self._extra_bufs,
             [b.byte_offset for b in bufs] + [0] * len(self._extra_bufs), scalars, grid, self._tg,
@@ -384,7 +491,8 @@ class CompiledKernel:
 
 
 def _check_writable(a: Any, name: str) -> None:
-    """Refuses to write through a broadcast MLX array, whose elements share memory."""
+    """Refuses to write through a read-only NumPy array or a broadcast MLX array."""
+    check_writable_numpy(a, f"argument `{name}`")
     if interop.framework_of(a) != interop.KIND_MLX:
         return
     ba = as_kernel_arg(a)

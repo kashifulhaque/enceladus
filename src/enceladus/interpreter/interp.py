@@ -6,19 +6,22 @@ once per program, with `tl` builtins computing on NumPy arrays:
 - `ITile` wraps a NumPy array and a `tl` dtype. Arithmetic on `float16` and `bfloat16`
   computes in `float32` and rounds to the tile dtype after each op.
 - `IPointer` is a flat view over an array's storage plus a tile of element offsets.
-- Runtime scalars (program IDs and scalar kernel arguments) are 0-d tiles, so integer
-  division truncates and `int32` wraps, as on the GPU.
+- Runtime scalars (program IDs, scalar kernel arguments, and loop variables) are 0-d
+  tiles, so integer division truncates and `int32` wraps, as on the GPU.
 
 The per-builtin NumPy rules live next to each builtin in `enceladus.language.ops`. This
 module holds the value types, the shared elementwise semantics, and the grid runner.
+`enceladus.interpreter.rewrite` recompiles each kernel with the few source rewrites that
+Python semantics need, such as typed loop variables.
 """
 
 from __future__ import annotations
 
 import math
+import operator
 import sys
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import numpy as np
@@ -501,8 +504,43 @@ def as_compute(x: Any, dt: core.dtype) -> np.ndarray:
         if x.dtype is dt:
             return x.data.astype(_compute_np(dt), copy=False)
         return convert(x, dt).data.astype(_compute_np(dt), copy=False)
-    x = core.unwrap(x)
-    return np.asarray(semantic.coerce_literal(x, dt), dtype=_np(dt)).astype(_compute_np(dt))
+    return literal_array(core.unwrap(x), dt).astype(_compute_np(dt))
+
+
+def literal_array(x: semantic.Literal, dt: core.dtype) -> np.ndarray:
+    """Returns the literal `x` as a 0-d array of `dt`, converted like a C cast.
+
+    An integer that fits in the width of `dt` as a signed or an unsigned number wraps to
+    two's complement, so `-1` becomes the largest `uint32`, as it does on the GPU. A float
+    that converts to an integer type must be finite and fit the type after truncation
+    toward zero.
+
+    Raises:
+        CompilationError: The literal doesn't fit in `dt`.
+    """
+    if isinstance(x, float) and dt.is_int() and not dt.is_bool():
+        lo, hi = semantic.int_range(dt)
+        if not (math.isfinite(x) and lo <= math.trunc(x) <= hi):
+            raise CompilationError(
+                f"the value {x!r} doesn't fit in {dt}, whose range is {lo} to {hi}. Use a value "
+                "in that range, or a floating-point dtype."
+            )
+    v = semantic.coerce_literal(x, dt)
+    try:
+        return np.asarray(v, dtype=_np(dt))
+    except OverflowError:
+        # NumPy refuses out-of-range Python ints. Wrap the ones that fit in the width.
+        bits = dt.primitive_bitwidth
+        if not -(1 << (bits - 1)) <= v < (1 << bits):
+            lo, hi = semantic.int_range(dt)
+            raise CompilationError(
+                f"the value {v} doesn't fit in {dt}, whose range is {lo} to {hi}. Use a value "
+                "in that range, or a wider dtype."
+            ) from None
+        v &= (1 << bits) - 1
+        if dt.is_signed() and v >> (bits - 1):
+            v -= 1 << bits
+        return np.asarray(v, dtype=_np(dt))
 
 
 def wrap(data: np.ndarray, dt: core.dtype) -> ITile:
@@ -625,7 +663,97 @@ def to_tile(x: Any, dt: core.dtype | None = None) -> ITile:
     if not semantic.is_literal(x):
         raise CompilationError(f"expected a number or a tile, but got {type(x).__name__} {x!r}")
     dt = dt or semantic.literal_dtype(x)
-    return ITile(np.asarray(semantic.coerce_literal(x, dt), dtype=_np(dt)), dt)
+    return ITile(literal_array(x, dt), dt)
+
+
+# ---------------------------------------------------------------------------
+# Loops and comparisons
+# ---------------------------------------------------------------------------
+
+
+def typed_range(*args: Any) -> Iterator[ITile]:
+    """Iterates over `range(*args)`, yielding the loop variable as a typed scalar.
+
+    As in compiled code, the loop variable is an `int32` scalar when every bound fits in
+    `int32`, an `int64` scalar when a bound is `uint32`, `int64`, or a literal outside the
+    `int32` range, and a `uint64` scalar when a bound is `uint64` and none is negative.
+    Arithmetic on it wraps like arithmetic on any other runtime scalar.
+    """
+    if not 1 <= len(args) <= 3:
+        raise CompilationError(f"range() takes 1 to 3 arguments, but got {len(args)}")
+    bounds = [core.unwrap(a) for a in ((0, args[0], 1) if len(args) == 1 else (*args, 1)[:3])]
+    ranges = []  # The range of values each bound can take.
+    for v in bounds:
+        if isinstance(v, np.integer):
+            v = int(v)
+        if isinstance(v, ITile) and v.shape == () and v.dtype.is_int() and not v.dtype.is_bool():
+            ranges.append(semantic.int_range(v.dtype))
+        elif isinstance(v, int) and not isinstance(v, bool):
+            ranges.append((v, v))
+        else:
+            what = f"a {v.dtype} tile of shape {v.shape}" if isinstance(v, ITile) else repr(v)
+            raise CompilationError(
+                f"range() bounds must be integer scalars, not {what}. Convert a float bound "
+                "with `.to(tl.int32)`."
+            )
+    for dt in (core.int32, core.int64, core.uint64):
+        lo, hi = semantic.int_range(dt)
+        if all(lo <= a and b <= hi for a, b in ranges):
+            break
+    else:
+        raise CompilationError(
+            "range() has a tl.uint64 bound and a signed bound or negative step, and no counter "
+            "type holds the values of both. Convert the bounds with `.to(tl.int64)`, or make "
+            "them all unsigned."
+        )
+    lb, ub, step = (int(to_tile(v, dt).data) for v in bounds)
+    if step == 0:
+        raise CompilationError("the step of range() can't be zero. Use a nonzero step.")
+    return _typed_range(lb, ub, step, dt)
+
+
+def _typed_range(lb: int, ub: int, step: int, dt: core.dtype) -> Iterator[ITile]:
+    npdt = _np(dt)
+    new = object.__new__
+    for v in range(lb, ub, step):
+        t = new(ITile)
+        t.data = np.array(v, npdt)
+        t.dtype = dt
+        yield t
+
+
+_CMP_FUNCS: dict[str, Callable[[Any, Any], Any]] = {
+    "lt": operator.lt, "le": operator.le, "gt": operator.gt, "ge": operator.ge,
+    "eq": operator.eq, "ne": operator.ne, "is": operator.is_, "is_not": operator.is_not,
+    "in": lambda a, b: a in b, "not_in": lambda a, b: a not in b,
+}  # fmt: skip
+
+
+def chain_compare(left: Any, op: str, right: Any, *rest: Any) -> Any:
+    """Evaluates the chained comparison `left op right op2 right2 ...`.
+
+    `rest` alternates operator names and zero-argument functions that evaluate the later
+    operands, so each operand is evaluated at most once and the chain stops at the first
+    false comparison, as in Python. Chains of scalars, including runtime scalars, work;
+    as in compiled code, a chain that compares tiles is refused.
+    """
+    result = _chain_link(_CMP_FUNCS[op](left, right))
+    for i in range(0, len(rest), 2):
+        if not result:
+            return result
+        left, right = right, rest[i + 1]()
+        result = _chain_link(_CMP_FUNCS[rest[i]](left, right))
+    return result
+
+
+def _chain_link(r: Any) -> Any:
+    if isinstance(r, ITile) and r.data.ndim != 0:
+        raise CompilationError(
+            f"chained comparisons such as `a < b < c` need scalars, but one comparison gives a "
+            f"tile of shape {r.shape}. Combine the comparisons elementwise instead, as in "
+            "`(a < b) & (b < c)`."
+        )
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +767,9 @@ def run_grid(fn: Callable[..., Any], grid: tuple[int, int, int], kwargs: dict[st
     Errors raised inside the kernel that don't carry a location get the kernel source
     line of the innermost kernel frame.
     """
+    from enceladus.interpreter.rewrite import interpretable
+
+    fn = interpretable(fn)
     state = core.INTERP
     saved = (state.program_id, state.grid)
     state.depth += 1

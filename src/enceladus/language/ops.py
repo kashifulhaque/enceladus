@@ -540,10 +540,14 @@ def _i_where(condition, x, y):
     if not c.dtype.is_bool():
         c = I.binary("ne", c, 0)
     if isinstance(x, IPointer) or isinstance(y, IPointer):
-        raise CompilationError(
-            "the interpreter doesn't support tl.where on pointers. Select integer offsets "
-            "instead, and add the result to one base pointer."
-        )
+        if not (isinstance(x, IPointer) and isinstance(y, IPointer) and x.flat is y.flat):
+            raise CompilationError(
+                "tl.where selects between pointers only when both derive from the same base "
+                "pointer, as in `tl.where(c, x_ptr + i, x_ptr + j)`. Otherwise, select integer "
+                "offsets, and add the result to one base pointer."
+            )
+        semantic.broadcast_shapes(semantic.broadcast_shapes(c.shape, x.shape), y.shape)
+        return x.with_offsets(np.where(c.data, x.offsets, y.offsets))
     dt = semantic.computation_dtype("select", I._operand(x), I._operand(y))
     semantic.broadcast_shapes(semantic.broadcast_shapes(c.shape, _ishape(x)), _ishape(y))
     return I.wrap(np.where(c.data, I.as_compute(x, dt), I.as_compute(y, dt)), dt)
@@ -854,19 +858,26 @@ def _reduce_interp(input, axis, kind: str, keep_dims, dtype=None):
     keep = bool(core.unwrap(keep_dims))
     data = I.as_compute(t, t.dtype)
     if kind == "sum":
-        out = np.sum(data, axis=ax, keepdims=keep, dtype=data.dtype)
-    elif kind in ("max", "min"):
-        uf = {"max": np.fmax, "min": np.fmin} if t.dtype.is_floating() else {
-            "max": np.maximum, "min": np.minimum}  # fmt: skip
-        flat = data.reshape(-1) if ax is None else data
-        out = uf[kind].reduce(flat, axis=0 if ax is None else ax, keepdims=keep)
-        if ax is None and keep:
-            out = out.reshape((1,) * len(t.shape))
-    else:
-        f = np.argmax if kind == "argmax" else np.argmin
-        out = f(data, axis=ax, keepdims=keep)
-        return ITile(np.asarray(out, dtype=np.int32), core.int32)
-    return I.wrap(np.asarray(out), t.dtype)
+        return I.wrap(np.sum(data, axis=ax, keepdims=keep, dtype=data.dtype), t.dtype)
+    flat = data.reshape(-1) if ax is None else data
+    a = 0 if ax is None else ax
+    uf = {"max": np.fmax, "min": np.fmin} if t.dtype.is_floating() else {
+        "max": np.maximum, "min": np.minimum}  # fmt: skip
+    out = uf[kind.removeprefix("arg")].reduce(flat, axis=a, keepdims=True)
+    if kind in ("argmax", "argmin"):
+        # The index of the first element equal to the NaN-ignoring max or min, so the index
+        # matches the value that tl.max and tl.min return. All-NaN slices give index 0.
+        hit = flat == out
+        if t.dtype.is_floating():
+            hit |= np.isnan(flat) & np.isnan(out)
+        out = np.argmax(hit, axis=a, keepdims=True).astype(np.int32)
+    if not keep:
+        out = np.squeeze(out, axis=a)
+    elif ax is None:
+        out = out.reshape((1,) * len(t.shape))
+    if kind in ("argmax", "argmin"):
+        return ITile(out, core.int32)
+    return I.wrap(out, t.dtype)
 
 
 def _i_sum(input, axis=None, keep_dims=False, dtype=None):
@@ -1184,7 +1195,7 @@ so the loop variable is a compile-time integer inside the body.
 """
 
 range_ = builtin(
-    interp=lambda *a, **k: builtins.range(*[int(x) for x in range_bounds(*a, **k)]),
+    interp=lambda *a, **k: I.typed_range(*range_bounds(*a, **k)),
     name="range",
 )(_loop_only("range"))
 range_.__doc__ = """Returns a runtime loop range, like Python's `range`, for use in a `for` loop.
@@ -1377,6 +1388,25 @@ def device_assert(ctx, cond, msg="", mask=None):
         ops = [semantic.broadcast_to(b, c, shape) if shape else c,
                semantic.broadcast_to(b, mask, shape) if shape else mask]  # fmt: skip
     b.create("assert", ops, [], {"msg": msg})
+
+
+def _i_debug_barrier():
+    # The interpreter runs each operation of a program on every element before the next
+    # operation starts, so stores are already visible to later loads.
+    return None
+
+
+@builtin(interp=_i_debug_barrier)
+def debug_barrier(ctx):
+    """Waits for every thread of the program and orders their device memory accesses.
+
+    After the barrier, every thread of the program sees the device memory stores that any
+    thread of the same program made before it. Use it when a program loads addresses that
+    it stored earlier through a different arrangement of elements, such as a loop that
+    stores a tile and loads it back transposed. The barrier doesn't order memory between
+    programs; use atomics for that. The interpreter doesn't need it and ignores it.
+    """
+    ctx.b.create("barrier", [], [])
 
 
 # ---------------------------------------------------------------------------

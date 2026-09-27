@@ -14,7 +14,8 @@ A `tl.dot` is eligible when all of the following hold:
   from zeros, and uses only as `acc = tl.dot(a, b, acc)`.
 - Both operands are tensor descriptor loads (optionally through `tl.trans`) inside the
   loop, used only by the `tl.dot`, from descriptors created outside the loop, at offsets
-  that are provably non-negative.
+  that are provably non-negative, with no store or atomic between the load and the
+  `tl.dot`.
 - `matmul2d` supports the operand and accumulator types, the tile is 16 to 128 in both
   dimensions, and the kernel uses at most 8 SIMD groups: the range that gave correct
   results on macOS 27.
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from enceladus.compiler import ir
+from enceladus.compiler.codegen.dot import written_between
 from enceladus.compiler.codegen.msl import CTYPES, _body_ops, literal
 
 if TYPE_CHECKING:
@@ -183,7 +185,7 @@ def _nonneg(v: ir.Value) -> bool:
     return False
 
 
-def _operand(v: ir.Value, body: ir.Block, loop: ir.Op, users, left: bool) -> _Operand:
+def _operand(v: ir.Value, dot: ir.Op, loop: ir.Op, users, left: bool) -> _Operand:
     side = "left" if left else "right"
     src, tr = v.defining_op, None
     if src is not None and src.name == "trans":
@@ -191,10 +193,13 @@ def _operand(v: ir.Value, body: ir.Block, loop: ir.Op, users, left: bool) -> _Op
             raise _Ineligible(f"the {side} operand has uses other than the tl.dot")
         tr, v = src, src.operands[0]
         src = v.defining_op
-    if src is None or src.name != "desc_load" or src.parent is not body:
+    if src is None or src.name != "desc_load" or src.parent is not dot.parent:
         raise _Ineligible(f"the {side} operand isn't a tensor descriptor load inside the loop")
     if len(users.get(id(v), [])) != 1:
         raise _Ineligible(f"the {side} operand has uses other than the tl.dot")
+    # matmul2d reads the operand's memory at the tl.dot, not at the load.
+    if written_between(src, dot):
+        raise _Ineligible(f"memory is written between the {side} operand's load and the tl.dot")
     mk = src.operands[0].defining_op
     if mk is None or mk.name != "make_desc" or _inside(mk, loop):
         raise _Ineligible(f"the {side} operand's descriptor isn't created outside the loop")
@@ -330,8 +335,8 @@ def _analyze(dot: ir.Op, users, num_warps: int) -> tuple[MppLoop, set[int]]:
     in_t, acc_t = a.type.elem.name, dot.result.type.elem.name
     if (in_t, acc_t) not in TYPES:
         raise _Ineligible(f"matmul2d doesn't support {in_t} operands with a {acc_t} accumulator")
-    oa = _operand(a, body, loop, users, True)
-    ob = _operand(b, body, loop, users, False)
+    oa = _operand(a, dot, loop, users, True)
+    ob = _operand(b, dot, loop, users, False)
     store, _, epilogue_ops = _epilogue(loop.results[index], loop, users)
     ml = MppLoop(loop, dot, index, oa, ob, _dynamic_k(loop, dot, oa, ob, body), store)
     skip = {id(oa.load), id(ob.load)} | {id(o.trans) for o in (oa, ob) if o.trans is not None}
@@ -458,7 +463,6 @@ def _emit_step(cg: _Codegen, ml: MppLoop) -> None:
 def _emit_manual_loop(cg: _Codegen, ml: MppLoop) -> None:
     """Emits the loop like `_Codegen.op_for`, with the accumulator in the cooperative tensor."""
     loop = ml.loop
-    lb, ub, step = (cg.s(v) for v in loop.operands[:3])
     body = loop.regions[0].block
     carried: list = []
     for j, (arg, init) in enumerate(zip(body.args[1:], loop.operands[3:], strict=True)):
@@ -477,13 +481,11 @@ def _emit_manual_loop(cg: _Codegen, ml: MppLoop) -> None:
     iv = body.args[0]
     ivn = cg.fresh(iv.name_hint or "i")
     cg.sv[id(iv)] = ivn
-    s = _const(loop.operands[2])
-    if s is not None:
-        cond = f"{ivn} < {ub}" if s > 0 else f"{ivn} > {ub}"
-    else:
-        cond = f"({step} > 0 ? {ivn} < {ub} : {ivn} > {ub})"
     keep = [j for j, c in enumerate(carried) if c is not None]
-    with cg.e.block(f"for ({CTYPES[iv.type.name]} {ivn} = {lb}; {cond}; {ivn} += {step})"):
+    header, iv_def = cg.for_header(loop, ivn)
+    with cg.e.block(header):
+        if iv_def:
+            cg.e.line(iv_def)
         cg.push_scope()
         cg.block(_body_ops(body))
         ys = body.ops[-1].operands

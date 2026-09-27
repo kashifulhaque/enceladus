@@ -201,6 +201,11 @@ NaNs. `@enceladus.jit(math_mode="fast")` lets the Metal compiler assume that no 
 infinite or NaN, which can speed up math-heavy kernels. Don't use it for kernels that
 rely on `-inf`, such as a softmax that masks with `-float("inf")`.
 
+In both modes, `tl.sin` and `tl.cos` use Metal's precise variants, because the fast ones
+return 0 for inputs above about 1e7. In compute-bound code, they take up to 3.3 times as
+long as the fast ones. `tl.tanh` takes about 1.7 times as long as Metal's fast `tanh`,
+which is inaccurate near 0 and returns NaN for inputs of 45 and more.
+
 For exponentials, prefer `tl.exp2` and fold the factor `log2(e)` into a scale that you
 compute once, as `examples/08_flash_attention.py` does.
 

@@ -163,12 +163,39 @@ _FORBIDDEN = {
     "NamedExpr": "the `:=` operator isn't supported in kernels. Assign on a separate line.",
     "Match": "`match` isn't supported in kernels. Use `if` and `elif` instead.",
     "Starred": "star expressions are supported only for compile-time tuples in calls.",
+    "Dict": (
+        "dict literals aren't supported in kernels. Use a compile-time tuple, or pass each "
+        "value as its own tl.constexpr parameter."
+    ),
+    "Set": "set literals aren't supported in kernels. Use a compile-time tuple instead.",
+    "TypeAlias": "`type` statements aren't supported in kernels. Define the alias at module level.",
+    "TemplateStr": "template strings (t-strings) aren't supported in kernels. Use an f-string.",
 }
 
 _ALLOWED_GLOBAL_TYPES = (
     int, float, bool, str, type(None), tuple, core.dtype, core.Builtin, types.ModuleType,
     types.FunctionType, types.BuiltinFunctionType, type,
 )  # fmt: skip
+
+
+def _check_tracked(v: Any, what: str) -> None:
+    """Refuses a global value whose changes the kernel cache can't detect.
+
+    Raises:
+        CompilationError: The dependency hash can't track `v`.
+    """
+    from enceladus.runtime.jit import is_tracked
+
+    if is_tracked(v):
+        return
+    fix = ("Use a plain function, a @enceladus.jit function, or a functools.partial instead."
+           if callable(v) else
+           "Use a module, a class, or a constant value such as a tuple instead, or pass the "
+           "value as a tl.constexpr argument.")  # fmt: skip
+    raise CompilationError(
+        f"{what} is a {type(v).__name__} object, and the kernel cache can't detect a "
+        f"change to it. {fix}"
+    )
 
 
 class CodeGenerator(ast.NodeVisitor):
@@ -216,7 +243,19 @@ class CodeGenerator(ast.NodeVisitor):
 
     def generic_visit(self, node: ast.AST) -> Any:
         name = type(node).__name__
-        msg = _FORBIDDEN.get(name, f"the Python construct `{name}` isn't supported in kernels.")
+        msg = _FORBIDDEN.get(name)
+        if msg is None:
+            try:
+                what = f"`{ast.unparse(node)}`"
+            except Exception:  # noqa: BLE001 - unparse can fail on nodes of new Python versions.
+                what = "this syntax"
+            if len(what) > 40:
+                what = "this syntax"
+            msg = (
+                f"kernels don't support {what} (a Python `{name}` node). Rewrite it with "
+                "assignments, arithmetic, `if`, `for`, and calls to tl functions or "
+                "@enceladus.jit functions."
+            )
         raise CompilationError(msg)
 
     def visit_body(self, stmts: Sequence[ast.stmt]) -> None:
@@ -475,6 +514,16 @@ class CodeGenerator(ast.NodeVisitor):
                 f"{semantic.type_str(t)}. Use an integer, or make `{name}` a float from the "
                 "start."
             )
+        if not semantic.literal_fits(v, e.dtype):
+            # Narrowing would change the value: 300 becomes 44 in uint8.
+            wide = semantic.computation_dtype("select", e.dtype, v)
+            if not semantic.literal_fits(v, wide):
+                wide = core.int64 if v < 0 else semantic.literal_dtype(v)
+            raise CompilationError(
+                f"`{name}` is {v} on one path and a {semantic.type_str(t)} on another, but {v} "
+                f"doesn't fit in {e.dtype!r}. Convert the {e.dtype!r} value with "
+                f"`.to({wide!r})` so that both paths have a type that holds {v}."
+            )
         if isinstance(t, ir.TileType):
             val = semantic.coerce_literal(v, e.dtype)
             return self.b.create("full", [], [t], {"value": val}).result
@@ -538,28 +587,33 @@ class CodeGenerator(ast.NodeVisitor):
                 "the loop variable must be a single name, as in `for i in range(n)`"
             )
         target = node.target.id
-        wide = any(
-            (isinstance(v, ir.Value) and v.type.dtype.primitive_bitwidth == 64)
-            or (not isinstance(v, ir.Value) and semantic.literal_dtype(v) is not core.int32)
-            for v in (lb, ub, step)
-        )
-        iv_dt = core.int64 if wide else core.int32
+        iv_dt = _counter_dtype((lb, ub, step))
+        iv_t = ir.scalar(iv_dt)
         lbv, ubv, stv = (semantic.to_value(self.b, v, iv_dt) for v in (lb, ub, step))
 
         pre = self.scope
+        # As in Python, the loop variable keeps its last value after the loop, and an empty
+        # loop leaves it unchanged. So when it shadows a variable of the counter's type, the
+        # loop carries it like any other variable.
+        shadowed = target in pre
+        carry_target = shadowed and (
+            (isinstance(pre[target], ir.Value) and pre[target].type == iv_t)
+            or (type(pre[target]) is int and semantic.literal_fits(pre[target], iv_dt))
+        )
         cands = [n for n in assigned_names(node.body) if n in pre and n != target]
         carried = [n for n in cands if isinstance(pre[n], ir.Value) or semantic.is_literal(pre[n])]
         fixed = [n for n in cands if n not in carried]
         types_ = {n: pre[n].type if isinstance(pre[n], ir.Value)
                   else ir.scalar(semantic.literal_dtype(pre[n])) for n in carried}  # fmt: skip
+        if carry_target:
+            carried.insert(0, target)
+            types_[target] = iv_t
         for _ in range(8):
-            block = ir.Block(
-                [ir.scalar(iv_dt), *(types_[n] for n in carried)], [target, *carried]
-            )
+            block = ir.Block([iv_t, *(types_[n] for n in carried)], [target, *carried])
             self.scope = dict(pre)
-            self.scope[target] = block.args[0]
             for n, a in zip(carried, block.args[1:], strict=True):
                 self.scope[n] = a
+            self.scope[target] = block.args[0]  # The body sees the counter, not the carry.
             self.runtime_depth += 1
             try:
                 with self.b.at(block):
@@ -612,11 +666,28 @@ class CodeGenerator(ast.NodeVisitor):
         for n, r in zip(carried, op.results, strict=True):
             r.name_hint = n
             self.scope[n] = r
+        line = self.b.loc.line
+        if shadowed and not carry_target:
+            del self.scope[target]
+            self.scoped_out[target] = (
+                f"`{target}` is the loop variable of the runtime `for` at line {line}, but "
+                f"before the loop it holds {semantic.describe(pre[target])}, not a "
+                f"{iv_dt!r} value. Its value after the loop would depend on whether the loop "
+                "runs. Give the loop variable a different name."
+            )
         for n in end:
-            if n not in pre:
+            if n in pre:
+                continue
+            if n == target:
                 self.scoped_out[n] = (
-                    f"`{n}` is assigned only inside the loop body at line {self.b.loc.line}, so "
-                    "it's undefined after the loop. Initialize it before the loop."
+                    f"`{n}` is the loop variable of the runtime `for` at line {line}, so it's "
+                    "undefined after the loop when the loop doesn't run. To give it a value for "
+                    f"that case, assign it before the loop, for example `{n} = 0`."
+                )
+            else:
+                self.scoped_out[n] = (
+                    f"`{n}` is assigned only inside the loop body at line {line}, so it's "
+                    "undefined after the loop. Initialize it before the loop."
                 )
 
     # ---- expressions ----
@@ -637,6 +708,7 @@ class CodeGenerator(ast.NodeVisitor):
             if isinstance(v, core.constexpr):
                 return v.value
             if is_jit_function(v) or isinstance(v, _ALLOWED_GLOBAL_TYPES) or callable(v):
+                _check_tracked(v, f"global `{name}`")
                 return v
             raise CompilationError(
                 f"global `{name}` is a {type(v).__name__}. Kernels can use only constant globals: "
@@ -659,8 +731,18 @@ class CodeGenerator(ast.NodeVisitor):
                 f"methods of {type(obj).__name__} aren't supported in kernels. Use a "
                 "compile-time tuple instead."
             )
+        from enceladus.runtime.jit import is_content_hashed
+
+        owner_tracked = isinstance(obj, (types.ModuleType, type))
+        if not owner_tracked and self._global_rooted(node.value) and not is_content_hashed(obj):
+            raise CompilationError(
+                f"`{ast.unparse(node)}` reads an attribute of a {type(obj).__name__}, and "
+                "the kernel cache can't detect a change to that attribute. Read attributes "
+                "only of modules, classes, and constant values such as tuples, or pass the "
+                "value as a tl.constexpr argument."
+            )
         try:
-            return core.unwrap(getattr(obj, attr))
+            v = core.unwrap(getattr(obj, attr))
         except AttributeError:
             hint = ""
             if isinstance(obj, types.ModuleType) and obj.__name__ == "enceladus.language":
@@ -671,6 +753,17 @@ class CodeGenerator(ast.NodeVisitor):
             raise CompilationError(
                 f"{semantic.describe(obj)} has no attribute `{attr}`{hint}"
             ) from None
+        if owner_tracked:
+            _check_tracked(v, f"`{ast.unparse(node)}`")
+        return v
+
+    def _global_rooted(self, node: ast.expr) -> bool:
+        """Returns whether `node` is a chain of attributes and subscripts on a global name,
+        which is what the dependency hash follows. A value that a call returns, or that
+        a local variable or parameter holds, isn't."""
+        while isinstance(node, (ast.Attribute, ast.Subscript)):
+            node = node.value
+        return isinstance(node, ast.Name) and node.id not in self.scope
 
     def value_attr(self, v: ir.Value, attr: str) -> Any:
         t = v.type
@@ -789,6 +882,11 @@ class CodeGenerator(ast.NodeVisitor):
             return semantic.unary(self.b, "neg", v)
         if isinstance(op, ast.Invert):
             return semantic.unary(self.b, "not", v)
+        if semantic.is_tile(v):
+            raise CompilationError(
+                "`not` on a tile isn't supported, because a tile has no single truth value. To "
+                "negate a mask elementwise, use `~mask` or `x == 0`."
+            )
         return semantic.unary(self.b, "not", semantic.to_bool(self.b, v))
 
     def visit_BoolOp(self, node: ast.BoolOp) -> Any:
@@ -900,24 +998,42 @@ class CodeGenerator(ast.NodeVisitor):
 
     def visit_Compare(self, node: ast.Compare) -> Any:
         left = core.unwrap(self.visit(node.left))
-        result: Any = _MISSING
-        for op, comp in zip(node.ops, node.comparators, strict=True):
-            right = core.unwrap(self.visit(comp))
-            if isinstance(op, (ast.Is, ast.IsNot, ast.In, ast.NotIn)) or not (
-                isinstance(left, ir.Value) or isinstance(right, ir.Value)
-            ):
-                r = _PY_CMPOPS[type(op)](left, right)
+        return self.compare_chain(left, node.ops, node.comparators)
+
+    def compare_chain(self, left: Any, ops: Sequence[ast.cmpop],
+                      comps: Sequence[ast.expr]) -> Any:  # fmt: skip
+        """Emits `left ops[0] comps[0] ops[1] comps[1] ...` with Python's semantics.
+
+        `a < b < c` means `a < b and b < c`: `b` runs once, and `c` runs only when `a < b`
+        holds. A chain on tiles is an error, because `and` needs a single truth value.
+        """
+        right = core.unwrap(self.visit(comps[0]))
+        op = ops[0]
+        if isinstance(op, (ast.Is, ast.IsNot, ast.In, ast.NotIn)) or not (
+            isinstance(left, ir.Value) or isinstance(right, ir.Value)
+        ):
+            r = _PY_CMPOPS[type(op)](left, right)
+        else:
+            r = semantic.binary(self.b, _CMPOPS[type(op)], left, right)
+        if len(ops) == 1:
+            return r
+        if not isinstance(r, ir.Value):
+            return self.compare_chain(right, ops[1:], comps[1:]) if r else r
+        _check_chain_scalar(r)
+        rest_blk = ir.Block()
+        with self.b.at(rest_blk):
+            rest = self.compare_chain(right, ops[1:], comps[1:])
+            if isinstance(rest, ir.Value):
+                _check_chain_scalar(rest)
+                rest = semantic.to_bool(self.b, rest)
             else:
-                r = semantic.binary(self.b, _CMPOPS[type(op)], left, right)
-            if result is _MISSING:
-                result = r
-            elif isinstance(result, ir.Value) or isinstance(r, ir.Value):
-                result = semantic.binary(self.b, "and", semantic.to_bool(self.b, result),
-                                         semantic.to_bool(self.b, r))  # fmt: skip
-            else:
-                result = result and r
-            left = right
-        return result
+                rest = semantic.const(self.b, bool(rest), core.int1)
+        if all(o.name in _SPECULATABLE for o in rest_blk.ops):
+            for o in rest_blk.ops:
+                self.b.block.append(o)
+            return semantic.binary(self.b, "and", r, rest)
+        (res,) = self._emit_if(r, rest_blk, ir.Block(), [("the comparison", rest, False)])
+        return res
 
     def visit_IfExp(self, node: ast.IfExp) -> Any:
         cond = self.visit_truth(node.test)
@@ -1032,6 +1148,43 @@ def _same_value(a: Any, b: Any) -> bool:
         return type(a) is type(b) and bool(a == b)
     except Exception:  # noqa: BLE001 - comparing arbitrary compile-time objects.
         return False
+
+
+def _check_chain_scalar(v: ir.Value) -> None:
+    if semantic.is_tile(v):
+        raise CompilationError(
+            "chained comparisons such as `a < b < c` aren't supported on tiles, because Python "
+            "evaluates them as `a < b and b < c`, and a tile has no single truth value. "
+            "Combine the comparisons elementwise with `&`, as in `(a < b) & (b < c)`."
+        )
+
+
+def _counter_dtype(bounds: Sequence[Any]) -> core.dtype:
+    """Returns the type of a `for` counter that holds every value of the bounds and step.
+
+    Bounds that fit in `int32` count in `int32`. Bounds of type `uint32` or `int64`, or
+    literals outside the `int32` range, count in `int64`. Bounds of type `uint64` count in
+    `uint64` when no bound is signed or negative.
+
+    Raises:
+        CompilationError: A `uint64` bound meets a signed bound or a negative literal.
+    """
+
+    def fits(v: Any, dt: core.dtype) -> bool:
+        if isinstance(v, ir.Value):
+            lo, hi = semantic.int_range(v.type.dtype)
+            dlo, dhi = semantic.int_range(dt)
+            return dlo <= lo and hi <= dhi
+        return semantic.literal_fits(v, dt)
+
+    for dt in (core.int32, core.int64, core.uint64):
+        if all(fits(v, dt) for v in bounds):
+            return dt
+    raise CompilationError(
+        "range() has a tl.uint64 bound and a signed bound or negative step, and no counter "
+        "type holds the values of both. Convert the bounds with `.to(tl.int64)`, or make "
+        "them all unsigned."
+    )
 
 
 def _check_no_tile_list(v: Any) -> None:

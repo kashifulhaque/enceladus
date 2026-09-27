@@ -7,11 +7,13 @@ own disk cache stores compiled binaries.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import hashlib
 import json
 import os
 import platform
+import tempfile
 import threading
 from functools import cache
 from pathlib import Path
@@ -46,14 +48,21 @@ def os_build() -> str:
     return f"{platform.mac_ver()[0]} ({build})"
 
 
+# The files that decide the generated MSL, relative to the `enceladus` package: the
+# compiler, the language surface, and the runtime code that builds specializations and
+# module attributes.
+_COMPILER_GLOBS = ("compiler/**/*.py", "compiler/**/*.metal", "language/**/*.py")
+_COMPILER_FILES = ("runtime/compile.py", "runtime/jit.py", "runtime/dot_backend.py")
+
+
 @cache
 def compiler_hash() -> str:
     """Returns a hash of the compiler's own source, so compiler changes invalidate caches."""
     root = Path(__file__).resolve().parents[1]
+    files = {f for g in _COMPILER_GLOBS for f in root.glob(g)}
+    files |= {root / f for f in _COMPILER_FILES}
     h = hashlib.sha256()
-    files = sorted((root / "compiler").rglob("*.py")) + sorted((root / "compiler").rglob("*.metal"))
-    files += [root / "language" / "ops.py", root / "language" / "core.py"]
-    for f in files:
+    for f in sorted(files):
         h.update(f.relative_to(root).as_posix().encode())
         h.update(f.read_bytes())
     return h.hexdigest()
@@ -68,15 +77,33 @@ def stable_hash(*parts: Any) -> str:
     return h.hexdigest()
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Writes `text` to `path` so that readers see either the old or the new contents.
+
+    The temporary file has a unique name, so concurrent writers from several processes
+    or threads don't clobber each other's partial files.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def write_entry(key: str, files: dict[str, str], meta: dict[str, Any]) -> Path:
-    """Writes files for one compiled specialization and returns its directory."""
+    """Writes files for one compiled specialization and returns its directory.
+
+    `meta.json` goes last, so an entry whose `meta.json` exists has all its files.
+    """
     d = cache_dir() / key[:32]
     d.mkdir(parents=True, exist_ok=True)
     for name, text in files.items():
-        tmp = d / (name + ".tmp")
-        tmp.write_text(text)
-        tmp.replace(d / name)
-    (d / "meta.json").write_text(json.dumps(meta, indent=1, sort_keys=True))
+        write_atomic(d / name, text)
+    write_atomic(d / "meta.json", json.dumps(meta, indent=1, sort_keys=True))
     return d
 
 

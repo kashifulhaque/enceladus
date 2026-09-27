@@ -14,6 +14,7 @@ otherwise.
 from __future__ import annotations
 
 import math
+import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,10 +44,17 @@ STRUCT_FORMATS = {
     "i1": "?", "i8": "b", "i16": "h", "i32": "i", "i64": "q",
     "u8": "B", "u16": "H", "u32": "I", "u64": "Q", "f16": "e", "f32": "f",
 }  # fmt: skip
+# Kernels compile with fast FP32 functions (`MTLMathFloatingPointFunctions.fast`). The fast
+# `tanh` returns 0 at 44 and NaN from 45 and is inaccurate near 0, so `tg_tanh` in the
+# prelude replaces it: within 1.4 ulp everywhere, and 1.7x the time of the fast `tanh` in
+# compute-bound code, against 6x for `precise::tanh`. The fast `sin` and `cos` return 0
+# from about 1e7 and at NaN and infinity, so they use the precise variants, as Triton does
+# with libdevice. Those take 3.3x the time of the fast ones in compute-bound code, and
+# nothing in memory-bound code. The fast `exp` and `log` stay accurate, so they remain.
 MATH_FUNCS = {
     "exp": "exp", "exp2": "exp2", "log": "log", "log2": "log2", "sqrt": "sqrt",
-    "rsqrt": "rsqrt", "sin": "sin", "cos": "cos", "tanh": "tanh", "sigmoid": "tg_sigmoid",
-    "erf": "tg_erf", "floor": "floor", "ceil": "ceil",
+    "rsqrt": "rsqrt", "sin": "precise::sin", "cos": "precise::cos", "tanh": "tg_tanh",
+    "sigmoid": "tg_sigmoid", "erf": "tg_erf", "floor": "floor", "ceil": "ceil",
 }  # fmt: skip
 BIN_SYMBOLS = {
     "add": "+", "sub": "-", "mul": "*", "div": "/", "floordiv": "/", "mod": "%",
@@ -225,6 +233,12 @@ class _Codegen:
         self.asserts: list[dict] = []
         self.report: dict[str, list[dict]] = {"conversions": [], "threadgroup": []}
         self.cur_op: str | None = None
+        # Float comparisons keep IEEE NaN semantics in the default relaxed math mode. The
+        # fast mode assumes that no value is NaN or infinite, so it skips the guards.
+        self.nan_cmp = module.attrs.get("math_mode", "relaxed") != "fast"
+        # With ENCELADUS_DEBUG set, the code of each source line starts with a
+        # `// file.py:LINE` comment. The debug flag is part of the cache key.
+        self.debug_locs = bool(module.attrs.get("debug"))
         from enceladus.compiler.codegen.dot import find_direct_operands, use_counts
 
         self.direct: set[int] = find_direct_operands(module, plan)
@@ -433,7 +447,15 @@ class _Codegen:
         if name == "cmp":
             src = ir.elem_of(types[0])
             a, b = (f"float({x})" if is_half(src) else x for x in args)
-            return f"({a} {CMP_SYMBOLS[op.attrs['pred']]} {b})"
+            pred = op.attrs["pred"]
+            if is_float(src) and self.nan_cmp:
+                # The relaxed math mode lets Metal assume that no operand is NaN, so it
+                # folds `x != x` to false and may invert a comparison into its negation.
+                # An `isunordered` guard, which Metal doesn't fold, gives the IEEE result.
+                if pred == "ne":
+                    return f"({a} != {b} || isunordered({a}, {b}))"
+                return f"({a} {CMP_SYMBOLS[pred]} {b} && !isunordered({a}, {b}))"
+            return f"({a} {CMP_SYMBOLS[pred]} {b})"
         if name == "unary":
             kind = op.attrs["op"]
             a = args[0]
@@ -648,6 +670,10 @@ class _Codegen:
         for op in block.ops:
             self.loc = op.loc or self.loc
             self.cur_op = op.name
+            if self.debug_locs and op.loc is not None:
+                # Ops that emit no code, such as lazily emitted values, drop their note.
+                note = f"{Path(op.loc.file).name}:{op.loc.line}"
+                self.e.note = note if note != self.e.last_note else None
             self.op(op)
         self.cur_op = saved
 
@@ -858,20 +884,28 @@ class _Codegen:
                 srcs.append(src)
             else:
                 srcs.append(self.s(y))
-        # Copy through temporaries when a target is read by a later assignment.
+        # The assignments run in order, so a source that reads another target would see
+        # that target's new value if it's assigned first. Copy every such source to a
+        # temporary before any assignment: a tile that shares a target's registers, a
+        # uniform tile or a scalar whose expression names a target.
         names = {t.name if isinstance(t, Tile) else t for t in targets}
         staged = []
-        for tgt, src in zip(targets, srcs, strict=True):
+        for tgt, src, y in zip(targets, srcs, values, strict=True):
             if isinstance(tgt, Tile):
-                if src.name in names and src.name != tgt.name:
+                if src.uniform is not None:
+                    if _idents(src.uniform) & (names - {tgt.name}):
+                        tmp = self.fresh("tmp")
+                        self.e.line(f"const {self.ctype(y.type)} {tmp} = {src.uniform};")
+                        src = Tile(tgt.layout, uniform=tmp, base=src.base, root=src.root)
+                elif src.name in names and src.name != tgt.name:
                     tmp = self.fresh("tmp")
                     n = tgt.layout.num_regs
-                    self.e.line(f"{self.ctype(values[targets.index(tgt)].type)} {tmp}[{n}];")
+                    self.e.line(f"{self.ctype(y.type)} {tmp}[{n}];")
                     self._assign(Tile(tgt.layout, tmp), src, n)
                     src = Tile(tgt.layout, tmp)
                 staged.append((tgt, src))
             else:
-                if src in names and src != tgt:
+                if src != tgt and _idents(src) & (names - {tgt}):
                     tmp = self.fresh("tmp")
                     self.e.line(f"const auto {tmp} = {src};")
                     src = tmp
@@ -891,8 +925,45 @@ class _Codegen:
             if isinstance(v.type, ir.PointerType):
                 pass
 
-    def op_for(self, op: ir.Op) -> None:
+    def for_header(self, op: ir.Op, ivn: str) -> tuple[str, str | None]:
+        """Returns the C `for` header of loop `op`, and a statement that defines `ivn`.
+
+        A 32-bit loop counts `ivn` itself, and the statement is None. A 64-bit loop counts
+        its trip number in a `ulong` up to a trip count that the optimizer can't see
+        through (`tg_opaque`), and computes `ivn` from it. Otherwise Metal's compiler
+        service crashes (XPC_ERROR_CONNECTION_INTERRUPTED) on loops such as
+        `for (long i = n; i < n + 30; ++i) acc += int(i - n);`. The trip count follows
+        Python's `range`: an empty range runs no iterations, and a negative step counts
+        down.
+        """
         lb, ub, step = (self.s(v) for v in op.operands[:3])
+        iv = op.regions[0].block.args[0]
+        ity = CTYPES[iv.type.name]
+        step_op = op.operands[2].defining_op
+        s = step_op.attrs["value"] if step_op is not None and step_op.name == "const" else None
+        if iv.type.dtype.primitive_bitwidth < 64:
+            if s is not None:
+                cond = f"{ivn} < {ub}" if s > 0 else f"{ivn} > {ub}"
+            else:
+                cond = f"({step} > 0 ? {ivn} < {ub} : {ivn} > {ub})"
+            return f"for ({ity} {ivn} = {lb}; {cond}; {ivn} += {step})", None
+        # Unsigned arithmetic can't overflow, even for a range that spans more than half
+        # of the 64-bit values.
+        up = f"({lb} < {ub} ? (ulong({ub}) - ulong({lb}) - 1ul) / {{d}} + 1ul : 0ul)"
+        down = f"({lb} > {ub} ? (ulong({lb}) - ulong({ub}) - 1ul) / {{d}} + 1ul : 0ul)"
+        if s is not None:
+            trips = (up if s > 0 else down).format(d=f"{abs(s)}ul")
+            stride = f"{s}ul" if s > 0 else f"(0ul - {-s}ul)"
+        else:
+            trips = (f"({step} > 0 ? {up.format(d=f'ulong({step})')} : "
+                     f"{down.format(d=f'(0ul - ulong({step}))')})")  # fmt: skip
+            stride = f"ulong({step})"
+        n, t = self.fresh("trips"), self.fresh("t")
+        self.e.line(f"const ulong {n} = tg_opaque({trips});")
+        return (f"for (ulong {t} = 0; {t} < {n}; ++{t})",
+                f"const {ity} {ivn} = {ity}(ulong({lb}) + {t} * {stride});")  # fmt: skip
+
+    def op_for(self, op: ir.Op) -> None:
         inits = op.operands[3:]
         body = op.regions[0].block
         carried: list[Tile | str] = []
@@ -909,13 +980,10 @@ class _Codegen:
         iv = body.args[0]
         ivn = self.fresh(iv.name_hint or "i")
         self.sv[id(iv)] = ivn
-        ity = CTYPES[iv.type.name]
-        step_op = op.operands[2].defining_op
-        if step_op is not None and step_op.name == "const":
-            cond = f"{ivn} < {ub}" if step_op.attrs["value"] > 0 else f"{ivn} > {ub}"
-        else:
-            cond = f"({step} > 0 ? {ivn} < {ub} : {ivn} > {ub})"
-        with self.e.block(f"for ({ity} {ivn} = {lb}; {cond}; {ivn} += {step})"):
+        header, iv_def = self.for_header(op, ivn)
+        with self.e.block(header):
+            if iv_def:
+                self.e.line(iv_def)
             self.push_scope()
             self.block(_body_ops(body))
             self._yield_into(carried, body.ops[-1].operands)
@@ -958,6 +1026,11 @@ class _Codegen:
     op_atomic_cas = op_atomic_rmw
 
     # ---- debugging ----
+
+    def op_barrier(self, op: ir.Op) -> None:
+        # Kernel control flow depends only on scalars, which are uniform across the
+        # threadgroup, so every thread reaches the barrier.
+        self.e.line("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);")
 
     def op_print(self, op: ir.Op) -> None:
         from enceladus.compiler.codegen.debug import emit_print
@@ -1068,6 +1141,14 @@ def _add(expr: str, c: int) -> str:
     if expr == "0":
         return str(c)
     return expr if c == 0 else f"{expr} + {c}"
+
+
+_IDENT = re.compile(r"(?<![\w.])[A-Za-z_]\w*")
+
+
+def _idents(expr: str) -> set[str]:
+    """Returns the identifiers that an MSL expression mentions."""
+    return set(_IDENT.findall(expr))
 
 
 def _body_ops(block: ir.Block) -> ir.Block:

@@ -258,7 +258,7 @@ def _contiguous(shape: tuple[int, ...]) -> tuple[int, ...]:
 # ---- Framework-neutral helpers ----
 
 
-def element_dtype(obj: Any) -> np.dtype | None:
+def framework_dtype(obj: Any) -> np.dtype | None:
     """Returns the element type of a PyTorch or MLX array, or `None` for other objects."""
     fw = framework_of(obj)
     if fw == KIND_TORCH:
@@ -299,6 +299,53 @@ def element_strides(obj: Any) -> tuple[int, ...]:
     )
 
 
+def element_dtype(obj: Any) -> np.dtype:
+    """Returns the element type of any supported array as a NumPy dtype.
+
+    PyTorch, MLX, and `enceladus.Tensor` have dtypes of their own; this function gives
+    them one form for host code that chooses output types.
+
+    Raises:
+        TypeError: `obj` isn't a supported array, or its element type isn't supported.
+    """
+    if isinstance(obj, Tensor):
+        return np.dtype(obj.np_dtype)
+    if isinstance(obj, np.ndarray):
+        return obj.dtype
+    d = framework_dtype(obj)
+    if d is None:
+        raise TypeError(
+            f"{type(obj).__name__} isn't a supported array type. Pass an enceladus.Tensor, a "
+            "NumPy array, a torch tensor on the mps device, or an MLX array."
+        )
+    return d
+
+
+def _framework_dtype_of(like: Any, dtype: Any) -> Any:
+    """Converts a NumPy dtype, such as `np.float32`, to the dtype of `like`'s framework.
+
+    Returns a dtype of that framework unchanged.
+    """
+    fw = framework_of(like)
+    if fw == KIND_TORCH:
+        import torch
+
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        want = np.dtype(dtype)
+        for t, d in _torch_dtype_table().items():
+            if d == want:
+                return t
+        raise TypeError(f"PyTorch has no dtype for {want}")
+    if fw == KIND_MLX:
+        import mlx.core as mx
+
+        if isinstance(dtype, mx.Dtype):
+            return dtype
+        return getattr(mx, np.dtype(dtype).name)
+    return dtype
+
+
 def new_empty(like: Any, shape: Any = None, dtype: Any = None) -> Any:
     """Returns an array of the same kind and on the same device as `like`.
 
@@ -311,21 +358,34 @@ def new_empty(like: Any, shape: Any = None, dtype: Any = None) -> Any:
     Args:
         like: The array whose kind, device, and (by default) shape and dtype to use.
         shape: The shape of the result. Defaults to `like.shape`.
-        dtype: The element type in `like`'s framework. Defaults to `like.dtype`.
+        dtype: The element type, as a NumPy dtype such as `np.float32` or a dtype of
+            `like`'s framework. Defaults to `like.dtype`.
     """
-    shape = tuple(like.shape) if shape is None else tuple(shape)
-    dtype = like.dtype if dtype is None else dtype
-    if isinstance(like, np.ndarray):
-        return np.empty(shape, dtype)
-    if isinstance(like, Tensor):
-        from enceladus.runtime.tensor import empty
+    return _new_array(like, shape, dtype, zero=False)
 
-        return empty(shape, like.np_dtype if dtype is like.dtype else dtype)
+
+def new_zeros(like: Any, shape: Any = None, dtype: Any = None) -> Any:
+    """Returns a zero-filled array of the same kind and on the same device as `like`.
+
+    It takes the same arguments as `new_empty`.
+    """
+    return _new_array(like, shape, dtype, zero=True)
+
+
+def _new_array(like: Any, shape: Any, dtype: Any, zero: bool) -> Any:
+    shape = tuple(like.shape) if shape is None else tuple(shape)
+    if isinstance(like, np.ndarray):
+        return (np.zeros if zero else np.empty)(shape, like.dtype if dtype is None else dtype)
+    if isinstance(like, Tensor):
+        from enceladus.runtime.tensor import empty, zeros
+
+        return (zeros if zero else empty)(shape, like.np_dtype if dtype is None else dtype)
+    dtype = like.dtype if dtype is None else _framework_dtype_of(like, dtype)
     fw = framework_of(like)
     if fw == KIND_TORCH:
         import torch
 
-        return torch.empty(shape, dtype=dtype, device=like.device)
+        return (torch.zeros if zero else torch.empty)(shape, dtype=dtype, device=like.device)
     if fw == KIND_MLX:
         import mlx.core as mx
 

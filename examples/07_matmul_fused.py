@@ -41,8 +41,7 @@ def matmul_bias_gelu(a, b, bias, c=None, bm: int = 64, bn: int = 64, bk: int = 3
     """
     (m, k), (_, n) = a.shape, b.shape
     if c is None:
-        c = np.empty((m, n), a.dtype) if isinstance(a, np.ndarray) else enceladus.empty((m, n),
-                                                                                   a.dtype)
+        c = enceladus.new_empty(a, (m, n))
     grid = (enceladus.cdiv(n, bn), enceladus.cdiv(m, bm))
     matmul_bias_gelu_kernel[grid](a, b, bias, c, m, n, k, k, n, n, BM=bm, BN=bn, BK=bk,
                                   dot_backend=dot_backend)  # fmt: skip

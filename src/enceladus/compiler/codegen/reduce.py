@@ -40,6 +40,13 @@ def _combine_builtin(kind: str, is_fp: bool):
     def arg(a, b):
         # Take b when it's strictly better, or equal with a lower index (NumPy ties).
         take = f"({b[0]} {cmp} {a[0]} || ({b[0]} == {a[0]} && {b[1]} < {a[1]}))"
+        if is_fp:
+            # Like `tl.max` and `tl.min`, skip NaNs: a NaN never replaces a number, a
+            # number always replaces a NaN, and of two NaNs the lower index wins, so an
+            # all-NaN slice gives index 0. The comparisons above then see no NaN, so the
+            # math mode can't change their results.
+            na, nb = f"isnan({a[0]})", f"isnan({b[0]})"
+            take = f"({nb} ? ({na} && {b[1]} < {a[1]}) : ({na} || {take}))"
         return [
             f"{{ const bool tk = {take};",
             f"  {a[0]} = tk ? {b[0]} : {a[0]}; {a[1]} = tk ? {b[1]} : {a[1]}; }}",

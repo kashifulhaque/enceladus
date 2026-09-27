@@ -52,6 +52,13 @@ The interpreter behaves as follows:
 - An unmasked load or store out of bounds raises `IndexError` with the kernel's line.
   The GPU doesn't check bounds, so run a suspect kernel in the interpreter first.
 - It's slow. Use small grids when you debug.
+- It also runs the compiler's checks on each kernel, once per specialization. Python
+  accepts some code that compiled mode refuses, such as a list of tiles or a `tl.dot`
+  with a K block of 4. For such a kernel, the interpreter warns once, names the line
+  that compiled mode refuses, and runs the kernel anyway. To raise the error instead,
+  set `ENCELADUS_VERIFY=1`. To skip the check, set `ENCELADUS_VERIFY=0`. The check
+  skips kernels whose source can't be read, such as kernels defined in an interactive
+  prompt.
 
 The interpreter computes the same results as the compiled kernel, with a few
 exceptions: the GPU flushes `float32` denormals to zero and the interpreter doesn't,
@@ -319,7 +326,7 @@ The following table lists every environment variable that Enceladus reads:
 | `ENCELADUS_CACHE_DIR` | Sets the disk-cache directory (default `~/.cache/enceladus`). |
 | `ENCELADUS_ALWAYS_COMPILE=1` | Ignores the disk cache and saved autotuning results. |
 | `ENCELADUS_OVERRIDE_DIR` | Loads hand-edited MSL from `DIR/KERNEL_NAME.metal`. |
-| `ENCELADUS_VERIFY=1` | Verifies the IR after every compiler pass, and builds and verifies it for interpreted launches too. |
+| `ENCELADUS_VERIFY` | Controls the compiler's checks on interpreted launches: unset warns about kernels that compiled mode refuses, `1` raises the error, and `0` skips the check. `1` also verifies the IR after every compiler pass. |
 | `ENCELADUS_PRINT_AUTOTUNING=1` | Prints each autotuning result. |
 | `ENCELADUS_FLUSH_EVERY` | Sets how many launches the stream batches per command buffer (default 64). |
 | `MTL_CAPTURE_ENABLED=1` | Lets `enceladus.capture` record GPU traces. Metal reads it at process start. |

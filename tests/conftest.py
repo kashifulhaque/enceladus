@@ -15,8 +15,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-# The interpreter builds and verifies the IR of every kernel it runs when ENCELADUS_VERIFY is
-# set, so every interpreter test is also a frontend and verifier test.
+# With ENCELADUS_VERIFY=1, the interpreter compiles every kernel it runs to MSL and raises
+# the compiler's errors instead of warning, so every interpreter test is also a compiler test.
 os.environ.setdefault("ENCELADUS_VERIFY", "1")
 
 ROOT = Path(__file__).resolve().parents[1]

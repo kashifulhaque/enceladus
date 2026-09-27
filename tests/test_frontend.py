@@ -6,7 +6,7 @@ import inspect
 
 import numpy as np
 import pytest
-from conftest import load_example
+from conftest import MODES, check_kernel, load_example
 
 import enceladus
 import enceladus.language as tl
@@ -98,6 +98,78 @@ def test_error_points_at_source_line(kernel, constexprs, phrase):
     assert f"{__file__}:{start + offset}:" in msg
     assert lines[offset].rstrip() in msg.splitlines()
     assert msg.splitlines()[-1].strip() == "^"
+
+
+# ---------------------------------------------------------------------------
+# Python semantics in compiled kernels. Each case once gave a wrong answer without an error.
+# ---------------------------------------------------------------------------
+
+
+@enceladus.jit
+def _loop_var_after_loop(out_ptr, n):
+    i = 100
+    for i in range(n):  # noqa: B007 - `i` is read after the loop.
+        pass
+    tl.store(out_ptr, i)  # Python: n - 1, or 100 when the loop doesn't run.
+
+
+@enceladus.jit
+def _negate_mask(out_ptr, x_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    m = tl.load(x_ptr + offs) > 0
+    tl.store(out_ptr + offs, -m + 10 * ~m)  # `-` computes in int32; `~` is logical.
+
+
+@enceladus.jit
+def _unsigned_loop_bound(out_ptr, n_ptr):
+    n = tl.load(n_ptr)
+    count = 0
+    for _ in range(0, n, 1_000_000_000):  # An int32 counter would see n < 0.
+        count += 1
+    tl.store(out_ptr, count)
+
+
+@enceladus.jit
+def _chained_compare(out_ptr, x_ptr, a, b):
+    tl.store(out_ptr, (a < b <= tl.load(x_ptr)).to(tl.int32))
+
+
+@enceladus.jit
+def _where_same_base(out_ptr, x_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs, tl.load(tl.where(offs % 2 == 0, x_ptr + offs, x_ptr + 50 + offs)))
+
+
+def _launch(kernel, out, *args, **kwargs):
+    kernel[(1,)](out, *args, **kwargs)
+    return out
+
+
+_I32 = np.zeros(1, np.int32)
+_ARANGE = np.arange(-32, 96, dtype=np.int32)
+SEMANTICS_CASES = [
+    ("loop_var_after_loop", lambda: _launch(_loop_var_after_loop, _I32.copy(), 5), [4], MODES),
+    ("loop_var_after_empty_loop", lambda: _launch(_loop_var_after_loop, _I32.copy(), 0), [100],
+     MODES),
+    ("negate_mask", lambda: _launch(_negate_mask, np.zeros(64, np.int32), _ARANGE, BLOCK=64),
+     np.where(_ARANGE[:64] > 0, -1, 10), MODES),
+    ("uint32_loop_bound", lambda: _launch(_unsigned_loop_bound, _I32.copy(),
+                                          np.array([3_000_000_000], np.uint32)), [3], MODES),
+    ("chained_compare", lambda: _launch(_chained_compare, _I32.copy(), _ARANGE[40:], 1, 2), [1],
+     MODES),
+    ("chained_compare_short_circuits", lambda: _launch(_chained_compare, _I32.copy(),
+                                                       _ARANGE[40:], 3, 2), [0], MODES),
+    # The interpreter doesn't support tl.where on pointers.
+    ("where_same_base_pointers", lambda: _launch(_where_same_base, np.zeros(64, np.int32),
+                                                 _ARANGE, BLOCK=64),
+     np.where(np.arange(64) % 2 == 0, _ARANGE[:64], _ARANGE[50:114]), ("compiled",)),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("run, expected, modes", [c[1:] for c in SEMANTICS_CASES],
+                         ids=[c[0] for c in SEMANTICS_CASES])  # fmt: skip
+def test_compiled_matches_python_semantics(run, expected, modes):
+    check_kernel(run, (), lambda: np.asarray(expected, np.int32), modes=modes)
 
 
 # ---------------------------------------------------------------------------

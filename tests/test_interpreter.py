@@ -1,7 +1,8 @@
 """Differential tests: kernels against NumPy references, in every available mode.
 
-With `ENCELADUS_VERIFY=1` (set in conftest), each interpreted launch also builds and verifies
-the kernel's IR, so these tests cover the frontend for every kernel they run.
+With `ENCELADUS_VERIFY=1` (set in conftest), each interpreted launch also compiles the kernel
+to MSL and raises the compiler's errors, so these tests cover the compiler for every kernel
+they run.
 """
 
 from __future__ import annotations
@@ -141,18 +142,29 @@ def _unary_kernel(x_ptr, out_ptr, n, OP: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, y, mask=mask)
 
 
+# Magnitudes where fast Metal math breaks: its `tanh` gives 0 at 44 and NaN from 45, and
+# its `sin` and `cos` give 0 around 1e7. In float16, 1e7 becomes infinity.
+LARGE = np.array([10.0, 44.0, 45.0, 100.0, 3e4, 1e7, np.inf])
+
+
 @pytest.mark.parametrize("dtype", [F32, F16])
 @pytest.mark.parametrize("op", list(UNARY))
 def test_unary_ops(mode, rng, op, dtype):
-    lo = 0.1 if op in ("log", "log2", "sqrt", "rsqrt") else -3.0
-    x = rng.uniform(lo, 3.0, 300).astype(dtype)
+    positive = op in ("log", "log2", "sqrt", "rsqrt")
+    big = LARGE if positive else np.concatenate([LARGE, -LARGE])
+    with np.errstate(over="ignore"):
+        x = np.concatenate([rng.uniform(0.1 if positive else -3.0, 3.0, 300), big]).astype(dtype)
 
     def run(x):
         out = np.empty_like(x)
         _unary_kernel[(1,)](x, out, x.size, OP=op, BLOCK=512)
         return out
 
-    check_kernel(run, (x,), lambda x: UNARY[op](x.astype(np.float64)).astype(dtype), modes=(mode,))
+    def ref(x):
+        with np.errstate(over="ignore", invalid="ignore"):
+            return UNARY[op](x.astype(np.float64)).astype(dtype)
+
+    check_kernel(run, (x,), ref, modes=(mode,))
 
 
 BINARY = {
@@ -488,6 +500,89 @@ def test_control_flow(mode):
     assert any(op.name == "if" and len(op.results) == 2 for op in loop.walk())
 
 
+@enceladus.jit
+def _carried_kernel(out_ptr, n, B: tl.constexpr):
+    s = 0
+    t = tl.zeros((B,), tl.int32)
+    p, q = 1, 2
+    for _ in range(n):
+        t_new = tl.full((B,), s, tl.int32)  # a uniform tile that reads `s` before its update
+        s = s + 1
+        t = t_new
+        p, q = q, p + q
+    tl.store(out_ptr + tl.arange(0, B), t + p * 1000 + q * 100000)
+
+
+@pytest.mark.parametrize("n", [0, 1, 3])
+def test_loop_carried_values_read_the_previous_iteration(mode, n):
+    def ref(n):
+        t, s, p, q = 0, 0, 1, 2
+        for _ in range(n):
+            t, s, p, q = s, s + 1, q, p + q
+        return np.full(16, t + p * 1000 + q * 100000, np.int32)
+
+    def run(n):
+        out = np.empty(16, np.int32)
+        _carried_kernel[(1,)](out, n, B=16)
+        return out
+
+    check_kernel(run, (n,), ref, modes=(mode,))
+
+
+@enceladus.jit
+def _range64_kernel(out_ptr, base, lo, hi, step, STEP: tl.constexpr):
+    acc = 0
+    count = 0
+    for i in range(base + lo, base + hi, step if STEP == 0 else STEP):
+        acc += (i - base).to(tl.int32) * 1000
+        count += 1
+    tl.store(out_ptr, acc + count)
+
+
+# (lo, hi, step) as offsets from a base above 2**32. A zero `const_step` passes the step at
+# run time.
+@pytest.mark.parametrize("lo, hi, step", [(0, 30, 1), (3, 30, 7), (30, 0, -1), (29, 0, -4),
+                                          (0, 0, 1), (5, 0, 2), (0, 5, -1)])  # fmt: skip
+@pytest.mark.parametrize("const_step", [False, True])
+def test_64_bit_loops_follow_python_range(mode, lo, hi, step, const_step):
+    # Metal's compiler service crashed on some loops that count in a `long`.
+    base = 5_000_000_000
+
+    def run(lo, hi, step):
+        out = np.zeros(1, np.int32)
+        _range64_kernel[(1,)](out, base, lo, hi, step, STEP=step if const_step else 0)
+        return out
+
+    def ref(lo, hi, step):
+        r = range(lo, hi, step)
+        return np.array([sum(r) * 1000 + len(r)], np.int32)
+
+    check_kernel(run, (lo, hi, step), ref, modes=(mode,))
+
+
+# A separate kernel, so the recompile count of `_range64_kernel` stays below the warning.
+_range_u64_kernel = enceladus.jit(_range64_kernel.fn)
+
+
+@pytest.mark.parametrize("lo, hi, step", [(0, 30, 1), (3, 30, 7), (5, 0, 2)])
+@pytest.mark.parametrize("const_step", [False, True])
+def test_uint64_loops_follow_python_range(mode, lo, hi, step, const_step):
+    # Unsigned bounds above 2**63 count in a uint64, and the arguments type as u64.
+    base = (1 << 63) + 5_000_000_000
+
+    def run(lo, hi, step):
+        out = np.zeros(1, np.int32)
+        _range_u64_kernel[(1,)](out, base, np.uint64(lo), np.uint64(hi), np.uint64(step),
+                              STEP=step if const_step else 0)  # fmt: skip
+        return out
+
+    def ref(lo, hi, step):
+        r = range(lo, hi, step)
+        return np.array([sum(r) * 1000 + len(r)], np.int32)
+
+    check_kernel(run, (lo, hi, step), ref, modes=(mode,))
+
+
 # `and` and `or` return an operand, as in Python. `x` is 42, read only when it's needed.
 BOOL_OPS = {
     "and": lambda n, m, f, x: n and m, "or": lambda n, m, f, x: n or m,
@@ -710,3 +805,224 @@ def test_welford_tuple_reduce(mode, rng):
     ref = lambda x: (x.mean(1, dtype=np.float64).astype(np.float32),  # noqa: E731
                      x.var(1, dtype=np.float64).astype(np.float32))
     check_kernel(run, (x,), ref, modes=(mode,), atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Interpreter fidelity: literals, loop variables, NaN reductions, and refusals
+# ---------------------------------------------------------------------------
+
+
+@enceladus.jit
+def _unsigned_literal_kernel(x_ptr, out_ptr, n, OP: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    if OP == "add":
+        y = tl.load(x_ptr + offs) + -1
+    elif OP == "other":
+        y = tl.load(x_ptr + offs, mask=offs < n, other=-1)
+    else:
+        y = tl.full((BLOCK,), -1, x_ptr.dtype)
+    tl.store(out_ptr + offs, y)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint32])
+@pytest.mark.parametrize("op", ["add", "other", "full"])
+def test_negative_literals_wrap_in_unsigned_types(mode, op, dtype):
+    def run(x):
+        out = np.empty_like(x)
+        _unsigned_literal_kernel[(1,)](x, out, 5, OP=op, BLOCK=16)
+        return out
+
+    def ref(x):
+        top = np.iinfo(dtype).max
+        return {"add": x - dtype(1), "other": np.where(np.arange(16) < 5, x, top).astype(dtype),
+                "full": np.full(16, top, dtype)}[op]  # fmt: skip
+
+    check_kernel(run, (np.arange(16, dtype=dtype),), ref, modes=(mode,))
+
+
+@enceladus.jit
+def _literal_error_kernel(out_ptr, OP: tl.constexpr):
+    if OP == "float64":
+        tl.store(out_ptr, tl.zeros((1,), tl.float64))  # literal-error-line
+    elif OP == "full_big":
+        tl.store(out_ptr, tl.full((1,), 1e10, tl.int32))  # literal-error-line
+    elif OP == "full_nan":
+        tl.store(out_ptr, tl.full((1,), float("nan"), tl.int32))  # literal-error-line
+    elif OP == "store_float":
+        tl.store(out_ptr, 130.5)  # literal-error-line
+    elif OP == "other_float":
+        x = tl.load(out_ptr + 1, mask=False, other=-130.5)  # literal-error-line
+        tl.store(out_ptr, x)
+    else:
+        tl.store(out_ptr, 300)  # literal-error-line
+
+
+@pytest.mark.parametrize("op", ["float64", "full_big", "full_nan", "store_wide", "store_float",
+                                "other_float"])  # fmt: skip
+def test_literals_that_dont_fit_are_refused(mode, op, monkeypatch):
+    # With verification off, the interpreter checks the kernel on its own.
+    monkeypatch.setenv("ENCELADUS_VERIFY", "0")
+    with execution_mode(mode), pytest.raises(enceladus.CompilationError) as e:
+        _literal_error_kernel[(1,)](np.zeros(1, np.int8), OP=op)
+    assert "# literal-error-line" in str(e.value) and __file__ in str(e.value)
+
+
+@enceladus.jit
+def _loop_sum(n):
+    acc = 0
+    for j in tl.range(0, n):
+        acc += j * 1500000000  # wraps in int32, as on the GPU
+    return acc
+
+
+@enceladus.jit(do_not_specialize=["n"])
+def _loop_variable_kernel(out_ptr, n):
+    acc = 0  # a literal that the loop makes an int32 scalar, even when it runs 0 times
+    for i in range(n):
+        acc += i
+        tl.store(out_ptr + 4 + i, i.to(tl.float32) * 0.5)
+    tl.store(out_ptr, acc.to(tl.float32))
+    tl.store(out_ptr + 1, _loop_sum(n).to(tl.float32))
+    big = 0
+    for i in range(0, 1 << 34, 1 << 32):  # an int64 loop variable
+        big += i
+    tl.store(out_ptr + 2, (big >> 32).to(tl.float32))
+
+
+@pytest.mark.parametrize("n", [0, 3])
+def test_loop_variables_are_typed_scalars(mode, n):
+    def run():
+        out = np.zeros(8, np.float32)
+        _loop_variable_kernel[(1,)](out, n)
+        return out
+
+    def ref():
+        out = np.zeros(8, np.float32)
+        out[0] = sum(range(n))
+        out[1] = (np.arange(n, dtype=np.int32) * np.int32(1500000000)).sum(dtype=np.int32)
+        out[2] = 6
+        out[4:4 + n] = np.arange(n) * 0.5
+        return out
+
+    check_kernel(run, (), ref, modes=(mode,))
+
+
+@enceladus.jit
+def _nan_argmax_kernel(x_ptr, val_ptr, idx_ptr, amin_ptr, N: tl.constexpr):
+    row = tl.program_id(0)
+    x = tl.load(x_ptr + row * N + tl.arange(0, N))
+    v, i = tl.max(x, 0, return_indices=True)
+    tl.store(val_ptr + row, v)
+    tl.store(idx_ptr + row, i)
+    tl.store(amin_ptr + row, tl.argmin(x, 0))
+
+
+def test_argmax_ignores_nan_like_max(mode):
+    nan = np.nan
+    x = np.array([[nan, 1, 3, 2, nan, 0, 3, 1], [nan] * 8, [0, 1, nan, 2, 5, 0, 3, 1],
+                  [1, nan, nan, nan, nan, nan, nan, 0]], np.float32)  # fmt: skip
+
+    def run(x):
+        v, i, a = np.empty(4, np.float32), np.empty(4, np.int32), np.empty(4, np.int32)
+        _nan_argmax_kernel[(4,)](x, v, i, a, N=8)
+        return v, i, a
+
+    def ref(x):
+        def first(f):  # NaNs don't count unless the whole row is NaN; then the index is 0.
+            return np.array([0 if np.isnan(r).all() else f(r) for r in x], np.int32)
+
+        vals = [np.nan if np.isnan(r).all() else np.nanmax(r) for r in x]
+        return np.array(vals, np.float32), first(np.nanargmax), first(np.nanargmin)
+
+    check_kernel(run, (x,), ref, modes=(mode,))
+
+
+@enceladus.jit(do_not_specialize=["n"])
+def _chain_kernel(x_ptr, out_ptr, count_ptr, n, TILE: tl.constexpr):
+    if TILE:
+        x = tl.load(x_ptr + tl.arange(0, 8))
+        tl.store(out_ptr + tl.arange(0, 8), (0 < n < x).to(tl.int32))
+    else:
+        tl.store(out_ptr, (0 <= n < 4).to(tl.int32))
+        # Python semantics: the atomic runs only when `n < 0` is true.
+        tl.store(out_ptr + 1, (n < 0 < tl.atomic_add(count_ptr, 1)).to(tl.int32))
+
+
+@pytest.mark.parametrize("n", [-1, 2, 5])
+def test_scalar_comparison_chains_short_circuit(n, monkeypatch):
+    monkeypatch.setenv("ENCELADUS_VERIFY", "0")
+    out, count = np.zeros(8, np.int32), np.zeros(1, np.int32)
+    with execution_mode("interpret"):
+        _chain_kernel[(1,)](np.zeros(8, np.float32), out, count, n, TILE=False)
+    assert out[0] == (0 <= n < 4) and out[1] == 0 and count[0] == (n < 0)
+
+
+def test_tile_comparison_chains_are_refused(monkeypatch):
+    # Python would return the tile `n < x` unchecked, because `0 < n` is a scalar.
+    monkeypatch.setenv("ENCELADUS_VERIFY", "0")
+    with execution_mode("interpret"), pytest.raises(enceladus.CompilationError, match=r"\) & \("):
+        _chain_kernel[(1,)](np.ones(8, np.float32), np.zeros(8, np.int32),
+                            np.zeros(1, np.int32), 2, TILE=True)  # fmt: skip
+
+
+@enceladus.jit
+def _pointer_where_kernel(x_ptr, y_ptr, out_ptr, SAME: tl.constexpr):
+    offs = tl.arange(0, 8)
+    other = x_ptr + 8 + offs if SAME else y_ptr + offs
+    tl.store(out_ptr + offs, tl.load(tl.where(offs % 2 == 0, x_ptr + offs, other)))
+
+
+def test_where_selects_pointers_with_one_base(monkeypatch):
+    monkeypatch.setenv("ENCELADUS_VERIFY", "0")
+    x, out = np.arange(16, dtype=np.float32), np.zeros(8, np.float32)
+    with execution_mode("interpret"):
+        _pointer_where_kernel[(1,)](x, x, out, SAME=True)
+        np.testing.assert_array_equal(out, np.where(np.arange(8) % 2 == 0, x[:8], x[8:]))
+        with pytest.raises(enceladus.CompilationError, match="same base pointer"):
+            _pointer_where_kernel[(1,)](x, x, out, SAME=False)
+
+
+@enceladus.jit
+def _small_k_dot_kernel(x_ptr, out_ptr):
+    rm, rk = tl.arange(0, 16), tl.arange(0, 4)
+    a = tl.load(x_ptr + rm[:, None] * 4 + rk[None, :])
+    b = tl.load(x_ptr + rk[:, None] * 16 + rm[None, :])
+    tl.store(out_ptr + rm[:, None] * 16 + rm[None, :], tl.dot(a, b))  # refused-line
+
+
+def test_interpreter_warns_about_kernels_that_compiled_mode_refuses(monkeypatch):
+    # Codegen refuses a K block of 4; the interpreter runs it, warning once per kernel.
+    x, out = np.ones(64, np.float32), np.zeros(256, np.float32)
+    monkeypatch.delenv("ENCELADUS_VERIFY", raising=False)
+    with execution_mode("interpret"), pytest.warns(UserWarning, match="K block") as rec:
+        _small_k_dot_kernel[(1,)](x, out)
+        _small_k_dot_kernel[(1,)](x, out)
+    assert len(rec) == 1 and rec[0].filename == __file__
+    np.testing.assert_array_equal(out, np.full(256, 4, np.float32))
+    monkeypatch.setenv("ENCELADUS_VERIFY", "1")
+    with execution_mode("interpret"), pytest.raises(enceladus.CompilationError) as e:
+        _small_k_dot_kernel[(1,)](x, out)
+    assert "# refused-line" in str(e.value)
+
+
+@enceladus.jit
+def _barrier_kernel(x_ptr, buf_ptr, out_ptr, rounds, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    base = tl.program_id(0) * BLOCK
+    x = tl.load(x_ptr + base + offs)
+    for _ in range(rounds):
+        tl.store(buf_ptr + base + offs, x)
+        tl.debug_barrier()  # the reversed load reads other threads' stores
+        x = tl.load(buf_ptr + base + (BLOCK - 1 - offs)) + 1
+        tl.debug_barrier()  # every thread loads before the next round overwrites
+    tl.store(out_ptr + base + offs, x)
+
+
+def test_debug_barrier_orders_stores_before_loads_by_other_threads(mode):
+    # Without the barriers, the GPU loads stale values for about half of the elements.
+    def run(x):
+        out = np.empty_like(x)
+        _barrier_kernel[(16,)](x, np.zeros_like(x), out, 8, BLOCK=1024)
+        return out
+
+    check_kernel(run, (np.arange(16 * 1024, dtype=np.int32),), lambda x: x + 8, modes=(mode,))

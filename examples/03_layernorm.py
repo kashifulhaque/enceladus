@@ -1,5 +1,8 @@
 """LayerNorm forward, one row per program, looping over the row in blocks.
 
+`layernorm` accepts NumPy arrays, `enceladus.Tensor` objects, PyTorch tensors on the
+`mps` device, and MLX arrays, and returns arrays of the same kind.
+
 Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/03_layernorm.py`.
 """
 
@@ -10,11 +13,11 @@ import enceladus.language as tl
 
 
 @enceladus.jit
-def layernorm_kernel(x_ptr, y_ptr, w_ptr, b_ptr, mean_ptr, rstd_ptr, stride, n_cols, eps,
-                     BLOCK: tl.constexpr):  # fmt: skip
+def layernorm_kernel(x_ptr, y_ptr, w_ptr, b_ptr, mean_ptr, rstd_ptr, stride_x, stride_y,
+                     n_cols, eps, BLOCK: tl.constexpr):  # fmt: skip
     row = tl.program_id(0)
-    x_ptr += row * stride
-    y_ptr += row * stride
+    x_ptr += row * stride_x
+    y_ptr += row * stride_y
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for off in range(0, n_cols, BLOCK):
         cols = off + tl.arange(0, BLOCK)
@@ -39,16 +42,18 @@ def layernorm_kernel(x_ptr, y_ptr, w_ptr, b_ptr, mean_ptr, rstd_ptr, stride, n_c
         tl.store(y_ptr + cols, (x - mean) * rstd * w + b, mask=mask)
 
 
-def layernorm(x: np.ndarray, w: np.ndarray, b: np.ndarray, eps: float = 1e-5,
-              block: int | None = None):  # fmt: skip
-    """Returns `(y, mean, rstd)` for a 2D input normalized over its last dimension."""
+def layernorm(x, w, b, eps: float = 1e-5, block: int | None = None):
+    """Returns `(y, mean, rstd)` for a 2D input normalized over its last dimension.
+
+    The rows can be strided, but the elements within a row must be contiguous.
+    """
     m, n = x.shape
-    y = np.empty_like(x)
-    mean = np.empty(m, np.float32)
-    rstd = np.empty(m, np.float32)
+    y = enceladus.new_empty(x)
+    mean = enceladus.new_empty(x, (m,), np.float32)
+    rstd = enceladus.new_empty(x, (m,), np.float32)
     block = block or min(1024, enceladus.next_power_of_2(n))
-    layernorm_kernel[(m,)](x, y, w, b, mean, rstd, x.strides[0] // x.itemsize, n, eps,
-                           BLOCK=block)  # fmt: skip
+    stride_x, stride_y = enceladus.element_strides(x)[0], enceladus.element_strides(y)[0]
+    layernorm_kernel[(m,)](x, y, w, b, mean, rstd, stride_x, stride_y, n, eps, BLOCK=block)
     return y, mean, rstd
 
 

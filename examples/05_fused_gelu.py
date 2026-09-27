@@ -1,5 +1,8 @@
 """Fused elementwise op: `gelu(x * scale + bias)`, with a bias per column.
 
+`fused_gelu` accepts NumPy arrays, `enceladus.Tensor` objects, PyTorch tensors on the
+`mps` device, and MLX arrays, and returns an array of the same kind.
+
 Run the demo with `ENCELADUS_INTERPRET=1 uv run python examples/05_fused_gelu.py`.
 """
 
@@ -22,10 +25,10 @@ def fused_gelu_kernel(x_ptr, bias_ptr, out_ptr, n, n_cols, scale, BLOCK: tl.cons
     tl.store(out_ptr + offs, 0.5 * y * (1.0 + tl.erf(y * 0.7071067811865476)), mask=mask)
 
 
-def fused_gelu(x: np.ndarray, bias: np.ndarray, scale: float, block: int = 1024) -> np.ndarray:
+def fused_gelu(x, bias, scale: float, block: int = 1024):
     """Returns `gelu(x * scale + bias)` for a contiguous 2D `x` and a bias per column."""
-    out = np.empty_like(x)
-    n = x.size
+    out = enceladus.new_empty(x)
+    n = int(np.prod(x.shape))
     fused_gelu_kernel[(enceladus.cdiv(n, block),)](x, bias, out, n, x.shape[-1], scale, BLOCK=block)
     return out
 
