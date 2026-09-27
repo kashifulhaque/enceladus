@@ -549,15 +549,52 @@ def wrap(data: np.ndarray, dt: core.dtype) -> ITile:
 
 
 def convert(x: ITile, dt: core.dtype) -> ITile:
-    """Converts a tile to `dt` with C semantics: float to int truncates, to int1 is `!= 0`."""
+    """Converts a tile to `dt` as compiled kernels do.
+
+    Conversion to `int1` is `x != 0`. Float-to-integer conversion truncates toward zero
+    and follows Metal for values out of range; see `float_to_int`.
+    """
     if x.dtype is dt:
         return x
     data = x.data
     if dt.is_bool():
         return ITile(data != 0, dt)
-    if x.dtype is core.bfloat16 or dt is core.bfloat16 or (x.dtype.is_floating() and dt.is_int()):
+    if x.dtype.is_floating() and dt.is_int():
+        return ITile(float_to_int(data, dt), dt)
+    if x.dtype is core.bfloat16 or dt is core.bfloat16:
         data = data.astype(np.float32)
     return ITile(data.astype(_np(dt)), dt)
+
+
+_TWO_64 = float(1 << 64)
+_TWO_63 = float(1 << 63)
+
+
+def float_to_int(data: np.ndarray, dt: core.dtype) -> np.ndarray:
+    """Converts floats to the integer type `dt` the way Metal does on the GPU.
+
+    Values truncate toward zero. For `int64`, the result is the truncated value modulo
+    2**64, as a signed number, and infinities become 0. For every other integer type,
+    values out of range saturate to the type's minimum or maximum, including
+    infinities. NaN becomes 0 for every type. Codegen converts `float16` and `bfloat16`
+    through `float32`, which is exact, so this function does too.
+    """
+    f = np.asarray(data).astype(np.float32).astype(np.float64)  # exact
+    nan = np.isnan(f)
+    t = np.trunc(np.where(nan, 0.0, f))
+    if dt is core.int64:
+        # fmod is exact, so `r` is the exact remainder of trunc(x) by 2**64.
+        with np.errstate(invalid="ignore"):
+            r = np.fmod(t, _TWO_64)
+        r = np.where(r >= _TWO_63, r - _TWO_64, np.where(r < -_TWO_63, r + _TWO_64, r))
+        return np.where(np.isfinite(r), r, 0.0).astype(np.int64)
+    lo, hi = semantic.int_range(dt)
+    npdt = _np(dt)
+    if dt.primitive_bitwidth < 64:
+        return np.clip(t, lo, hi).astype(npdt)
+    # float64 can't hold 2**64 - 1, so fill the saturated values after converting.
+    out = np.clip(t, 0.0, np.nextafter(_TWO_64, 0.0)).astype(npdt)
+    return np.where(t >= _TWO_64, npdt.type(hi), out)
 
 
 def _c_div(a: np.ndarray, b: np.ndarray, signed: bool) -> np.ndarray:

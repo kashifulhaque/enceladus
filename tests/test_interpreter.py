@@ -307,6 +307,62 @@ def test_int_to_half_casts(mode, src, dst):
         check_kernel(run, (x,), lambda x: x.astype(dst), modes=(mode,), atol=0, rtol=0)
 
 
+# Edge values for float-to-int casts: NaN, infinities, fractions, negatives for unsigned
+# types, and values just inside and just past each integer type's range. Values that the
+# source type can't hold round to it (float16 overflows to inf).
+FLOAT_TO_INT_VALUES = [
+    math.nan, -math.nan, math.inf, -math.inf, -0.0, 0.5, -0.5, -0.99, -1.0, -2.5, 1e-40,
+    127.5, 128.0, -128.5, -129.0, 255.5, 256.0, -255.0, 32767.5, 32768.0, -32769.0,
+    65535.5, 65536.0, -65536.0, 2.0**31 - 128, 2.0**31, -(2.0**31), -(2.0**31) - 256,
+    2.0**32 - 256, 2.0**32, 2.0**63 - 2**39, 2.0**63, -(2.0**63), 2.0**63 + 2**40,
+    -(2.0**63) - 2**40, 1.5 * 2.0**64, 2.0**64, -(2.0**64), 2.0**70 + 2**47,
+    -(2.0**70) - 2**47, 3e38, -3e38,
+]  # fmt: skip
+INT_DSTS = {"i8": (np.int8, tl.int8), "u8": (np.uint8, tl.uint8), "i16": (np.int16, tl.int16),
+            "u16": (np.uint16, tl.uint16), "i32": (np.int32, tl.int32),
+            "u32": (np.uint32, tl.uint32), "i64": (np.int64, tl.int64),
+            "u64": (np.uint64, tl.uint64)}  # fmt: skip
+
+
+def metal_float_to_int(v: float, dst: type) -> int:
+    """What Metal gives for `dst(v)` on Apple GPUs, measured with raw MSL.
+
+    NaN becomes 0. `long` wraps the truncated value modulo 2**64 and maps infinities to 0.
+    Every other integer type saturates.
+    """
+    if math.isnan(v):
+        return 0
+    info = np.iinfo(dst)
+    if dst is np.int64:
+        if math.isinf(v):
+            return 0
+        r = math.trunc(v) % (1 << 64)
+        return r - (1 << 64) if r >= 1 << 63 else r
+    if math.isinf(v):
+        return int(info.max) if v > 0 else int(info.min)
+    return min(max(math.trunc(v), int(info.min)), int(info.max))
+
+
+@pytest.mark.filterwarnings("ignore:_cast_kernel has been compiled")
+@pytest.mark.parametrize("dst", list(INT_DSTS))
+@pytest.mark.parametrize("src", [F32, F16, BF16], ids=["f32", "f16", "bf16"])
+def test_float_to_int_casts_match_metal(mode, src, dst):
+    with np.errstate(over="ignore"):
+        x = np.zeros(64, src)
+        x[: len(FLOAT_TO_INT_VALUES)] = np.array(FLOAT_TO_INT_VALUES, np.float32).astype(src)
+    dnp, dt = INT_DSTS[dst]
+
+    def run(x):
+        out = np.zeros(x.size, dnp)
+        _cast_kernel[(1,)](x, out, DT=dt, BLOCK=x.size)
+        return out
+
+    def reference(x):
+        return np.array([metal_float_to_int(float(v), dnp) for v in x.tolist()], dnp)
+
+    check_kernel(run, (x,), reference, modes=(mode,))
+
+
 SHAPE_OPS = {
     "trans": lambda x: x.T, "T": lambda x: x.T, "reshape": lambda x: x.reshape(16, 8),
     "row_bcast": lambda x: x - x.max(1, keepdims=True),

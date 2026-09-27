@@ -80,10 +80,29 @@ model predicts. The autotuner measures instead of guessing.
 
 `@enceladus.autotune(configs, key)` compiles every candidate `enceladus.Config` in
 parallel, times each one with `do_bench`, and uses the fastest for each combination
-of the `key` arguments and the argument dtypes. It rejects configurations that run more
-than 3 times slower than the median, and it saves each result on disk, in
+of the `key` arguments and the argument dtypes. It saves each result on disk, in
 `~/.cache/enceladus/autotune/`, keyed by the kernel's source, the compiler version, and
 the GPU. Later processes reuse saved results without benchmarking.
+
+GPU timings vary by a few percent from run to run, so the autotuner times in two
+phases. The first phase times every configuration. The second times the fastest few
+again, up to three within 15% of the fastest, in four interleaved rounds, and compares
+the medians of all their samples. Interleaving spreads GPU clock changes and other GPU
+work across the configurations. Among the configurations within `tolerance` (1% by
+default) of the fastest, the one listed first wins. The autotuner also benchmarks
+each configuration with the same argument alignment and strides as the real launch, so
+it times the code that the launch runs.
+
+To tune reliably, follow these guidelines:
+
+- List a known-good default configuration first, as `matmul_configs` does. It then
+  stays in use unless another configuration is measurably faster.
+- Tune on a quiet GPU. Other GPU work during tuning, such as another process, can
+  still make a slower configuration win.
+- To check what tuning costs, set `ENCELADUS_PRINT_AUTOTUNING=1`, which prints the
+  tuning time with each result. The second phase adds about a third to the tuning
+  time: the FP32 matmul at 4096³ tuned in 11-12 seconds on a busy M4 Pro GPU.
+- For stable choices in production, freeze the printed configuration in your code.
 
 Enceladus ships pre-validated configuration lists for the two kernels that need them
 most:
@@ -135,7 +154,7 @@ The grid must be a function of `meta`, because the block sizes come from the cho
 configuration. The output is similar to the following:
 
 ```text
-enceladus: autotuning matmul_kernel [1024|1024|512|float16,float16,float16] chose enceladus.Config({'BM': 64, 'BN': 32, 'BK': 32}, num_warps=4, dot_warps=(4, 1), dot_backend='mpp') (0.186 ms)
+enceladus: autotuning matmul_kernel [1024|1024|512|float16,float16,float16] chose enceladus.Config({'BM': 64, 'BN': 32, 'BK': 32}, num_warps=4, dot_warps=(4, 1), dot_backend='mpp') (0.186 ms, tuned in 1.2 s)
 ```
 
 The autotuner has the following options, which match Triton's:
@@ -149,6 +168,9 @@ The autotuner has the following options, which match Triton's:
   that accumulate into their output. `restore_value` restores arguments after tuning.
 - `enceladus.heuristics({"BLOCK": fn})` computes constexprs from the other arguments
   instead of benchmarking them.
+
+Enceladus adds one option that Triton doesn't have: `tolerance=0.01` sets the fraction
+of the fastest time within which the first-listed configuration wins.
 
 Set `ENCELADUS_ALWAYS_COMPILE=1` to ignore saved results and tune again.
 

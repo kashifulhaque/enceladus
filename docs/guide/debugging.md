@@ -66,6 +66,11 @@ math functions such as `exp` differ in the last bits, and colliding atomics can 
 in a different order. The test suite uses the interpreter as the reference for every
 compiled kernel.
 
+Converting an out-of-range float to an integer type gives the same result in both
+modes, because the interpreter follows Metal: NaN becomes 0, `int64` wraps modulo
+2**64, and narrower types saturate. For the details, see `tl.cast` in the
+[language reference](language-reference.md).
+
 ## Inspect the generated IR and MSL
 
 To see what the compiler generates, set `ENCELADUS_DUMP=1`. For a compiled launch,

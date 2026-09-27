@@ -209,6 +209,15 @@ A kernel can call other `@enceladus.jit` functions, which the compiler inlines. 
 kernels, these helper functions can return values, including tuples. A kernel can also
 call plain Python functions with compile-time arguments, for example `math.log2(BLOCK)`.
 
+The kernel cache recompiles a kernel when a value that it reads at compile time
+changes, including the values that plain Python helpers, classes, and their methods
+read. The cache follows helpers, classes, and methods transitively, and it can track
+modules, classes, functions, library functions such as `np.log2`, and constant values
+such as numbers, strings, and tuples. A kernel or helper that reads anything else, such
+as an attribute of an object instance or `os.environ`, gets an
+`enceladus.CompilationError`. To use such a value, pass it as a `tl.constexpr`
+argument.
+
 The following program uses a helper function:
 
 ```python
