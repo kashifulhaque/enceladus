@@ -4,8 +4,10 @@ It also reports exact `int8` matmul (`int32` accumulation) in TOPS. MLX's matmul
 only floating-point types, and PyTorch MPS `int8` matmul returns `int8`, so neither has a
 comparable `int8` number.
 
-Enceladus uses GPU timestamps. MLX and PyTorch use wall clock around a synchronized call
-(overhead is under 1% at 4096^3). Operands come from memory, never constants.
+Enceladus uses GPU timestamps. MLX and PyTorch use the wall clock around a synchronized
+call (overhead is under 1% at 4096^3). All of them run in the same interleaved rounds, so
+GPU clock changes, such as thermal throttling on a laptop, affect each one alike. Operands
+come from memory, never constants.
 
 Run with `uv run python benchmarks/bench_matmul.py [--quick]`.
 """
@@ -35,11 +37,8 @@ def load(stem: str):
     return mod
 
 
-def tflops(m: int, n: int, k: int, ms: float) -> float:
-    return 2 * m * n * k / (ms * 1e-3) / 1e12
-
-
-def wall_min(fn, sync, reps: int = 10) -> float:
+def wall_samples(fn, sync, reps: int = 10) -> list[float]:
+    """Returns the wall-clock time of `reps` synchronized calls of `fn`, after 3 warmups."""
     for _ in range(3):
         fn()
     sync()
@@ -49,10 +48,11 @@ def wall_min(fn, sync, reps: int = 10) -> float:
         fn()
         sync()
         out.append((time.perf_counter() - t0) * 1e3)
-    return min(out)
+    return out
 
 
-def mlx_ms(m, n, k, dtype):
+def mlx_matmul(m, n, k, dtype):
+    """Returns a timed MLX `a @ b` and its sync, or None without MLX."""
     try:
         import mlx.core as mx
     except ImportError:
@@ -60,35 +60,41 @@ def mlx_ms(m, n, k, dtype):
     a = mx.random.normal((m, k)).astype(getattr(mx, dtype))
     b = mx.random.normal((k, n)).astype(getattr(mx, dtype))
     mx.eval(a, b)
-    return wall_min(lambda: mx.eval(a @ b), lambda: None)
+    return lambda: mx.eval(a @ b), lambda: None
 
 
-def torch_ms(m, n, k, dtype):
+def torch_matmul(m, n, k, dtype):
+    """Returns a timed PyTorch MPS `a @ b` and its sync, or None without PyTorch."""
     try:
         import torch
     except ImportError:
         return None
     a = torch.randn(m, k, device="mps", dtype=getattr(torch, dtype))
     b = torch.randn(k, n, device="mps", dtype=getattr(torch, dtype))
-    return wall_min(lambda: a @ b, torch.mps.synchronize)
+    return lambda: a @ b, torch.mps.synchronize
 
 
-def interleaved(variants: dict, rounds: int = 3, rep: int = 10) -> dict[str, list[float]]:
+def interleaved(variants: dict, refs: dict | None = None, rounds: int = 3,
+                rep: int = 10) -> dict[str, list[float]]:  # fmt: skip
     """Times each variant `rounds` times in turn and returns all samples per variant.
 
-    Alternating the variants spreads GPU clock changes and other GPU users across them.
+    `variants` launch Enceladus kernels, timed with GPU timestamps. `refs` maps a name to
+    a `(fn, sync)` pair timed with the wall clock. Alternating all of them spreads GPU
+    clock changes, such as thermal throttling, and other GPU users across them.
     """
-    samples: dict[str, list[float]] = {name: [] for name in variants}
+    refs = refs or {}
+    samples: dict[str, list[float]] = {name: [] for name in [*variants, *refs]}
     for _ in range(rounds):
         for name, fn in variants.items():
             samples[name] += do_bench(fn, rep=rep, return_mode="all")
+        for name, (fn, sync) in refs.items():
+            samples[name] += wall_samples(fn, sync, rep)
     return samples
 
 
-def row(label: str, dtype: str, cfg: str, flops: float, ms: list[float], extra: str = "") -> None:
+def row(label: str, dtype: str, cfg: str, flops: float, ms: list[float]) -> None:
     best, med = min(ms), statistics.median(ms)
-    print(f"{label:<18}{dtype:<10}{cfg:<24}{flops / best / 1e9:8.2f}{flops / med / 1e9:8.2f}"
-          f"{extra}")  # fmt: skip
+    print(f"{label:<18}{dtype:<10}{cfg:<24}{flops / best / 1e9:8.2f}{flops / med / 1e9:8.2f}")
 
 
 @enceladus.jit
@@ -130,16 +136,17 @@ def main() -> None:
     fused = load("07_matmul_fused")
     shapes = SHAPES[:1] if "--quick" in sys.argv else SHAPES
     print(f"Device: {enceladus.get_device().caps.name}")
-    print("TFLOPS as the minimum and median time over 3 interleaved rounds of 10 runs.")
-    print(f"{'shape':<18}{'dtype':<10}{'config':<24}{'TFLOPS':>8}{'median':>8}{'MLX':>8}"
-          f"{'torch':>8}")  # fmt: skip
+    print("TFLOPS at the minimum and median time over 3 interleaved rounds of 10 runs.")
+    print("MLX and torch run in the same rounds and use the wall clock.")
+    print(f"{'shape':<18}{'dtype':<10}{'config':<24}{'TFLOPS':>8}{'median':>8}")
     for m, n, k in shapes:
         flops = 2 * m * n * k
         for dtype in ("float32", "float16", "bfloat16"):
             a, b = enceladus.randn(m, k, dtype=dtype), enceladus.randn(k, n, dtype=dtype)
             c = enceladus.empty((m, n), dtype)
-            refs = [mlx_ms(m, n, k, dtype), torch_ms(m, n, k, dtype)]
-            ref = "".join(f"{tflops(m, n, k, r):8.2f}" if r else f"{'n/a':>8}" for r in refs)
+            refs = {name: r for name, r in (("MLX a @ b", mlx_matmul(m, n, k, dtype)),
+                                            ("torch a @ b", torch_matmul(m, n, k, dtype)))
+                    if r is not None}  # fmt: skip
             ex.matmul_tuned(a, b, c)  # tunes on first use
             best = ex.matmul_desc_tuned.config_for(a, b, c, m, n, k, k, n, n)
             variants = {
@@ -156,13 +163,13 @@ def main() -> None:
                     variants[f"{backend} + bias + GELU"] = (
                         lambda backend=backend: fused.matmul_bias_gelu(a, b, bias, c,
                                                                        dot_backend=backend))
-            res = interleaved(variants)
+            res = interleaved(variants, refs)
             label = f"{m}x{n}x{k}"
             for i, (cfg, ms) in enumerate(res.items()):
-                row(label if i == 0 else "", dtype, cfg, flops, ms, ref if i == 0 else "")
+                row(label if i == 0 else "", dtype, cfg, flops, ms)
         res = interleaved(int8_variants(m, n, k))
         for cfg, ms in res.items():
-            row("", "int8", cfg, flops, ms, f"{'n/a':>8}{'n/a':>8}")
+            row("", "int8", cfg, flops, ms)
 
 
 if __name__ == "__main__":
