@@ -30,6 +30,10 @@ from enceladus.compiler.passes.axis_info import AxisAnalysis, contiguous_order
 CHEAP_SOURCES = frozenset(["const", "splat", "arange", "full"])
 ELEMENTWISE = frozenset(["binary", "cmp", "unary", "fma", "select", "cast", "bitcast", "addptr"])
 VIEWS = frozenset(["expand_dims", "broadcast", "reshape", "trans"])
+# Shape ops that combine or separate tiles. They're cheap over cheap operands, and
+# anchored otherwise, in a layout derived from the operand's (see `layout.join` and
+# `layout.split`).
+JOIN_SPLIT = frozenset(["join", "split"])
 
 CHEAP, VIEW, ANCHORED = "cheap", "view", "anchored"
 
@@ -231,6 +235,8 @@ class _Assigner:
                     k = CHEAP if all(p.classify(v) == CHEAP for v in tiles) else ANCHORED
                 elif op.name in VIEWS:
                     k = CHEAP if p.classify(op.operands[0]) == CHEAP else VIEW
+                elif op.name in JOIN_SPLIT:
+                    k = CHEAP if all(p.classify(v) == CHEAP for v in tiles) else ANCHORED
                 else:
                     k = ANCHORED
                 p.kind[id(r)] = k
@@ -308,7 +314,10 @@ class _Assigner:
                     if lay is not None:
                         return lay
             return None
-        if op.name in ELEMENTWISE:
+        if op.name == "split":
+            src = op.operands[0]
+            return L.split(L.split_source(self.resolve(src) or p.default(src.type)))[0]
+        if op.name in ELEMENTWISE or op.name == "join":
             tiles = [x for x in op.operands if isinstance(x.type, ir.TileType)]
             # Prefer operands with a layout of their own, then loop-carried values (whose
             # layout may depend on this op), then views.
@@ -320,7 +329,7 @@ class _Assigner:
                 if rank(x) < 3:
                     lay = self.resolve(x)
                     if lay is not None:
-                        return lay
+                        return L.join(lay) if op.name == "join" else lay
             return None
         if op.name == "dot":
             bm, bn = t.shape

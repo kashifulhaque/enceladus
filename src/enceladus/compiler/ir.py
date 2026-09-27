@@ -576,6 +576,23 @@ def _v_trans(op: Op) -> None:
     _check(r == TileType(tuple(a.shape[p] for p in perm), a.elem), "result shape must be permuted")
 
 
+def _v_join(op: Op) -> None:
+    _arity(op, 2, 1)
+    a, b, r = op.operands[0].type, op.operands[1].type, op.result.type
+    _check(isinstance(a, TileType) and a == b, f"operands must be tiles of one type, got {a}, {b}")
+    out = TileType((*a.shape, 2), a.elem)
+    _check(r == out, f"result must be {out}")
+
+
+def _v_split(op: Op) -> None:
+    _arity(op, 1, 2)
+    a = op.operands[0].type
+    _check(isinstance(a, TileType) and len(a.shape) >= 2 and a.shape[-1] == 2,
+           "operand must be a tile of rank 2 or more whose last dimension is 2")
+    out = TileType(a.shape[:-1], a.elem)
+    _check(all(r.type == out for r in op.results), f"results must be {out}")
+
+
 def _v_addptr(op: Op) -> None:
     _arity(op, 2, 1)
     p, o = op.operands[0].type, op.operands[1].type
@@ -770,6 +787,8 @@ VERIFIERS: dict[str, Callable[[Op], None]] = {
     "expand_dims": _v_expand_dims,
     "reshape": _v_reshape,
     "trans": _v_trans,
+    "join": _v_join,
+    "split": _v_split,
     "addptr": _v_addptr,
     "load": _v_load,
     "store": _v_store,

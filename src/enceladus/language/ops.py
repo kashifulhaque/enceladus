@@ -807,6 +807,96 @@ def permute(ctx, input, *dims):
     return _trans(ctx, input, *dims, fname="permute")
 
 
+def _no_pointer_join(fname: str, *xs: Any) -> None:
+    for x in xs:
+        if isinstance(x, IPointer) or (isinstance(x, ir.Value) and semantic.is_pointer(x)):
+            raise CompilationError(
+                f"tl.{fname} doesn't support tiles of pointers. Apply it to the integer "
+                "offsets instead, and add the result to the base pointer."
+            )
+
+
+def _split_shape(shape: tuple[int, ...]) -> None:
+    if not shape or shape[-1] != 2:
+        raise CompilationError(
+            f"tl.split needs a tile whose last dimension is 2, but got a tile of shape "
+            f"{shape}. Reshape the tile first so that its last dimension is 2."
+        )
+
+
+def _i_join(a, b):
+    _no_pointer_join("join", a, b)
+    dt = semantic.join_dtype(I._operand(a), I._operand(b))
+    x, y = I.to_tile(a, dt), I.to_tile(b, dt)
+    shape = semantic.broadcast_shapes(x.shape, y.shape)
+    data = np.stack([np.broadcast_to(x.data, shape), np.broadcast_to(y.data, shape)], axis=-1)
+    return ITile(data, dt)
+
+
+@builtin(interp=_i_join)
+def join(ctx, a, b):
+    """Joins `a` and `b` along a new last dimension of size 2.
+
+    `a` and `b` broadcast to one shape `S`, and the result has shape `(*S, 2)`: element
+    `[..., 0]` comes from `a` and element `[..., 1]` from `b`. The operands must have the
+    same dtype, except that a Python number takes the other operand's dtype. Joining
+    two scalars gives a tile of shape `(2,)`. To interleave two tiles, reshape the result,
+    as in `tl.reshape(tl.join(a, b), (M, 2 * N))`.
+    """
+    x, y = core.unwrap(a), core.unwrap(b)
+    _no_pointer_join("join", x, y)
+    bld = ctx.b
+    dt = semantic.join_dtype(semantic.operand_dtype(x), semantic.operand_dtype(y))
+    xv, yv = semantic.to_value(bld, x, dt), semantic.to_value(bld, y, dt)
+    shape = semantic.broadcast_shapes(ir.shape_of(xv.type), ir.shape_of(yv.type))
+    scalar = not shape
+    shape = shape or (1,)
+    xv, yv = (semantic.broadcast_to(bld, v, shape) for v in (xv, yv))
+    t = ir.TileType((*shape, 2), ir.scalar(dt))
+    out = bld.create("join", [xv, yv], [t]).result
+    if scalar:
+        out = bld.create("reshape", [out], [ir.TileType((2,), t.elem)]).result
+    return out
+
+
+def _i_split(a):
+    _no_pointer_join("split", a)
+    t = _itile(a)
+    _split_shape(t.shape)
+    return ITile(t.data[..., 0].copy(), t.dtype), ITile(t.data[..., 1].copy(), t.dtype)
+
+
+def _first_element(b: ir.Builder, v: ir.Value) -> ir.Value:
+    """Returns the only element of a tile of shape `(1,)` as a scalar."""
+    elem = v.type.elem
+    block = ir.Block([elem, elem], ["a0", "b0"])
+    with b.at(block):
+        b.create("yield", [block.args[0]])
+    return b.create("reduce", [v], [elem], {"axis": 0}, regions=[ir.Region(block)]).result
+
+
+@builtin(interp=_i_split)
+def split(ctx, a):
+    """Splits `a` along its last dimension, which must be 2, into two tiles.
+
+    Returns `(a[..., 0], a[..., 1])`, the inverse of `tl.join`. Splitting a tile of
+    shape `(2,)` gives two scalars. To separate the even and odd columns of an `M x 2N`
+    tile, reshape it first, as in `tl.split(tl.reshape(x, (M, N, 2)))`.
+    """
+    v = _value(ctx, a)
+    _no_pointer_join("split", v)
+    _split_shape(ir.shape_of(v.type))
+    b = ctx.b
+    rank1 = len(v.type.shape) == 1
+    if rank1:
+        v = b.create("reshape", [v], [ir.TileType((1, 2), v.type.elem)]).result
+    t = ir.TileType(v.type.shape[:-1], v.type.elem)
+    outs = b.create("split", [v], [t, t]).results
+    if rank1:
+        outs = [_first_element(b, r) for r in outs]
+    return outs[0], outs[1]
+
+
 # ---------------------------------------------------------------------------
 # Reductions
 # ---------------------------------------------------------------------------
@@ -1413,7 +1503,8 @@ def debug_barrier(ctx):
 # Tile methods
 # ---------------------------------------------------------------------------
 
-for _b in (reshape, trans, permute, broadcast_to, expand_dims, argmax, argmin, reduce, cast):
+for _b in (reshape, trans, permute, broadcast_to, expand_dims, join, split, argmax, argmin,
+           reduce, cast):
     _method(_b)
 TILE_METHODS["sum"] = sum_
 TILE_METHODS["max"] = max_

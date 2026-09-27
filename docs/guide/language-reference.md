@@ -60,6 +60,7 @@ You can also call the following functions as methods of a tile, for example
 - `x.exp2(...)`: `tl.exp2`
 - `x.expand_dims(...)`: `tl.expand_dims`
 - `x.floor(...)`: `tl.floor`
+- `x.join(...)`: `tl.join`
 - `x.log(...)`: `tl.log`
 - `x.log2(...)`: `tl.log2`
 - `x.max(...)`: `tl.max`
@@ -70,6 +71,7 @@ You can also call the following functions as methods of a tile, for example
 - `x.rsqrt(...)`: `tl.rsqrt`
 - `x.sigmoid(...)`: `tl.sigmoid`
 - `x.sin(...)`: `tl.sin`
+- `x.split(...)`: `tl.split`
 - `x.sqrt(...)`: `tl.sqrt`
 - `x.sum(...)`: `tl.sum`
 - `x.tanh(...)`: `tl.tanh`
@@ -420,6 +422,32 @@ You can also call it as a tile method: `x.trans(...)`.
 Permutes the dimensions of `input` into the order `dims`.
 
 You can also call it as a tile method: `x.permute(...)`.
+
+### `tl.join`
+
+**Signature:** `tl.join(a, b)`
+
+Joins `a` and `b` along a new last dimension of size 2.
+
+`a` and `b` broadcast to one shape `S`, and the result has shape `(*S, 2)`: element
+`[..., 0]` comes from `a` and element `[..., 1]` from `b`. The operands must have the
+same dtype, except that a Python number takes the other operand's dtype. Joining
+two scalars gives a tile of shape `(2,)`. To interleave two tiles, reshape the result,
+as in `tl.reshape(tl.join(a, b), (M, 2 * N))`.
+
+You can also call it as a tile method: `x.join(...)`.
+
+### `tl.split`
+
+**Signature:** `tl.split(a)`
+
+Splits `a` along its last dimension, which must be 2, into two tiles.
+
+Returns `(a[..., 0], a[..., 1])`, the inverse of `tl.join`. Splitting a tile of
+shape `(2,)` gives two scalars. To separate the even and odd columns of an `M x 2N`
+tile, reshape it first, as in `tl.split(tl.reshape(x, (M, N, 2)))`.
+
+You can also call it as a tile method: `x.split(...)`.
 
 ## Reductions
 

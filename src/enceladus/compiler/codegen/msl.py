@@ -523,6 +523,9 @@ class _Codegen:
         try:
             if op.name in VIEWS:
                 tile = self.mat_view(op, lay)
+            elif op.name == "split":
+                i = op.results.index(v)
+                tile = self.split_parts(op, L.join(lay), lay, 0, (i,))[0]
             else:
                 assert k == CHEAP
                 tile = self.mat_cheap(op, lay)
@@ -561,6 +564,8 @@ class _Codegen:
                 c = self.coord(lay, r, 0)
                 self.e.line(f"{arr}[{r}] = {c if not start else f'{start} + {c}'};")
             return Tile(lay, arr)
+        if name == "join":
+            return self.join(op, lay)
         return self.elementwise(op, lay, lazy=True)
 
     def elementwise(self, op: ir.Op, lay: L.BitLayout, lazy: bool) -> Tile:
@@ -663,6 +668,60 @@ class _Codegen:
                 self.e.line(f"{name}[{r}] = buf[{_add(dst_flat, dst_c[r])}];")
         return Tile(lay, name, base=t.base, root=t.root)
 
+    def join(self, op: ir.Op, lay: L.BitLayout) -> Tile:
+        """Emits `tl.join(a, b)` in `lay`, any layout of the result.
+
+        Each result register reads one operand register in the same thread: `a` and `b`
+        materialize in the layout that `lay` has without its trailing dimension. When a
+        register bit selects the trailing coordinate, as in `layout.join`, the choice of
+        operand is known at compile time. Otherwise a lane or SIMD-group bit selects it,
+        and each thread picks its operand by its coordinate.
+        """
+        last = lay.rank - 1
+        src_lay = L.slice_layout(lay, last)
+        a, b = (self.mat(v, src_lay) for v in op.operands)
+        k = next((i for i, basis in enumerate(lay.reg) if basis[last]), None)
+        tc = self.thread_coord(lay, last) if k is None else None
+        arr = self.declare(op.result.type, lay, op.result.name_hint or "jn")
+        for r in range(lay.num_regs):
+            if k is None:
+                self.e.line(f"{arr}[{r}] = {tc} ? {b.get(r)} : {a.get(r)};")
+            else:
+                j = (r & ((1 << k) - 1)) | (r >> (k + 1) << k)
+                self.e.line(f"{arr}[{r}] = {(b if r >> k & 1 else a).get(j)};")
+        return Tile(lay, arr)
+
+    def split_parts(self, op: ir.Op, src_lay: L.BitLayout, lay: L.BitLayout, k: int,
+                    which: tuple[int, ...]) -> list[Tile]:  # fmt: skip
+        """Emits results `which` of `tl.split`, reading the operand in `src_lay`.
+
+        Register bit `k` of `src_lay` selects the trailing coordinate, and `lay` is
+        `src_lay` without it (see `layout.split`), so every result register copies one
+        operand register of the same thread.
+        """
+        src = self.mat(op.operands[0], src_lay)
+        out = []
+        for i in which:
+            res = op.results[i]
+            arr = self.declare(res.type, lay, res.name_hint or "sp")
+            for j in range(lay.num_regs):
+                self.e.line(f"{arr}[{j}] = {src.get(L.insert_bit(j, k, i))};")
+            out.append(Tile(lay, arr))
+        return out
+
+    def op_split(self, op: ir.Op) -> None:
+        if self.plan.classify(op.results[0]) != ANCHORED:
+            return  # emitted lazily at each use
+        lay = self.plan.layout_of(op.results[0])
+        v = op.operands[0]
+        src_lay = L.split_source(self.plan.natural(v) or self.plan.default(v.type))
+        res_lay, k = L.split(src_lay)
+        if res_lay != lay:
+            src_lay, k = L.join(lay), 0
+        for r, tile in zip(op.results, self.split_parts(op, src_lay, lay, k, (0, 1)),
+                           strict=True):  # fmt: skip
+            self.tiles[id(r)] = tile
+
     # ---- ops ----
 
     def block(self, block: ir.Block) -> None:
@@ -701,6 +760,8 @@ class _Codegen:
             elif name in ("binary", "cmp", "unary", "fma", "select", "cast", "bitcast",
                           "addptr"):  # fmt: skip
                 self.tiles[id(res)] = self.elementwise(op, lay, lazy=False)
+            elif name == "join":
+                self.tiles[id(res)] = self.join(op, lay)
             elif name == "dot":
                 from enceladus.compiler.codegen.dot import emit_dot
 

@@ -100,8 +100,10 @@ The compiler refuses the following Triton features with an `enceladus.Compilatio
 - Block pointers: `tl.make_block_ptr`, `tl.advance`, and the `boundary_check` and
   `padding_option` arguments of `tl.load` and `tl.store`. Use tensor descriptors.
 - `while` loops, `break`, and `continue`.
-- `tl.multiple_of` and `tl.max_contiguous` hints, `tl.join`, `tl.split`,
-  `tl.inline_asm_elementwise`, `tl.dot_scaled`, and the `libdevice` functions.
+- `tl.multiple_of` and `tl.max_contiguous` hints, `tl.inline_asm_elementwise`,
+  `tl.dot_scaled`, and the `libdevice` functions.
+- `tl.join` and `tl.split` on tiles of pointers. Join or split the integer offsets
+  instead.
 - Other `tl` functions that aren't in the [Language reference](language-reference.md),
   such as `tl.sort`, `tl.flip`, `tl.gather`, `tl.histogram`, and `tl.rand`.
 - The `**` operator on runtime values. Use `tl.exp2` and `tl.log2`, or multiply.
