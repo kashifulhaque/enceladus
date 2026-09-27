@@ -1429,7 +1429,9 @@ unchanged.
   bias and GELU epilogue. The FP16 and BF16 `mpp` results are stable.
 - In this run, the autotuner picked a slower FP32 config at 4096³ (4.81 TFLOPS against
   5.09 for the fixed simdgroup config). The tuning benchmark is short, so noise at tuning
-  time can pick a config within about 5% of the best.
+  time can pick a config within about 5% of the best. The
+  [known-gap fixes after M9](#known-gap-fixes-after-m9) add a second, interleaved
+  tuning phase.
 - `mpp` is the largest gain at small and ragged shapes: tuned 32 x 32 `mpp` reaches 3.75
   (FP32) and 4.32 (FP16) TFLOPS at 513³, against 1.71 and 1.81 for simdgroup and 1.33 and
   1.39 for MLX.
@@ -1565,6 +1567,135 @@ without it, except where the known gaps say otherwise.
 - The `dl_delete` finalization guard has no test.
 - A plain helper function that reads an attribute of an untracked object still gets a
   token that holds only for the process, because the frontend doesn't see inside the
-  helper.
+  helper. Fixed in the [known-gap fixes after M9](#known-gap-fixes-after-m9): the
+  frontend refuses it.
 - Converting an out-of-range runtime float to an integer type differs between modes:
-  the GPU saturates and the interpreter wraps. Both are undefined in C.
+  the GPU saturates and the interpreter wraps. Both are undefined in C. Fixed in the
+  [known-gap fixes after M9](#known-gap-fixes-after-m9): the interpreter follows Metal.
+
+## Known-gap fixes after M9
+
+This pass fixes four gaps from the [bug-fix pass after M9](#bug-fix-pass-after-m9) and
+the [benchmarks after M9](#benchmarks-and-acceptance-after-m9). Each fix has a test
+that fails without it.
+
+### What changed
+
+**Float-to-integer conversion.** A raw-MSL probe measured what Metal gives for `T(x)`
+from `float`, and from `half` and `bfloat` both directly and through `float`, to every
+integer type. It covered NaN, infinities, fractions, negatives to unsigned types, and
+values just past each range, and then every `float` exponent with 15 mantissas per
+exponent and 2^20 random bit patterns. The results were the same in the safe,
+relaxed, and fast math modes:
+
+| Destination | In range | Out of range | NaN | +inf, -inf |
+|---|---|---|---|---|
+| `char`, `short`, `int` | Truncates | Saturates | 0 | Maximum, minimum |
+| `uchar`, `ushort`, `uint`, `ulong` | Truncates | Saturates; negatives give 0 | 0 | Maximum, 0 |
+| `long` | Truncates | Truncated value modulo 2^64 | 0 | 0, 0 |
+
+Codegen converts `half` and `bfloat` to integers through `float`, so these rules cover
+every source type. A direct `ulong(bfloat)` differs (values from 2^64 up give 2^63),
+but codegen doesn't emit it. The interpreter's `float_to_int` now follows the table;
+before, NumPy casts wrapped, so -2.5 converted to `uint8` gave 254 instead of 0. The
+`tl.cast` docstring, the language reference, and the debugging guide describe the
+rules.
+
+**Dependency hash.**
+
+- A user class is hashed with its bases, its methods (followed like plain helpers,
+  with the same recursion guard), and its class attributes. Rebinding a class
+  attribute recompiles, and so does changing a global that a method reads.
+- The frontend checks every Python callable that a kernel calls at compile time with
+  `jit.untracked_reason`, which follows helpers, classes, and methods transitively. A
+  callable that reaches a value without a deterministic token, such as an attribute of
+  an object instance or `os.environ`, is refused with an error at the call that names
+  the helper and the chain it reads.
+- Callable attributes of installed modules, such as `np.log2`, are keyed by name and
+  library version, in kernels and helpers. A classmethod read from its class is
+  tracked.
+
+**Autotuning.**
+
+- Tuning takes two phases. The fastest configs from the first phase, up to 3 within
+  15% of the best, are timed again in 4 interleaved rounds of `max(3, rep // 4)` runs,
+  after a dropped run, and compete on the median of all their samples. A new
+  `tolerance` option (default 0.01) picks the earliest config in the list among those
+  within the tolerance of the fastest. `matmul_configs` lists the fixed M4 config
+  first.
+- `ENCELADUS_PRINT_AUTOTUNING=1` prints the tuning time. `TUNING_VERSION` is part of the
+  results path, so saved results are re-tuned once; the file format is unchanged.
+- Benchmark copies of NumPy arguments keep the argument's element strides and its
+  alignment to 16 bytes, so tuning compiles and times the specialization that the
+  launch runs. Before, an unaligned view was copied to aligned, contiguous memory:
+  tuning timed the aligned specialization, and a kernel that applies the view's
+  strides read and wrote past the copy's end during tuning.
+
+### Benchmarks
+
+The GPU was shared with other agents for every measurement in this section, so absolute
+numbers are 20-35% below the quiet-GPU numbers in earlier sections, and MLX varied from
+1.2 to 5.3 TFLOPS within runs.
+
+In 8 alternating re-tunes of FP32 4096³ in one process
+(`matmul_desc_tuned`, 6 simdgroup and 3 `mpp` candidates), the previous algorithm
+(first phase only) picked 5 different configs; the new one picked `mpp` 64 x 64 six
+times, `mpp` 64 x 32 once, and simdgroup 32 x 64 once. A head-to-head run of 12
+interleaved rounds right after measured, in minimum and median TFLOPS:
+
+| Config | Min | Median |
+|---|---|---|
+| simdgroup 64 x 64, 4 warps (fixed) | 3.64 | 3.48 |
+| simdgroup 32 x 64, 2 warps | 3.64 | 3.49 |
+| simdgroup 128 x 64, 8 warps | 3.62 | 3.45 |
+| `mpp` 64 x 64, 4 warps | 3.87 | 3.70 |
+| `mpp` 64 x 32, 4 warps | 3.80 | 3.58 |
+
+The simdgroup configs are within 1% of each other, which is why the single-phase tuner
+picked among them at random. Tuning took 8.1-21.6 s with the previous algorithm and
+11.1-21.7 s with the new one (typically 8.5 s against 11.5 s).
+
+`benchmarks/bench_matmul.py --quick` with a fresh cache per run (so each run re-tunes)
+gave these FP32 4096³ results, tuned against fixed, in minimum TFLOPS from the same
+interleaved run:
+
+| Tuner | Runs: chosen config and tuned / fixed |
+|---|---|
+| Previous | sg 64x64: 5.26 / 5.22; sg 32x64 w2: 4.47 / 4.49; sg 64x64: 4.18 / 4.17; sg 64x64: 3.33 / 3.52 |
+| New (4 finalists, 5 rounds) | sg 64x64: 3.82 / 3.84; sg 32x64 w2: 3.62 / 3.73; sg 64x64: 3.77 / 3.66; sg 64x64: 3.68 / 3.69; `mpp` 64x32: 3.60 / 3.44 |
+
+Runs that picked the fixed config itself still differ by up to 5% between the two
+rows, so on this shared GPU the benchmark's own noise is as large as the effect it
+measures. The benchmark runs used an earlier setting of 4 finalists in 5 rounds, which
+took 8.1-22.3 s per dtype; the committed setting is 3 finalists in 4 rounds.
+
+### Tests
+
+- `uv run pytest -q`: 965 passed, 19 skipped, and 1 deselected in about 8 s, and the
+  same with `ENCELADUS_DEBUG=1`. `uv run pytest -q -m slow`: 1 passed.
+- New tests: a float-to-int differential test over float32, float16, and bfloat16 to
+  all eight integer types with 42 edge values, in both modes (48 cases); 3 dependency
+  staleness cases, each in the same and a new process (a method's global, a base
+  class method's global, and a class attribute); 2 error cases for helpers and
+  methods that read an object instance's attribute; a scripted-timing test for the
+  second phase and the tolerance (2 cases); and an unaligned, strided NumPy tuning
+  test.
+- Every example runs compiled and in the interpreter.
+
+### Deviations from the plan
+
+- Behavior changes: helpers, classes, and methods that reach untracked values are
+  refused where they ran before. Kernels that read callables of installed modules,
+  such as `np.log2`, compile where they were refused.
+- `@enceladus.autotune` takes a `tolerance` argument, which Triton doesn't have.
+
+### Known gaps
+
+- The float-to-int rules were measured on Apple9 (M4 Pro) with Xcode 27's Metal
+  compiler. `long` conversion is likely a compiler routine, so another GPU family or
+  compiler version might differ; the differential test would catch it.
+- Tuning on a busy GPU can still pick a slower config; interleaving spreads the
+  contention across the finalists but doesn't remove it.
+- The dependency hash still doesn't see values that a helper reaches only through its
+  arguments, such as an object that the kernel builds and passes to it. Such objects
+  come from compile-time values that the hash covers, so they're deterministic.
