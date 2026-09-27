@@ -384,7 +384,9 @@ class JITFunction:
         """
         interpret = self.interpret
         if interpret is None:
-            interpret = _env_flag("ENCELADUS_INTERPRET")
+            # Like `_env_flag`, but through the bound C method: `os.environ.get` costs
+            # about 0.3 µs, a tenth of a launch.
+            interpret = core.env_lookup(b"ENCELADUS_INTERPRET", b"0") not in (b"", b"0")
         if not interpret:
             self._run_compiled(args, kwargs, grid, num_warps, dot_warps, dot_backend)
             return
@@ -720,6 +722,8 @@ def _spec_key(v: Any, no_facts: bool) -> Any:
         return "f32"
     if t.__name__ == "Tensor" and t.__module__ == "torch":
         return interop.torch_spec_key(v, no_facts)
+    if t.__name__ == "array" and t.__module__ == "mlx.core":
+        return interop.mlx_spec_key(v, no_facts)
     from enceladus.runtime.tensor import Tensor
 
     if t is Tensor:

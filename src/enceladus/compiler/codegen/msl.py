@@ -44,13 +44,11 @@ STRUCT_FORMATS = {
     "i1": "?", "i8": "b", "i16": "h", "i32": "i", "i64": "q",
     "u8": "B", "u16": "H", "u32": "I", "u64": "Q", "f16": "e", "f32": "f",
 }  # fmt: skip
-# Kernels compile with fast FP32 functions (`MTLMathFloatingPointFunctions.fast`). The fast
-# `tanh` returns 0 at 44 and NaN from 45 and is inaccurate near 0, so `tg_tanh` in the
-# prelude replaces it: within 1.4 ulp everywhere, and 1.7x the time of the fast `tanh` in
-# compute-bound code, against 6x for `precise::tanh`. The fast `sin` and `cos` return 0
-# from about 1e7 and at NaN and infinity, so they use the precise variants, as Triton does
-# with libdevice. Those take 3.3x the time of the fast ones in compute-bound code, and
-# nothing in memory-bound code. The fast `exp` and `log` stay accurate, so they remain.
+# Every launch path compiles with precise FP32 functions, so that NumPy, PyTorch, and MLX
+# inputs give identical results (see `raw.MATH_FP32_FUNCTIONS`). `tanh` uses `tg_tanh` from
+# the prelude, which is within 1.4 ulp everywhere and cheaper than `precise::tanh`. `sin`
+# and `cos` name the precise variants explicitly: the fast ones return 0 from about 1e7
+# and at NaN and infinity.
 MATH_FUNCS = {
     "exp": "exp", "exp2": "exp2", "log": "log", "log2": "log2", "sqrt": "sqrt",
     "rsqrt": "rsqrt", "sin": "precise::sin", "cos": "precise::cos", "tanh": "tg_tanh",

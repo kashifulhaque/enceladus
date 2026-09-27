@@ -20,7 +20,6 @@ import hashlib
 import logging
 import math
 import struct
-import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,7 +28,7 @@ import numpy as np
 
 from enceladus import _C
 from enceladus.compiler.codegen.msl import KernelArg, scalar_slots
-from enceladus.runtime import interop
+from enceladus.runtime import interop, mlx_lazy
 from enceladus.runtime.device import get_device
 from enceladus.runtime.interop import as_kernel_arg
 from enceladus.runtime.raw import (
@@ -57,26 +56,23 @@ log = logging.getLogger("enceladus")
 # SHA-256 of the MSL source -> the library that `torch.mps.compile_shader` returned.
 _torch_libs: dict[bytes, Any] = {}
 
-# `arg_casts` names that `torch.mps.compile_shader` accepts for Python ints. It binds an
-# uncast int as int64 and a float as float32.
-_INT_CASTS = {8: "int8", 16: "int16", 32: "int32"}
 _INT_BITS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "u8": 8, "u16": 16, "u32": 32, "u64": 64}
 
 
 def _int_converter(bits: int, signed: bool) -> Callable[[Any], int]:
-    """Returns a function that range-checks an int and wraps unsigned values to signed.
+    """Returns a function that range-checks an int and wraps it to a signed 64-bit value.
 
-    `compile_shader` only binds signed casts (and uint8), so a uint16, uint32, or uint64
-    argument binds as the signed type of the same width with the same bit pattern.
+    Without `arg_casts`, `compile_shader` binds an int as the 8 bytes of an `int64`. A
+    narrower parameter reads the low bytes, which hold the value's bit pattern at that
+    width, so only a uint64 of 2^63 or more needs wrapping.
     """
     lo, hi = (-(1 << (bits - 1)), 1 << (bits - 1)) if signed else (0, 1 << bits)
-    half, full = 1 << (bits - 1), 1 << bits
 
     def convert(v: Any) -> int:
         v = int(v)
         if not lo <= v < hi:
             raise OverflowError(f"{v} is out of range for a {bits}-bit argument")
-        return v - full if (not signed and bits > 8 and v >= half) else v
+        return v - (1 << 64) if v >= 1 << 63 else v
 
     return convert
 
@@ -93,6 +89,19 @@ def _float_tensor_converter(dtype_name: str) -> Callable[[Any], Any]:
     return lambda v: torch.tensor(float(v), dtype=dt)
 
 
+def torch_source(source: str, math_mode: str) -> str:
+    """Returns `source` as the PyTorch path compiles it, with the native path's math.
+
+    `compile_shader` takes no compile options: it compiles with the safe math mode and
+    precise math functions. The pragma sets `math_mode` instead. The native path also
+    compiles with precise math functions (`raw.MATH_FP32_FUNCTIONS`), so both paths
+    give bit-identical results. MSL has no pragma for fast math functions, and the
+    `__METAL_MATH_FP32_FUNCTIONS_FAST__` macro that selects them has no effect in
+    source, because Metal includes its standard library before the source.
+    """
+    return f"#pragma METAL fp math_mode({math_mode})\n{source}"
+
+
 class TorchLaunch:
     """Launches one kernel through `torch.mps.compile_shader`.
 
@@ -104,8 +113,9 @@ class TorchLaunch:
     """
 
     def __init__(self, source: str, name: str, math_mode: str,
-                 arg_types: Sequence[str | None], checked: bool = False) -> None:  # fmt: skip
-        """Compiles `source` with `compile_shader` and prepares argument conversion.
+                 arg_types: Sequence[str | None], checked: bool = False,
+                 group: int | None = None) -> None:  # fmt: skip
+        """Compiles `source` with `compile_shader` and generates the launch functions.
 
         Args:
             source: The complete MSL source.
@@ -116,62 +126,85 @@ class TorchLaunch:
             checked: Whether callers pass only in-range signed ints, bools, and floats,
                 as `@enceladus.jit` specialization does, so conversion can skip range
                 checks.
+            group: The threadgroup width of every launch, which `try_launch` needs. If
+                `None`, `try_launch` is `None`.
         """
         import torch
 
-        # compile_shader compiles with safe math; match Enceladus's math mode instead.
-        src = f"#pragma METAL fp math_mode({math_mode})\n{source}"
+        src = torch_source(source, math_mode)
         key = hashlib.sha256(src.encode()).digest()
         lib = _torch_libs.get(key)
         if lib is None:
             lib = _torch_libs[key] = torch.mps.compile_shader(src)
         self.fn = getattr(lib, name)
         self.max_threads = self.fn.max_threads_per_threadgroup
-        casts: dict[int, str] = {}
-        convs: list[tuple[int, Callable[[Any], Any]]] = []
+        ns: dict[str, Any] = {"fn": self.fn, "T": torch.Tensor, "LIM": _INDEX_CHECK_BYTES}
+        # Ints bind without `arg_casts` (see `_int_converter`), which saves about 0.1 µs
+        # per launch.
+        call, ptrs = [], []
         for i, t in enumerate(arg_types):
+            a = f"a{i}"
             if t is None:
+                ptrs.append(a)
+                call.append(a)
                 continue
             if t == "i1":
-                casts[i] = "int8"
-                convs.append((i, int if checked else (lambda v: 1 if v else 0)))
+                conv: Callable[[Any], Any] = int if checked else (lambda v: 1 if v else 0)
             elif checked and t in ("i32", "i64"):
-                if t == "i32":
-                    casts[i] = "int32"
-                convs.append((i, int))
+                conv = int
             elif t in _INT_BITS:
-                bits = _INT_BITS[t]
-                if bits in _INT_CASTS:
-                    casts[i] = "uint8" if t == "u8" else _INT_CASTS[bits]
-                convs.append((i, _int_converter(bits, t[0] == "i")))
+                conv = _int_converter(_INT_BITS[t], t[0] == "i")
             elif t == "f32":
-                convs.append((i, float))
+                conv = float
             elif t == "f16":
-                convs.append((i, _float_tensor_converter("float16")))
+                conv = _float_tensor_converter("float16")
             elif t == "bf16":
-                convs.append((i, _float_tensor_converter("bfloat16")))
+                conv = _float_tensor_converter("bfloat16")
             else:
                 raise TypeError(f"argument {i} has type {t}, which the PyTorch path can't bind")
-        # Generate the call once, like JITFunction's binder: a per-launch loop over the
-        # arguments costs more than the rest of this path.
-        ns: dict[str, Any] = {"fn": self.fn, "casts": casts or None}
-        call = [f"v[{i}]" for i in range(len(arg_types))]
-        for i, conv in convs:
             ns[f"c{i}"] = conv
-            call[i] = f"c{i}(v[{i}])"
-        call += ["threads=threads", "group_size=group", "arg_casts=casts"]
-        src = f"def launch(v, threads, group):\n    fn({', '.join(call)})\n"
+            call.append(f"c{i}({a})")
+        # Generate the calls once, like JITFunction's binder: a per-launch loop over the
+        # arguments costs more than the rest of this path.
+        unpack = "".join(f"a{i}, " for i in range(len(arg_types)))
+        args = ", ".join(call)
+        src = (f"def launch(v, threads, group):\n"
+               f"    ({unpack}) = v\n"
+               f"    fn({args}, threads=threads, group_size=group)\n")  # fmt: skip
+        if group is not None:
+            # The precheck turns down the fast path when an array argument isn't an MPS
+            # tensor, or when its storage is large enough that a 32-bit offset might
+            # overflow; the caller then takes the fully checked path. A scalar `threads`
+            # and `group_size` cost less than tuples.
+            mps = " and ".join([f"type({a}) is T" for a in ptrs] + [f"{a}.is_mps" for a in ptrs])
+            big = " or ".join(f"{a}.untyped_storage().nbytes() > LIM" for a in ptrs)
+            src += (f"def try_launch(v, g0, g1, g2):\n"
+                    f"    ({unpack}) = v\n"
+                    f"    if not ({mps or 'True'}) or ({big or 'False'}):\n"
+                    f"        return False\n"
+                    f"    if g1 == 1 and g2 == 1:\n"
+                    f"        fn({args}, threads=g0 * {group}, group_size={group})\n"
+                    f"    else:\n"
+                    f"        fn({args}, threads=(g0 * {group}, g1, g2), "
+                    f"group_size=({group}, 1, 1))\n"
+                    f"    return True\n")  # fmt: skip
         exec(src, ns)  # noqa: S102 - the source is built from argument indices only
-        self.launch: Callable[[Sequence[Any], tuple, tuple], None] = ns["launch"]
+        self.launch: Callable[[Sequence[Any], Any, Any], None] = ns["launch"]
         """Launches with values in binding order, `threads` total threads in groups of
         `group` threads."""
+        self.try_launch: Callable[[Sequence[Any], int, int, int], bool] | None = (
+            ns.get("try_launch"))  # fmt: skip
+        """Launches `(g0, g1, g2)` threadgroups of `group` threads if every array argument
+        is an MPS tensor in storage of at most `_INDEX_CHECK_BYTES`, and returns whether
+        it launched."""
 
 
 def make_torch_launch(source: str, name: str, math_mode: str, arg_types: Sequence[str | None],
-                      checked: bool = False) -> TorchLaunch | str:  # fmt: skip
+                      checked: bool = False,
+                      group: int | None = None) -> TorchLaunch | str:  # fmt: skip
     """Returns a `TorchLaunch`, or the reason that the kernel can't use the PyTorch path."""
     try:
-        return TorchLaunch(source, name, math_mode, arg_types, checked)
+        return TorchLaunch(source, name, math_mode, arg_types, checked, group)
     except Exception as e:  # noqa: BLE001 - any failure selects the fallback path
         first = str(e).strip().splitlines()
         return f"{type(e).__name__}: {first[0] if first else ''}"
@@ -191,8 +224,9 @@ def launch_synced(stream: Any, pipeline: Any, plan: Any, bufs_values: Sequence[A
     """Dispatches on Enceladus's stream between syncs with PyTorch's stream.
 
     Waits for PyTorch's pending work, binds every array argument (evaluating MLX arrays),
-    dispatches, and waits until the GPU finishes, so PyTorch and MLX read the results.
-    `extra_bufs` are native buffers bound after the arguments, such as an error buffer.
+    waits for MLX's queued work if an argument is an MLX array, dispatches, and waits
+    until the GPU finishes, so PyTorch and MLX read the results. `extra_bufs` are native
+    buffers bound after the arguments, such as an error buffer.
     """
     interop.torch_synchronize()
     bufs, offsets, args = [], [], []
@@ -201,6 +235,10 @@ def launch_synced(stream: Any, pipeline: Any, plan: Any, bufs_values: Sequence[A
         bufs.append(ba.buffer)
         offsets.append(ba.byte_offset)
         args.append(ba)
+    if any(ba.kind == interop.KIND_MLX for ba in args):
+        # MLX work queued before the launch can still read an array that the kernel
+        # writes; `mx.eval` in `as_kernel_arg` doesn't wait for it.
+        interop.mlx_synchronize()
     for b in extra_bufs:
         bufs.append(b)
         offsets.append(0)
@@ -299,6 +337,7 @@ class CompiledKernel:
         self._checked_pipeline: Any = None  # the pipeline that `_check_pipeline` accepted
         self._torch: TorchLaunch | str | None = None  # a reason string if unavailable
         self._fallback_logged = False
+        self._mlx: Any = None  # an mlx_lazy.MlxKernel, or a reason string if unavailable
         self._debug = self.enable_logging or self.assert_buffer is not None
         if self.enable_logging:
             self._torch = ("it calls tl.device_print, which needs Enceladus's logging queue; "
@@ -381,17 +420,9 @@ class CompiledKernel:
         if debug:
             self._prepare_debug(get_device().stream)
         tl = self._torch
-        if type(tl) is TorchLaunch:  # the PyTorch hot path: every array is an MPS tensor
-            tensor_type = sys.modules["torch"].Tensor
-            for i in self._ptr_idx:
-                a = values[i]
-                if type(a) is not tensor_type or not a.is_mps:
-                    break
-                if a.untyped_storage().nbytes() > _INDEX_CHECK_BYTES:
-                    check_index_range(a, self.args[i].name)
-            else:
-                tl.launch(values, (grid[0] * self._tg[0], grid[1], grid[2]), self._tg)
-                return
+        # The PyTorch hot path: every array is an MPS tensor in storage small enough.
+        if type(tl) is TorchLaunch and tl.try_launch(values, grid[0], grid[1], grid[2]):
+            return
         stream = get_device().stream
         bufs, offsets = [], []
         host: list[Any] = []  # BufferArgs over host memory
@@ -445,7 +476,8 @@ class CompiledKernel:
                                     "compiles with MSL 4.0")  # fmt: skip
             if tl is None:
                 types = [None if a.is_pointer else a.dtype for a in self.args]
-                tl = make_torch_launch(self.msl, self.name, self.math_mode, types, checked=True)
+                tl = make_torch_launch(self.msl, self.name, self.math_mode, types,
+                                       checked=True, group=self._tg[0])  # fmt: skip
                 if isinstance(tl, TorchLaunch) and tl.max_threads < self._tg[0]:
                     tl = (f"its PyTorch pipeline allows {tl.max_threads} threads per "
                           f"threadgroup, and the kernel needs {self._tg[0]}")  # fmt: skip
@@ -456,8 +488,12 @@ class CompiledKernel:
             reason = f"torch.mps.compile_shader can't run it ({tl})"
         elif interop.KIND_TORCH in kinds:
             reason = "it mixes PyTorch tensors with other array types"
+        elif kinds == {interop.KIND_MLX} and mlx_lazy.enabled():
+            reason = self._launch_mlx_lazy(grid, values)
+            if reason is None:
+                return
         else:
-            reason = None  # MLX launches are synchronous by design
+            reason = None  # MLX launches are synchronous unless lazy_mlx(True) is set
         if reason is not None and not self._fallback_logged:
             self._fallback_logged = True
             log_fallback(self.name, reason)
@@ -465,10 +501,33 @@ class CompiledKernel:
             check_index_range(values[i], self.args[i].name)
             if self.args[i].written:
                 _check_writable(values[i], self.args[i].name)
+                mlx_lazy.consume(values[i])
         scalars = self._pack_scalars(values)
         launch_synced(get_device().stream, self.pipeline, self._plan,
                       [values[i] for i in self._ptr_idx], scalars, grid, self._tg,
                       self._extra_bufs)  # fmt: skip
+
+    def _launch_mlx_lazy(self, grid: tuple[int, int, int], values: Sequence[Any]) -> str | None:
+        """Adds a launch on MLX arrays to MLX's lazy graph.
+
+        Returns:
+            `None` if the launch is in MLX's graph, or the reason that it must take the
+            synchronized path.
+        """
+        for i in self._ptr_idx:
+            interop.mlx_np_dtype(values[i])  # refuses float64 arrays
+        mk = self._mlx
+        if mk is None:
+            mk = self._mlx = mlx_lazy.adapt(self)
+        if isinstance(mk, str):
+            return f"mx.fast.metal_kernel can't run it: {mk}"
+        reason = mlx_lazy.ineligible_reason(self, grid, values)
+        if reason is not None:
+            return f"the launch can't be lazy: {reason}"
+        reason = mlx_lazy.launch(mk, grid, values)
+        if reason is not None:
+            self._mlx = reason
+        return reason
 
     def timed_launch(self, grid: tuple[int, int, int], values: Sequence[Any]) -> float:
         """Runs one launch in its own command buffer and returns its GPU time in seconds."""
@@ -482,6 +541,8 @@ class CompiledKernel:
         if self._debug:
             self._prepare_debug(stream)
         bufs = [as_kernel_arg(values[i]) for i in self._ptr_idx]
+        if any(b.kind == interop.KIND_MLX for b in bufs):
+            interop.mlx_synchronize()
         scalars = self._pack_scalars(values)
         t0, t1 = stream.native.timed_run(
             self.pipeline, self._plan, [b.buffer for b in bufs] + self._extra_bufs,

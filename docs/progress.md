@@ -1566,7 +1566,8 @@ without it, except where the known gaps say otherwise.
 - 64-bit atomics other than `uint64` `max` and `min`, and integer `tl.dot`, aren't
   supported. Integer `tl.dot` is added in the [integer `tl.dot` and 64-bit atomics](#integer-tldot-and-64-bit-atomics) entry; Metal has no other
   64-bit atomics.
-- MLX arrays aren't evaluated lazily; launches synchronize.
+- MLX arrays aren't evaluated lazily; launches synchronize. The [interop pass after
+  M9](#interop-pass-after-m9) adds opt-in lazy launches.
 - The `dl_delete` finalization guard has no test.
 - A plain helper function that reads an attribute of an untracked object still gets a
   token that holds only for the process, because the frontend doesn't see inside the
@@ -1954,3 +1955,152 @@ run, from the three quietest of six runs (20-40 rounds each):
   bitcasts, and doesn't fold `tl.minimum` and `tl.maximum` of two zeros.
 - `multiple_of`, `max_contiguous`, vector loads, and 64-bit offsets remain open, as the
   bug-fix pass lists.
+
+## Interop pass after M9
+
+This pass cut the launch cost on PyTorch tensors, made results bit-identical across
+launch paths, added opt-in lazy MLX launches, and fixed a race with queued MLX work.
+
+### What changed
+
+**PyTorch launch cost.** A sustained `@enceladus.jit` launch on MPS tensors measured
+5.10 µs, above the 5 µs target. PyTorch runs the queued GPU work only after the host
+loop, so each launch costs its host time plus about 1.4 µs of GPU time; only host time
+could shrink. Profiling showed three costs that could go:
+
+- `JITFunction.run` read `ENCELADUS_INTERPRET` through `os.environ.get`, about 0.3 µs
+  per compiled launch on every path. It now uses the bound C method that
+  `ENCELADUS_DEBUG` already used.
+- The launch looped over the arguments to check them. `TorchLaunch` now generates a
+  `try_launch` function per kernel that checks the array arguments (exact
+  `torch.Tensor`, `is_mps`, and storage of at most 2 GB), converts scalars, and calls
+  `compile_shader` in one unrolled function. For 1-D grids it passes `threads` and
+  `group_size` as ints, which cost about 0.12 µs less than tuples. Arguments that fail
+  the precheck take the fully checked path, as before.
+- Ints bind without `arg_casts`, which cost about 0.09 µs. `compile_shader` binds an
+  int as the 8 bytes of an `int64`, and a narrower parameter reads the low bytes, which
+  hold the value's bit pattern at that width. The existing test that binds every ABI
+  scalar type at its extreme values covers this.
+
+`torch_spec_key` also skips `element_size()` at storage offset 0.
+
+**Math settings.** The native path compiled with fast fp32 math functions, and
+`compile_shader` compiles with precise ones and takes no compile options. MSL has no
+pragma for the function variant, and defining `__METAL_MATH_FP32_FUNCTIONS_FAST__` in
+the source has no effect, because Metal includes its standard library before the
+source. The native path now compiles with precise functions too
+(`raw.MATH_FP32_FUNCTIONS`), and the math mode still comes from the kernel. A kernel
+that calls every transcendental function gave results up to 18 ULP apart on NumPy and
+PyTorch inputs, and now gives bit-identical ones in both math modes.
+
+**Lazy MLX launches.** `enceladus.lazy_mlx(True)` adds eligible launches on MLX arrays to
+MLX's graph through `mx.fast.metal_kernel` (`runtime/mlx_lazy.py`):
+
+- MLX kernels are functional: MLX allocates each output. A launch is lazy only when
+  every array that the kernel writes is a *fresh output*, an array from
+  `enceladus.new_empty` or `enceladus.new_zeros` (lazy `mx.zeros` in this mode) that no
+  launch has written. The kernel writes a new array with `init_value=0`, so it sees
+  what the fresh output holds, and `out[...] = result` rebinds the argument without a
+  copy. A registry of weak references tracks fresh outputs; eager writes,
+  `enceladus.Tensor` views, and lazy writes remove an array from it.
+- In-place writes, aliased outputs, empty arrays, kernels that print or assert, and
+  grids too large for MLX's `int` grid keep the synchronized path, which logs the reason
+  once per kernel.
+- The adapter reuses the generated MSL. The prelude becomes the `header`, inside
+  `namespace enc_lazy`, and the kernel body becomes the `source`, after a prologue that
+  binds the kernel's thread-position parameters to MLX's attributes of the same name.
+  Threadgroup memory stays in the body, where MSL allows it. Scalars become MLX scalar
+  inputs (`bool`, `int`, `float`) or 0-d `int64` and `uint64` arrays.
+- MLX compiles with fast math functions. Using-declarations of the float-only
+  `metal::precise` functions, in the namespace and in the body, select the precise
+  variants, so lazy results match the other paths bit for bit. `abs`, `min`, `max`, and
+  `clamp` aren't declared, because a using-declaration would hide their integer
+  overloads; generated code uses `fabs`, `fmin`, and `fmax` for floats.
+- MLX caches kernels by name, so the name includes a hash of the MSL. MLX compiles a
+  kernel only when it evaluates it, so the first launch of each kernel evaluates its
+  results; a compile error then selects the synchronized path instead of surfacing at
+  a later `mx.eval`.
+- In lazy mode, specialization doesn't evaluate MLX arguments: only fresh outputs count
+  as 16-byte aligned. `element_strides` of a fresh output doesn't evaluate it.
+
+**Queued MLX readers.** `mx.eval(a)` waits only for the work that computes `a`. A
+synchronized launch that wrote `a` on Enceladus's queue raced with MLX work queued
+earlier that reads `a`, such as work from `mx.async_eval`. Synchronized launches, timed
+launches, and `as_tensor` on MLX arrays now call `mx.synchronize()` after evaluating the
+arguments. MLX exposes no wait for the readers of one array.
+
+### Benchmarks
+
+`benchmarks/bench_dispatch.py` method, 5 runs of 10,000 launches each, with baseline
+(`f04f800`) and new runs interleaved five times while other agents used the machine.
+Minimum and median are over the five runs' minimums and medians:
+
+| Launch | Baseline min | Baseline median | New min | New median |
+|---|---|---|---|---|
+| `@enceladus.jit` on PyTorch MPS tensors, sustained | 5.18-5.30 µs | 5.36 µs | 4.44-4.59 µs | 4.57 µs |
+| `@enceladus.jit` on `enceladus.Tensor`, sustained | 3.53-3.61 µs | 3.59 µs | 3.02-3.23 µs | 3.17 µs |
+
+The same session measured the other rows once, with `bench_dispatch.py`:
+
+| Launch | Min | Median |
+|---|---|---|
+| `torch.mps.compile_shader` call made directly, sustained | 2.26 µs | 2.33 µs |
+| `@enceladus.jit` on MLX arrays, sync round trip | 120 µs | 161 µs |
+| `@enceladus.jit` on MLX arrays, lazy, chain of 1,000 dependent launches | 12.8 µs | 13.4 µs |
+| MLX `x + y`, chain of 1,000 | 1.67 µs | 1.75 µs |
+
+- A lazy launch costs about 9.5 µs of host time: about 1.2 µs for `new_empty`, 1.6 µs for
+  the specialization lookup, 1.3 µs for the `mx.fast.metal_kernel` call, and 1 µs for
+  the eligibility check. The rest is the shared launch path.
+- The `mx.synchronize()` call adds about 7 µs to a synchronized MLX launch: 125-133 µs
+  median before, 133 µs after, in four interleaved runs.
+- Precise math functions, measured on a compute-bound kernel that applies a function 64
+  times per element over 4M elements: `tl.exp` takes 1.7 times as long as with fast
+  functions, `tl.log` 2.4, `tl.rsqrt` 3.0, `tl.sqrt` 3.4, and `tl.tanh` 1.4. `tl.exp2`
+  compiles to the same code. Softmax, LayerNorm, and RMSNorm at 4096 x 4096 didn't
+  change (interleaved runs, within noise), and attention uses `tl.exp2`.
+
+### Tests
+
+- `test_math_is_bit_identical_across_launch_paths`: a kernel that calls every
+  transcendental function, in both math modes, on the PyTorch path and the lazy MLX
+  path against the native path. It fails with fast functions on the native path, or
+  without the using-declarations on the MLX path.
+- The framework example test runs every example on `mlx-lazy` too, with and without
+  offset views, and asserts that no launch takes the synchronized path.
+- `test_lazy_mlx_writes_only_fresh_outputs`: an accumulating kernel runs lazily into a
+  fresh output, then in place and aliased on the synchronized path, and logs once. It
+  fails if a written array counts as fresh after a launch.
+- `test_lazy_mlx_falls_back_when_mlx_cant_compile`: a forced MSL error on the first lazy
+  launch runs the kernel eagerly, with correct results and one warning.
+- `test_mlx_write_waits_for_queued_mlx_readers`: 33 queued elementwise ops read `a`, a
+  kernel overwrites `a`, and the ops' result must match. It failed in 5 of 5 runs
+  without `mx.synchronize()`.
+
+### Deviations from the plan
+
+- The native path compiles with precise math functions, which slows compute-bound
+  `tl.exp`, `tl.log`, `tl.sqrt`, `tl.rsqrt`, and `tl.tanh` (see the benchmarks). The
+  comment on `MATH_FUNCS` in `compiler/codegen/msl.py`, which says the fast `exp` and
+  `log` remain, is stale; the compiler's owner should update it.
+- Lazy MLX launches are opt-in, and only for fresh outputs, because MLX can't donate an
+  existing array's buffer to a custom kernel: `init_value` fills outputs with a constant
+  only, so a kernel that updates an array in place can't see its old contents.
+- `jit.py` changed in two places outside dependency hashing: `run` reads
+  `ENCELADUS_INTERPRET` through `core.env_lookup`, and `_spec_key` has an MLX fast path.
+  `enceladus/__init__.py` exports `lazy_mlx`.
+
+### Known gaps
+
+- Lazy launches don't check that a strided MLX view spans fewer than 2^31 elements,
+  because MLX reports strides only for evaluated arrays; they check the element count.
+- A fresh output that you modify yourself, for example with `out[0] = 1`, still counts
+  as fresh, and a lazy launch ignores its contents. Enceladus can't detect the change.
+- Lazy launches fill each output with zeros first, one extra dispatch that writes the
+  whole output.
+- In a chain, a lazy launch costs about 7.5 times as much as an MLX op, mostly host
+  time.
+- `mx.synchronize()` covers MLX's default stream only; readers on other streams can
+  still race.
+- Raw `metal_kernel` launches on PyTorch tensors still rebuild the argument mask on each
+  launch; they weren't measured.
