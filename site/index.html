@@ -4,6 +4,10 @@
       <div class="eyebrow"><span>Apple silicon</span><span>Metal</span><span>Python 3.11+</span></div>
       <h1>Triton-style GPU kernels, <em>compiled for your Mac.</em></h1>
       <p class="lede">Enceladus compiles Python tile programs to Metal Shading Language while your program runs. You don't need Xcode or the Metal toolchain. Kernels accept NumPy arrays, PyTorch <code>mps</code> tensors, and MLX arrays.</p>
+      <div class="cta">
+        <a class="btn primary" href="/docs/quickstart/">Get started</a>
+        <a class="btn" href="/examples/">Browse examples</a>
+      </div>
       <div class="install">
         <code id="install-cmd">uv add enceladus</code>
         <button class="copy" type="button" data-copy="#install-cmd">Copy</button>
@@ -86,36 +90,6 @@ np.testing.assert_allclose(out, x + y)</code></pre>
   </div>
 </section>
 
-<main>
-<section class="doc prose" id="overview">
-  <h2>Write the tile, not the thread</h2>
-  <p>You write an Enceladus kernel as a Python function that operates on <em>tiles</em>: blocks of values that one program computes on at once, like small NumPy arrays. The compiler decides which thread holds which element, lowers <code>tl.dot</code> to the GPU's SIMD-group matrix instructions, and hands the resulting MSL to Metal's <code>newLibraryWithSource</code>.</p>
-  <p>If you know Triton, you already know most of Enceladus. The decorator, the launch syntax, <code>tl.constexpr</code>, masks, and the autotuner work the same way.</p>
-  <div class="features">
-    <div class="feature"><span class="k">no toolchain</span><h3>Compiles at run time</h3><p>Metal compiles the generated MSL in your process. Results are cached on disk, so later runs load in under 10 ms.</p></div>
-    <div class="feature"><span class="k">interop</span><h3>Bring your arrays</h3><p>Pass NumPy arrays, PyTorch <code>mps</code> tensors, MLX arrays, or <code>enceladus.Tensor</code> objects directly to a kernel.</p></div>
-    <div class="feature"><span class="k">ENCELADUS_INTERPRET=1</span><h3>Debug on the CPU</h3><p>The NumPy interpreter runs the same kernel with <code>print()</code>, <code>pdb</code>, and bounds-checked loads.</p></div>
-    <div class="feature"><span class="k">CompilationError</span><h3>No silent miscompiles</h3><p>Every unsupported construct is refused with the file, line, column, and a suggested fix.</p></div>
-    <div class="feature"><span class="k">tl.dot</span><h3>Two matmul backends</h3><p>Use <code>simdgroup_matrix</code> on every Apple GPU, or Metal 4 <code>matmul2d</code> for eligible loops.</p></div>
-    <div class="feature"><span class="k">@enceladus.autotune</span><h3>Tuned per GPU</h3><p>The autotuner compiles candidates in parallel, times them with GPU timestamps, and saves the winner.</p></div>
-  </div>
-</section>
-
-<section class="doc prose" id="explore">
-  <h2>Explore the docs</h2>
-  <!-- @page-cards -->
-</section>
-
-<section class="doc prose" id="limits">
-  <h2>Project status</h2>
-  <p>Enceladus is alpha software. Keep the following in mind:</p>
-  <ul class="tight">
-    <li>All published performance numbers come from one M4 Pro. Wheels target macOS 15 but have been tested only on later releases.</li>
-    <li>No wheel is published for Python 3.14, so 3.14 builds from source.</li>
-    <li>Without <code>ENCELADUS_VERIFY=1</code>, the interpreter accepts some constructs that the compiler refuses, such as <code>while</code> and a <code>tl.dot</code> whose K isn't a multiple of 8.</li>
-    <li>MLX launches are always synchronous, at about 100 µs each.</li>
-    <li><code>atomic_add</code> doesn't support <code>float16</code> or <code>bfloat16</code>.</li>
-  </ul>
-  <p>To report a problem, <a href="https://github.com/kashifulhaque/enceladus/issues">open an issue on GitHub</a>.</p>
-</section>
+<main class="landing">
+  <!-- @sections -->
 </main>

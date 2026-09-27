@@ -1,0 +1,60 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Flash attention</h1>
+  <p class="lede">The flash attention forward pass, <code>softmax(q @ kᵀ * sm_scale) @ v</code>, with an optional causal mask. An online softmax means the full attention matrix never exists in memory.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>attention(q, k, v, causal=False)</code> takes contiguous queries, keys, and values with the same shape, <code>(batch, heads, seq_len, head_dim)</code>, and returns the attention output with that shape. The head dimension must be 16, 32, 64, or 128. <code>sm_scale</code> defaults to <code>1 / sqrt(head_dim)</code>. With <code>causal=True</code>, query <code>i</code> attends only to keys <code>0</code> to <code>i</code>.</p>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel:</p>
+  <!-- @source examples/08_flash_attention.py#L30-L70 -->
+  <p>The following code shows the host wrapper:</p>
+  <!-- @source examples/08_flash_attention.py#L84-L107 -->
+
+  <h2>How it works</h2>
+  <h3>Grid and descriptors</h3>
+  <p>The grid is <code>(cdiv(seq_len, block_m), batch * heads)</code>. Each program computes <code>BLOCK_M</code> query rows of one (batch, head) pair. <code>tl.program_id(1)</code> selects the pair, and the kernel offsets every base pointer by <code>stride_h = seq_len * head_dim</code>. Four tensor descriptors then cover that pair's <code>(N_CTX, HEAD_DIM)</code> slices of <code>q</code>, <code>k</code>, <code>v</code>, and the output.</p>
+
+  <h3>Online softmax</h3>
+  <p>The kernel loops over the keys in blocks of <code>BLOCK_N</code>. It keeps a running row maximum <code>m_i</code>, a running row sum <code>l_i</code>, and a <code>float32</code> output accumulator <code>acc</code>. For each block, it does the following:</p>
+  <ol class="tight" style="padding-left:22px;color:var(--ink-2)">
+    <li>Compute the scores with <code>tl.dot(q, tl.trans(k_block))</code>, scaled by <code>qk_scale</code>.</li>
+    <li>Update the row maximum, and compute <code>p = tl.exp2(qk - m_ij[:, None])</code>.</li>
+    <li>Rescale <code>l_i</code> and <code>acc</code> by <code>alpha = tl.exp2(m_i - m_ij)</code>, the change in the maximum, and then add this block's contribution.</li>
+  </ol>
+  <p>After the loop, the kernel divides <code>acc</code> by <code>l_i</code> and stores it. <code>qk_scale</code> folds <code>log2(e)</code> into <code>sm_scale</code>, so the kernel can use <code>tl.exp2</code> instead of <code>tl.exp</code>.</p>
+
+  <h3>Masks</h3>
+  <ul class="tight">
+    <li>The descriptor load zero-fills keys past <code>N_CTX</code>, which would give scores of 0. <code>mask = cols[None, :] &lt; N_CTX</code> and <code>tl.where</code> replace those scores with <code>-inf</code>, so they get zero weight.</li>
+    <li>With <code>CAUSAL</code>, the mask also requires <code>offs_m[:, None] &gt;= cols[None, :]</code>, and the loop stops at <code>hi = min((start_m + 1) * BLOCK_M, N_CTX)</code>, which skips key blocks that lie entirely above the diagonal.</li>
+    <li><code>CAUSAL</code> is a constexpr, so Enceladus compiles a separate kernel for each value, and the untaken branch isn't compiled.</li>
+  </ul>
+
+  <h3>Registers and SIMD groups</h3>
+  <ul class="tight">
+    <li><code>q</code> stays in registers across the loop, and <code>tl.trans(k_desc.load(...))</code> loads <code>k</code> straight from device memory with transposed fragment loads.</li>
+    <li>The launch passes <code>dot_warps=(num_warps, 1)</code>, so each SIMD group owns whole rows, <code>block_m / num_warps</code> of them. The row maximum and row sum then reduce inside each SIMD group.</li>
+    <li><code>p.to(q_desc.dtype)</code> feeds the second <code>tl.dot</code> directly from the score registers.</li>
+  </ul>
+
+  <h2>Autotuning</h2>
+  <p>The following code defines <code>attention_tuned</code>, which returns the same result as <code>attention</code> with the fastest configuration for the shape:</p>
+  <!-- @source examples/08_flash_attention.py#L110-L131 -->
+  <p>The candidates are the <code>attention_configs</code> lists for head dimensions 64 and 128. <code>_prune</code> keeps only the configurations that <code>attention_configs</code> lists for the actual dtype and head dimension. The tuning key is <code>N_CTX</code>, <code>HEAD_DIM</code>, and <code>CAUSAL</code>. The demo doesn't call <code>attention_tuned</code>.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/08_flash_attention.py</code></pre></div>
+  <p>The demo runs <code>attention</code> on <code>float16</code> inputs of shape <code>(2, 3, 100, 64)</code>, without and with the causal mask. It compares each result with a NumPy reference computed in <code>float64</code>. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error, causal=False: 4.88e-04
+max abs error, causal=True: 9.77e-04</code></pre></div>
+
+  <h2>Full source</h2>
+  <!-- @source examples/08_flash_attention.py -->
+</section>
+</main>

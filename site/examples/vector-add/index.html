@@ -1,0 +1,36 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Vector add</h1>
+  <p class="lede">The smallest complete kernel: <code>out = x + y</code>. It shows the program ID, block offsets, and masks that every other example builds on.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>add(x, y)</code> returns the elementwise sum of two contiguous arrays with the same shape and dtype. It accepts NumPy arrays, <code>enceladus.Tensor</code> objects, PyTorch tensors on the <code>mps</code> device, and MLX arrays. <code>enceladus.new_empty(x)</code> allocates the output with the same framework and device as <code>x</code>, so the result is the same kind of array that you pass in.</p>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel and its host wrapper:</p>
+  <!-- @source examples/01_vector_add.py#L15-L30 -->
+
+  <h2>How it works</h2>
+  <ul class="tight">
+    <li>The grid is one-dimensional, with <code>cdiv(n, block)</code> programs. Each program handles <code>BLOCK</code> consecutive elements, 1,024 by default.</li>
+    <li><code>tl.program_id(0)</code> returns the program's index, and <code>pid * BLOCK + tl.arange(0, BLOCK)</code> is the tile of element offsets that the program covers.</li>
+    <li><code>mask = offs &lt; n</code> keeps the last program in bounds. In the demo, <code>n</code> is 100,003, so the grid has 98 programs and the last one covers only 675 valid elements.</li>
+    <li>The wrapper flattens the array: <code>n</code> is the product of the shape, so any shape works as long as the array is contiguous.</li>
+    <li><code>BLOCK: tl.constexpr</code> makes the block size a compile-time constant. Enceladus compiles one version of the kernel for each value you pass.</li>
+  </ul>
+  <p>For more information about programs and tiles, see <a href="/docs/programming-model/">Programming model</a>.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/01_vector_add.py</code></pre></div>
+  <p>The demo adds two vectors of 100,003 random <code>float32</code> values and compares the result with NumPy. If PyTorch is installed and the <code>mps</code> device is available, it repeats the add with PyTorch tensors and compares the result with <code>tx + ty</code>. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error: 0.0
+max abs error, torch: 0.0</code></pre></div>
+
+  <h2>Full source</h2>
+  <!-- @source examples/01_vector_add.py -->
+</section>
+</main>

@@ -1,0 +1,27 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Reference</p>
+  <h1>Environment variables</h1>
+  <p class="lede">The environment variables that Enceladus reads. It reads most of them each time it compiles or launches a kernel, so you can also set them through <code>os.environ</code> in your program.</p>
+</header>
+
+<section class="doc prose">
+  <h2>Variables</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>ENCELADUS_INTERPRET=1</code></td><td>Runs kernels in the NumPy interpreter on the CPU.</td></tr>
+      <tr><td><code>ENCELADUS_DEBUG=1</code></td><td>Compiles <code>tl.device_assert</code> checks. It's part of the specialization, so changing it recompiles.</td></tr>
+      <tr><td><code>ENCELADUS_DUMP=1</code></td><td>Writes each compiled kernel's IR, MSL, and <code>meta.json</code> to its cache entry and prints the path.</td></tr>
+      <tr><td><code>ENCELADUS_CACHE_DIR</code></td><td>Moves the disk cache from <code>~/.cache/enceladus</code>.</td></tr>
+      <tr><td><code>ENCELADUS_ALWAYS_COMPILE=1</code></td><td>Ignores the disk cache and saved autotuning results.</td></tr>
+      <tr><td><code>ENCELADUS_OVERRIDE_DIR</code></td><td>Loads <code>DIR/KERNEL_NAME.metal</code> instead of the generated MSL.</td></tr>
+      <tr><td><code>ENCELADUS_VERIFY=1</code></td><td>Verifies the IR after every compiler pass, including for interpreted launches.</td></tr>
+      <tr><td><code>ENCELADUS_PRINT_AUTOTUNING=1</code></td><td>Prints each autotuning winner as a pasteable <code>enceladus.Config(...)</code>.</td></tr>
+      <tr><td><code>ENCELADUS_FLUSH_EVERY</code></td><td>Sets the number of launches per command buffer. The default is 64.</td></tr>
+      <tr><td><code>MTL_CAPTURE_ENABLED=1</code></td><td>A Metal variable that <code>enceladus.capture</code> needs at process start.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Enceladus reads <code>ENCELADUS_FLUSH_EVERY</code> once, when it creates the device. Metal reads <code>MTL_CAPTURE_ENABLED</code> only at process start, so set it in the shell. For how to use these variables while you debug, see <a href="/docs/debugging/">Debugging</a>.</p>
+</section>
+</main>

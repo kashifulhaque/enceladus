@@ -1,0 +1,15 @@
+# The guides moved under /docs/ when the site was split into sections.
+/quickstart    /docs/quickstart/    301
+/quickstart/   /docs/quickstart/    301
+/programming-model    /docs/programming-model/    301
+/programming-model/   /docs/programming-model/    301
+/memory    /docs/memory/    301
+/memory/   /docs/memory/    301
+/debugging    /docs/debugging/    301
+/debugging/   /docs/debugging/    301
+/interop    /docs/interop/    301
+/interop/   /docs/interop/    301
+/performance    /docs/performance/    301
+/performance/   /docs/performance/    301
+/porting    /docs/porting/    301
+/porting/   /docs/porting/    301

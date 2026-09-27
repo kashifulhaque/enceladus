@@ -1,58 +1,22 @@
 <main>
 <header class="page-head prose">
   <p class="sec-label">Reference</p>
-  <h1>Language reference</h1>
-  <p class="lede">Every builtin in <code>enceladus.language</code>, imported as <code>tl</code>, and the host API in <code>enceladus</code>. Tile shapes must be compile-time powers of two. Most math and shape functions are also tile methods, for example <code>x.exp()</code>, <code>x.sum(axis=0)</code>, <code>x.to(tl.float16)</code>, and <code>x.T</code>.</p>
+  <h1>Language builtins</h1>
+  <p class="lede">Every builtin in <code>enceladus.language</code>, imported as <code>tl</code>. Tile shapes must be compile-time powers of two. Most math and shape functions are also tile methods, for example <code>x.exp()</code>, <code>x.sum(axis=0)</code>, <code>x.to(tl.float16)</code>, and <code>x.T</code>.</p>
 </header>
 
-<section class="doc" id="reference">
-  <div class="prose"><h2>Builtins</h2></div>
+<section class="doc prose reference">
   <div class="refbar">
     <div class="search">
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      <input id="ref-search" type="search" placeholder="Filter, for example dot, atomic, or mask" aria-label="Filter the language reference" autocomplete="off">
-    </div>
-    <div class="seg scope" role="group" aria-label="Namespace">
-      <button type="button" aria-pressed="true" data-scope="all">All</button>
-      <button type="button" aria-pressed="false" data-scope="tl">tl</button>
-      <button type="button" aria-pressed="false" data-scope="host">enceladus</button>
+      <input id="ref-search" type="search" placeholder="Filter, for example dot, atomic, or mask" aria-label="Filter this page" autocomplete="off">
     </div>
     <span class="refcount" id="ref-count"></span>
   </div>
-  <div id="ref-list" class="prose"></div>
-
-  <div class="prose">
-    <h2>Data types</h2>
-    <p>The following table lists the element types. Pass them as <code>tl.float16</code> in a kernel, or as the string <code>"float16"</code> to the host allocators.</p>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Kind</th><th>Types</th><th>Short names</th></tr></thead>
-      <tbody>
-        <tr><td>Boolean</td><td><code>tl.int1</code></td><td><code>i1</code>, <code>bool</code></td></tr>
-        <tr><td>Signed integer</td><td><code>tl.int8</code>, <code>tl.int16</code>, <code>tl.int32</code>, <code>tl.int64</code></td><td><code>i8</code>, <code>i16</code>, <code>i32</code>, <code>i64</code></td></tr>
-        <tr><td>Unsigned integer</td><td><code>tl.uint8</code>, <code>tl.uint16</code>, <code>tl.uint32</code>, <code>tl.uint64</code></td><td><code>u8</code>, <code>u16</code>, <code>u32</code>, <code>u64</code></td></tr>
-        <tr><td>Floating point</td><td><code>tl.float16</code>, <code>tl.bfloat16</code>, <code>tl.float32</code></td><td><code>fp16</code>, <code>bf16</code>, <code>fp32</code></td></tr>
-      </tbody>
-    </table></div>
+  <div id="ref-list">
+<!-- @reference tl -->
   </div>
-</section>
-
-<section class="doc prose" id="env">
-  <h2>Environment variables</h2>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
-    <tbody>
-      <tr><td><code>ENCELADUS_INTERPRET=1</code></td><td>Runs kernels in the NumPy interpreter on the CPU.</td></tr>
-      <tr><td><code>ENCELADUS_DEBUG=1</code></td><td>Compiles <code>tl.device_assert</code> checks. It's part of the specialization, so changing it recompiles.</td></tr>
-      <tr><td><code>ENCELADUS_DUMP=1</code></td><td>Writes each compiled kernel's IR, MSL, and <code>meta.json</code> to its cache entry and prints the path.</td></tr>
-      <tr><td><code>ENCELADUS_CACHE_DIR</code></td><td>Moves the disk cache from <code>~/.cache/enceladus</code>.</td></tr>
-      <tr><td><code>ENCELADUS_ALWAYS_COMPILE=1</code></td><td>Ignores the disk cache and saved autotuning results.</td></tr>
-      <tr><td><code>ENCELADUS_OVERRIDE_DIR</code></td><td>Loads <code>DIR/KERNEL_NAME.metal</code> instead of the generated MSL.</td></tr>
-      <tr><td><code>ENCELADUS_VERIFY=1</code></td><td>Verifies the IR after every compiler pass, including for interpreted launches.</td></tr>
-      <tr><td><code>ENCELADUS_PRINT_AUTOTUNING=1</code></td><td>Prints each autotuning winner as a pasteable <code>enceladus.Config(...)</code>.</td></tr>
-      <tr><td><code>ENCELADUS_FLUSH_EVERY</code></td><td>Sets the number of launches per command buffer. The default is 64.</td></tr>
-      <tr><td><code>MTL_CAPTURE_ENABLED=1</code></td><td>A Metal variable that <code>enceladus.capture</code> needs at process start.</td></tr>
-    </tbody>
-  </table></div>
+  <div class="empty" id="ref-empty" hidden>No builtins match that filter. Try a shorter term, such as <code>load</code>.</div>
 </section>
 </main>
 <script type="module" src="/src/reference.js"></script>

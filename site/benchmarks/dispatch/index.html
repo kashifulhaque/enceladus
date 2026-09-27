@@ -1,0 +1,66 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Benchmarks</p>
+  <h1>Dispatch overhead</h1>
+  <p class="lede">The host cost of launching a kernel through each Enceladus path, next to the native dispatch floor and PyTorch's own launch paths.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it measures</h2>
+  <p><code>bench_dispatch</code> launches a 1,024-element <code>float32</code> vector add, which does almost no GPU work, so the time per launch is launch overhead. It measures two patterns with the host's wall clock:</p>
+  <ul class="tight">
+    <li><strong>Sustained:</strong> 10,000 back-to-back launches followed by one synchronization, repeated 5 times. The result is the time per launch. The stream commits a command buffer every 64 dispatches.</li>
+    <li><strong>Sync round trip:</strong> 300 launches that each wait for the GPU before the next one starts.</li>
+  </ul>
+  <p>The script compares the following launch paths:</p>
+  <ul class="tight">
+    <li>A raw <code>enceladus.metal_kernel</code> with handwritten MSL.</li>
+    <li>The native <code>Stream.dispatch</code> call with prebuilt arguments, which is the floor for any Python launch.</li>
+    <li>An <code>@enceladus.jit</code> kernel, which also binds arguments, computes the specialization key, and packs arguments.</li>
+    <li>The same <code>@enceladus.jit</code> kernel on PyTorch MPS tensors and on MLX arrays.</li>
+    <li>PyTorch floors: a <code>torch.mps.compile_shader</code> kernel called directly, and <code>torch.add(out=)</code>.</li>
+  </ul>
+  <p>Before measuring, the script warms up the GPU clocks with 20,000 launches.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Results</h2>
+  <p>The following table lists the minimum and median time per launch, in microseconds:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Launch path</th><th>Pattern</th><th class="n">Min (µs)</th><th class="n">Median (µs)</th></tr></thead>
+    <tbody>
+      <tr><td>Native <code>Stream.dispatch</code></td><td>Sustained</td><td class="n">1.00</td><td class="n">1.00</td></tr>
+      <tr><td>Raw <code>metal_kernel</code></td><td>Sustained</td><td class="n">1.04</td><td class="n">1.06</td></tr>
+      <tr><td><code>@enceladus.jit</code> on <code>enceladus.Tensor</code></td><td>Sustained</td><td class="n">3.41</td><td class="n">3.49</td></tr>
+      <tr><td><code>@enceladus.jit</code> on PyTorch MPS</td><td>Sustained</td><td class="n">5.10</td><td class="n">5.17</td></tr>
+      <tr><td><code>torch.mps.compile_shader</code> call</td><td>Sustained</td><td class="n">2.23</td><td class="n">2.25</td></tr>
+      <tr><td><code>torch.add(out=)</code></td><td>Sustained</td><td class="n">1.98</td><td class="n">2.05</td></tr>
+      <tr><td>Raw <code>metal_kernel</code></td><td>Sync round trip</td><td class="n">70.67</td><td class="n">84.58</td></tr>
+      <tr><td><code>@enceladus.jit</code> on PyTorch MPS</td><td>Sync round trip</td><td class="n">78.42</td><td class="n">112.06</td></tr>
+      <tr><td><code>@enceladus.jit</code> on MLX arrays</td><td>Sync round trip</td><td class="n">99.83</td><td class="n">132.25</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="doc prose">
+  <h2>Reading the results</h2>
+  <ul class="tight">
+    <li><strong>The GPU sets the floor.</strong> The native dispatch call and the raw <code>metal_kernel</code> launch both cost about 1 µs, which is the GPU's cost for a dependent dispatch. Python adds almost nothing on the raw path.</li>
+    <li><strong><code>@enceladus.jit</code> adds about 2.4 µs.</strong> Binding, the specialization key, and argument packing bring a launch to 3.41 µs, which is still well under a synchronized round trip.</li>
+    <li><strong>The PyTorch path is host-bound.</strong> A launch on MPS tensors costs 5.10 µs, against 2.23 µs for the same MSL through <code>compile_shader</code> called directly, and 1.98 µs for a built-in <code>torch.add</code>.</li>
+    <li><strong>Synchronization dominates small kernels.</strong> A round trip costs 70-100 µs, 20 to 30 times a sustained <code>@enceladus.jit</code> launch. MLX launches are synchronous, so every launch on MLX arrays pays this cost.</li>
+  </ul>
+  <p>To keep launches asynchronous, allocate with <code>enceladus.empty</code>, <code>zeros</code>, or <code>randn</code>, and synchronize only when you need the result. For more information, see <a href="/docs/performance/">Performance</a> and <a href="/docs/interop/">Framework interop</a>.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Raw output</h2>
+  <p>The following output is the <code>bench_dispatch</code> section of the results file:</p>
+  <!-- @results bench_dispatch -->
+</section>
+
+<section class="doc prose">
+  <h2>Source</h2>
+  <!-- @source benchmarks/bench_dispatch.py -->
+</section>
+</main>

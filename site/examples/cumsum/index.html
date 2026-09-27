@@ -1,0 +1,34 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Cumulative sum</h1>
+  <p class="lede">A row-wise cumulative sum with <code>tl.cumsum</code>. Each program scans a 2D tile that covers several whole rows.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>cumsum(x)</code> returns the inclusive cumulative sum of each row of a 2D NumPy array. With <code>reverse=True</code>, it returns the suffix sum instead: each element is the sum of itself and every later element in its row. Integers narrower than 32 bits sum in <code>int32</code>, as in <code>tl.cumsum</code>.</p>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel and its host wrapper:</p>
+  <!-- @source examples/10_cumsum.py#L15-L41 -->
+
+  <h2>How it works</h2>
+  <ul class="tight">
+    <li>Each program loads a <code>BLOCK_M</code> by <code>BLOCK_N</code> tile. <code>BLOCK_N</code> is <code>next_power_of_2(n)</code>, so the tile covers <code>BLOCK_M</code> whole rows.</li>
+    <li>The wrapper sets <code>BLOCK_M</code> to <code>max(1, min(16, 4096 // BLOCK_N))</code>, which keeps the tile at 4,096 elements or fewer. For the demo's 1,000 columns, <code>BLOCK_N</code> is 1,024 and <code>BLOCK_M</code> is 4, so the grid has 75 programs for 300 rows.</li>
+    <li>The 2D mask guards both the last rows and the padding columns.</li>
+    <li><code>tl.cumsum(x, axis=1, reverse=REVERSE)</code> scans along the rows. <code>REVERSE</code> is a constexpr, so the prefix and suffix sums compile to separate kernels.</li>
+  </ul>
+  <p>For the scan builtins, see <a href="/reference/#scans">Scans</a> in the language reference.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/10_cumsum.py</code></pre></div>
+  <p>The demo computes the prefix sum of a 300 by 1,000 <code>float32</code> array and compares it with <code>np.cumsum</code> in <code>float32</code>. Rounding differs between the GPU scan and NumPy's sequential sum, so the error is small but not zero. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error: 8.773804e-05</code></pre></div>
+
+  <h2>Full source</h2>
+  <!-- @source examples/10_cumsum.py -->
+</section>
+</main>

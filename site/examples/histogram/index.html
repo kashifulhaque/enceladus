@@ -1,0 +1,35 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Histogram</h1>
+  <p class="lede">A histogram of floating-point data, built with <code>tl.atomic_add</code>. Every program adds its counts to one shared histogram in device memory.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>histogram(x, num_bins, lo, hi)</code> counts the values of a NumPy array in <code>num_bins</code> equal bins over <code>[lo, hi)</code>, and returns the counts as <code>int32</code>. It skips values outside that range.</p>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel and its host wrapper:</p>
+  <!-- @source examples/09_histogram.py#L15-L33 -->
+
+  <h2>How it works</h2>
+  <ul class="tight">
+    <li>The grid has <code>cdiv(n, block)</code> programs, and each one bins <code>BLOCK</code> values.</li>
+    <li>The wrapper passes <code>inv_width = num_bins / (hi - lo)</code>, so the kernel computes each bin with a multiply instead of a divide: <code>tl.floor((x - lo) * inv_width)</code>, converted to <code>int32</code>.</li>
+    <li>The mask <code>ok</code> combines the bounds check, <code>offs &lt; n</code>, with the bin range, <code>0 &lt;= b &lt; NUM_BINS</code>. Out-of-range values don't touch the histogram.</li>
+    <li><code>tl.atomic_add(hist_ptr + b, 1, mask=ok)</code> adds one count per value. Many programs update the same bins at once, and the atomic add keeps the counts exact.</li>
+    <li>The wrapper starts from <code>np.zeros</code>, because the kernel only adds to the histogram.</li>
+  </ul>
+  <p>Enceladus atomics use relaxed memory ordering, and <code>float16</code> and <code>bfloat16</code> <code>atomic_add</code> isn't supported. For details, see <a href="/reference/#atomics">Atomics</a> in the language reference.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/09_histogram.py</code></pre></div>
+  <p>The demo bins 1,000,000 normally distributed <code>float32</code> values into 64 bins over <code>[-4, 4)</code>. The NumPy reference bins in <code>float32</code> with the same formula, so the counts must match exactly. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">counts match: True</code></pre></div>
+
+  <h2>Full source</h2>
+  <!-- @source examples/09_histogram.py -->
+</section>
+</main>

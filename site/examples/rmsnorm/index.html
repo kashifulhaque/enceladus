@@ -1,0 +1,35 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>RMSNorm</h1>
+  <p class="lede">The RMSNorm forward pass, <code>x * rsqrt(mean(x²) + eps) * w</code>, with one program per row and the whole row in one tile.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>rmsnorm(x, w, eps=1e-6)</code> takes a 2D NumPy array <code>x</code> and a weight <code>w</code> with one value per column. It divides each row by its root mean square and multiplies by <code>w</code>, and returns the result in the input dtype.</p>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel and its host wrapper:</p>
+  <!-- @source examples/06_rmsnorm.py#L12-L30 -->
+
+  <h2>How it works</h2>
+  <ul class="tight">
+    <li>The grid is <code>(m,)</code>, one program per row, and <code>BLOCK</code> is <code>next_power_of_2(n)</code>, so one tile holds the whole row, as in the <a href="/examples/softmax/">row softmax</a>.</li>
+    <li>Masked lanes load 0, so they add nothing to <code>tl.sum(x * x, axis=0)</code>. The kernel divides by <code>n_cols</code>, not <code>BLOCK</code>, to get the mean.</li>
+    <li><code>tl.rsqrt</code> computes the reciprocal square root in one call.</li>
+    <li>The wrapper passes the input and output row strides in elements, computed from the NumPy byte strides.</li>
+  </ul>
+  <p>Compare this kernel with the <a href="/examples/layernorm/">LayerNorm</a> example, which loops over the row in blocks instead of holding it in one tile.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/06_rmsnorm.py</code></pre></div>
+  <p>The demo normalizes a 32 by 1,000 <code>float32</code> array and compares the result with a NumPy reference computed in <code>float64</code>. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error: 9.536743e-07</code></pre></div>
+  <p>The file's docstring runs the demo in the CPU interpreter, with <code>ENCELADUS_INTERPRET=1</code>. Both ways work, and they give errors of the same size. For more information, see <a href="/docs/debugging/">Debugging</a>.</p>
+
+  <h2>Full source</h2>
+  <!-- @source examples/06_rmsnorm.py -->
+</section>
+</main>

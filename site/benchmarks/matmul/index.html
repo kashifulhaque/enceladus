@@ -1,0 +1,81 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Benchmarks</p>
+  <h1>Matmul</h1>
+  <p class="lede">Matrix multiply throughput for both <code>tl.dot</code> backends and the autotuned kernel, across four shapes and three dtypes, against MLX and PyTorch.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it measures</h2>
+  <p><code>bench_matmul</code> multiplies an M × K matrix by a K × N matrix from device memory with the descriptor matmul in <code>examples/04_matmul.py</code>. It runs the following shapes (M × N × K) in <code>float32</code>, <code>float16</code>, and <code>bfloat16</code>:</p>
+  <ul class="tight">
+    <li>4096 × 4096 × 4096, a large square matmul.</li>
+    <li>2000 × 2000 × 2000, whose size isn't a multiple of the tile size.</li>
+    <li>513 × 513 × 513, a small matmul with a one-element ragged edge.</li>
+    <li>1024 × 4096 × 1024, a rectangular output.</li>
+  </ul>
+  <p>For each shape and dtype, the script times the following Enceladus variants:</p>
+  <ul class="tight">
+    <li><strong>simdgroup:</strong> a fixed 64 × 64 × 32 tile over 4 SIMD groups, on the <code>simdgroup_matrix</code> backend.</li>
+    <li><strong>mpp:</strong> a fixed 64 × 64 tile over 4 SIMD groups, on the Metal 4 <code>matmul2d</code> backend.</li>
+    <li><strong>Tuned:</strong> <code>matmul_tuned</code>, which autotunes over <code>matmul_configs</code> on first use. The table names the configuration it picked.</li>
+    <li><strong>Fused bias and GELU:</strong> <code>examples/07_matmul_fused.py</code> on both backends, at 4096³ in <code>float32</code> and <code>float16</code> only.</li>
+  </ul>
+  <p>The variants run in 3 interleaved rounds of 10 GPU-timed runs, and each cell reports TFLOPS at the minimum and the median time. MLX (<code>a @ b</code>) and PyTorch MPS (<code>a @ b</code>) report the minimum of 10 wall-clock runs after 3 warmup runs.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Results</h2>
+  <p>The following table lists TFLOPS for each shape and dtype. Enceladus cells show the minimum, with the median in parentheses. MLX and PyTorch show the minimum only:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Shape</th><th>dtype</th><th class="n">simdgroup</th><th class="n">mpp</th><th class="n">Tuned</th><th>Tuned config</th><th class="n">MLX</th><th class="n">PyTorch</th></tr></thead>
+    <tbody>
+      <tr><td>4096³</td><td><code>float32</code></td><td class="n">5.09 (4.79)</td><td class="n">5.35 (3.36)</td><td class="n">4.81 (4.63)</td><td>128×64 sg w8</td><td class="n">5.19</td><td class="n">5.20</td></tr>
+      <tr><td>4096³</td><td><code>float16</code></td><td class="n">5.33 (5.22)</td><td class="n">5.70 (5.60)</td><td class="n">5.67 (5.59)</td><td>64×64 mpp w4</td><td class="n">5.77</td><td class="n">5.73</td></tr>
+      <tr><td>4096³</td><td><code>bfloat16</code></td><td class="n">5.36 (5.31)</td><td class="n">5.73 (5.69)</td><td class="n">5.72 (5.68)</td><td>64×64 mpp w4</td><td class="n">5.59</td><td class="n">5.39</td></tr>
+      <tr><td>2000³</td><td><code>float32</code></td><td class="n">4.05 (3.80)</td><td class="n">4.71 (4.36)</td><td class="n">4.77 (4.37)</td><td>64×64 mpp w4</td><td class="n">4.81</td><td class="n">4.77</td></tr>
+      <tr><td>2000³</td><td><code>float16</code></td><td class="n">4.70 (4.17)</td><td class="n">5.67 (5.08)</td><td class="n">5.57 (5.12)</td><td>64×32 mpp w4</td><td class="n">5.34</td><td class="n">5.16</td></tr>
+      <tr><td>2000³</td><td><code>bfloat16</code></td><td class="n">4.69 (4.47)</td><td class="n">5.76 (5.41)</td><td class="n">5.73 (5.46)</td><td>64×32 mpp w4</td><td class="n">5.27</td><td class="n">5.32</td></tr>
+      <tr><td>513³</td><td><code>float32</code></td><td class="n">1.71 (1.70)</td><td class="n">2.99 (2.94)</td><td class="n">3.75 (3.66)</td><td>32×32 mpp w4</td><td class="n">1.33</td><td class="n">1.29</td></tr>
+      <tr><td>513³</td><td><code>float16</code></td><td class="n">1.81 (1.78)</td><td class="n">3.31 (3.25)</td><td class="n">4.32 (4.26)</td><td>32×32 mpp w4</td><td class="n">1.39</td><td class="n">1.31</td></tr>
+      <tr><td>513³</td><td><code>bfloat16</code></td><td class="n">1.93 (1.90)</td><td class="n">3.31 (3.24)</td><td class="n">4.31 (4.25)</td><td>32×32 mpp w4</td><td class="n">1.57</td><td class="n">1.68</td></tr>
+      <tr><td>1024×4096×1024</td><td><code>float32</code></td><td class="n">5.10 (4.79)</td><td class="n">5.02 (4.88)</td><td class="n">5.34 (4.79)</td><td>64×64 sg w4</td><td class="n">4.92</td><td class="n">4.92</td></tr>
+      <tr><td>1024×4096×1024</td><td><code>float16</code></td><td class="n">5.76 (5.44)</td><td class="n">6.03 (5.68)</td><td class="n">6.09 (5.80)</td><td>64×32 mpp w4</td><td class="n">5.53</td><td class="n">5.55</td></tr>
+      <tr><td>1024×4096×1024</td><td><code>bfloat16</code></td><td class="n">5.77 (5.43)</td><td class="n">6.04 (5.67)</td><td class="n">6.01 (5.65)</td><td>32×32 mpp w4</td><td class="n">5.49</td><td class="n">5.48</td></tr>
+    </tbody>
+  </table></div>
+  <p>In the tuned configuration, <code>sg</code> is the <code>simdgroup</code> backend and <code>wN</code> is the number of SIMD groups. The following table lists the fused bias-plus-GELU matmul at 4096³, in TFLOPS as the minimum (median):</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>dtype</th><th class="n">simdgroup + bias + GELU</th><th class="n">mpp + bias + GELU</th></tr></thead>
+    <tbody>
+      <tr><td><code>float32</code></td><td class="n">5.05 (4.80)</td><td class="n">3.60 (3.22)</td></tr>
+      <tr><td><code>float16</code></td><td class="n">5.30 (4.87)</td><td class="n">5.65 (5.35)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="doc prose">
+  <h2>Reading the results</h2>
+  <ul class="tight">
+    <li><strong>At 4096³, Enceladus is within a few percent of MLX.</strong> MLX leads in <code>float32</code> (5.19 against 5.09 for <code>simdgroup</code>) and <code>float16</code> (5.77 against 5.70 for <code>mpp</code>). Enceladus leads in <code>bfloat16</code> (5.73 against 5.59). At this size, the wall-clock overhead in the MLX and PyTorch times is under 1%.</li>
+    <li><strong><code>float32</code> <code>mpp</code> is bimodal at 4096³.</strong> Its minimum, 5.35, is the fastest <code>float32</code> result, but its median is 3.36, and the fused <code>mpp</code> variant shows the same pattern at 3.60 (3.22). Earlier sweeps of tile shapes and K steps found nothing faster than <code>simdgroup</code> for this case, and tuning picks a <code>simdgroup</code> configuration.</li>
+    <li><strong><code>mpp</code> wins on ragged shapes.</strong> At 2000³, <code>mpp</code> is 16-23% faster than <code>simdgroup</code>, and it beats MLX by 6% in <code>float16</code> and 9% in <code>bfloat16</code>, more than the overhead of about 3% at this size. In <code>float32</code>, the tuned kernel and MLX are even, at 4.77 and 4.81.</li>
+    <li><strong>513³ favors small tiles.</strong> The tuned 32 × 32 <code>mpp</code> kernel reaches 3.75-4.32 TFLOPS, more than twice the fixed 64 × 64 <code>simdgroup</code> kernel. A 32 × 32 tile splits the output into 289 programs instead of 81, and wastes less work on the ragged edge. MLX and PyTorch measure 1.29-1.68 TFLOPS here, which is 0.16-0.21 ms per matmul, so the roughly 0.1 ms of wall-clock overhead is up to half of their times. Part of the 2.7-3.1× gap is measurement, not kernel speed.</li>
+    <li><strong>The lead at 1024 × 4096 × 1024 is about the size of the overhead.</strong> Enceladus leads MLX by 8-10%, for example 6.09 against 5.53 TFLOPS in <code>float16</code>. That&#39;s a difference of about 0.14 ms on a 1.4-1.7 ms matmul, so most of the lead can come from the wall-clock overhead.</li>
+    <li><strong>Fused epilogues cost little on <code>float16</code>.</strong> Bias plus GELU on <code>mpp</code> runs at 5.65 TFLOPS against 5.70 for the plain <code>mpp</code> matmul.</li>
+    <li><strong>The autotuner picks a near-best configuration.</strong> Each tuning run is short, so the tuned kernel lands within about 6% of the fastest fixed variant, not counting the bimodal <code>float32</code> <code>mpp</code>. For example, it measures 4.81 against 5.09 for <code>simdgroup</code> at 4096³ in <code>float32</code>. The tuned and fixed <code>simdgroup</code> kernels at 1024 × 4096 × 1024 in <code>float32</code> share a 4.79 median but differ by 5% in their minimums, which shows the run-to-run noise.</li>
+  </ul>
+  <p>For how to choose a backend and autotune a matmul, see <a href="/docs/performance/">Performance</a>. For the <code>tl.dot</code> arguments, see the <a href="/reference/">language reference</a>.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Raw output</h2>
+  <p>The following output is the <code>bench_matmul</code> section of the results file:</p>
+  <!-- @results bench_matmul -->
+</section>
+
+<section class="doc prose">
+  <h2>Source</h2>
+  <!-- @source benchmarks/bench_matmul.py -->
+</section>
+</main>

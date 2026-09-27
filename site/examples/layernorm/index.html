@@ -1,0 +1,39 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>LayerNorm</h1>
+  <p class="lede">The LayerNorm forward pass, with one program per row. Unlike the softmax, the row doesn't have to fit in one tile: the kernel loops over it in blocks.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>layernorm(x, w, b, eps=1e-5)</code> normalizes each row of a 2D NumPy array over its last dimension and returns <code>(y, mean, rstd)</code>:</p>
+  <ul class="tight">
+    <li><code>y</code> is <code>(x - mean) * rstd * w + b</code>, in the input dtype.</li>
+    <li><code>mean</code> and <code>rstd</code> hold the mean and the reciprocal standard deviation of each row, in <code>float32</code>.</li>
+  </ul>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel and its host wrapper:</p>
+  <!-- @source examples/03_layernorm.py#L12-L52 -->
+
+  <h2>How it works</h2>
+  <p>The grid is <code>(m,)</code>, one program per row. Each program first moves <code>x_ptr</code> and <code>y_ptr</code> to the start of its row, and then makes three passes over the row, <code>BLOCK</code> columns at a time:</p>
+  <ol class="tight" style="padding-left:22px;color:var(--ink-2)">
+    <li>Sum the row into a <code>float32</code> accumulator tile, and reduce it with <code>tl.sum</code> to get the mean.</li>
+    <li>Sum the squared deviations to get the variance, and compute <code>rstd = 1 / tl.sqrt(var + eps)</code>. <code>tl.where(cols &lt; n_cols, a - mean, 0.0)</code> zeroes the masked lanes, which would otherwise contribute <code>(0 - mean)²</code>.</li>
+    <li>Normalize, scale by <code>w</code>, shift by <code>b</code>, and store <code>y</code>.</li>
+  </ol>
+  <p>The kernel also stores <code>mean</code> and <code>rstd</code> for the row. The wrapper sets <code>BLOCK</code> to <code>min(1024, next_power_of_2(n))</code> unless you pass <code>block</code>. The demo passes <code>block=256</code>, so each pass over the 1,000-column rows takes four iterations, and the last one is partly masked.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/03_layernorm.py</code></pre></div>
+  <p>The demo normalizes a 32 by 1,000 <code>float32</code> array and compares <code>y</code> with a NumPy reference computed in <code>float64</code>. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error: 9.536743e-07</code></pre></div>
+  <p>The file's docstring runs the demo in the CPU interpreter, with <code>ENCELADUS_INTERPRET=1</code>. Both ways work, and they give errors of the same size. For more information, see <a href="/docs/debugging/">Debugging</a>.</p>
+
+  <h2>Full source</h2>
+  <!-- @source examples/03_layernorm.py -->
+</section>
+</main>

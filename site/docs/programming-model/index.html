@@ -73,15 +73,15 @@
     <p>A kernel can call other <code>@enceladus.jit</code> functions, which the compiler inlines. Helpers can return values, including tuples. <code>while</code>, <code>break</code>, <code>continue</code>, early <code>return</code>, <code>try</code>, <code>with</code>, comprehensions, lambdas, and nested functions raise <code>enceladus.CompilationError</code>.</p>
     <div class="codeblock"><div class="bar"><span class="file">gelu.py</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">@enceladus.jit
 def gelu(x):
-return 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
+    return 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
 
 
 @enceladus.jit
 def gelu_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
-offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-mask = offs &lt; n
-x = tl.load(x_ptr + offs, mask=mask)
-tl.store(out_ptr + offs, gelu(x), mask=mask)</code></pre></div>
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs &lt; n
+    x = tl.load(x_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, gelu(x), mask=mask)</code></pre></div>
   </div>
 </section>
 
@@ -97,8 +97,8 @@ tl.store(out_ptr + offs, gelu(x), mask=mask)</code></pre></div>
   <p>Each specialization takes a few milliseconds to compile and is cached in memory and on disk. If a kernel compiles more than 16 times in one process, Enceladus warns and names the argument that changed most often. For sizes that vary from launch to launch, add them to <code>do_not_specialize</code>:</p>
   <div class="codeblock"><div class="bar"><span class="file">python</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">@enceladus.jit(do_not_specialize=["n"])
 def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
-# The kernel body is unchanged.
-pass</code></pre></div>
+    # The kernel body is unchanged.
+    pass</code></pre></div>
   <p><code>@enceladus.jit</code> also takes <code>interpret=True</code>, which runs every launch in the interpreter, and <code>math_mode="fast"</code>, which lets Metal assume that no value is infinite or NaN. The default, <code>"relaxed"</code>, keeps infinities and NaNs.</p>
 </section>
 </main>

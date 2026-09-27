@@ -12,8 +12,8 @@
   <div class="codeblock"><pre class="text"><code class="nohighlight">enceladus.CompilationError: add.py:9:12: the end of tl.arange must be a compile-time
 integer, but got a runtime value `BLOCK` of type tl.int32. If `BLOCK` comes from a kernel
 parameter, annotate the parameter as tl.constexpr, for example `BLOCK: tl.constexpr`.
-offs = tl.arange(0, BLOCK)
-       ^</code></pre></div>
+    offs = tl.arange(0, BLOCK)
+           ^</code></pre></div>
 
   <h2>Run kernels in the interpreter</h2>
   <p>The interpreter runs a kernel on the CPU with NumPy, one program at a time. You can use <code>print()</code>, <code>pdb</code>, and breakpoints inside the kernel and see real tile values. To run every kernel in the interpreter, set <code>ENCELADUS_INTERPRET=1</code>. To interpret one kernel, pass <code>interpret=True</code> to the decorator.</p>
@@ -32,31 +32,31 @@ print(compiled.threadgroup_memory_bytes)</code></pre></div>
   <div class="codeblock"><pre class="text"><code class="nohighlight">Kernel `rowsum_matmul`: num_warps=4 (128 threads per program), grid (4, 1, 1)
 MSL language version 3.2
 dot backend: simdgroup
-dbg.py:30  64x64x32 (MxNxK), SIMD-group grid 4x1  `acc = tl.dot(...)`
-uses simdgroup instead of mpp: dbg.py:30:15: the tl.dot result feeds `reduce`,
-which isn't an elementwise op in the loop's block
+  dbg.py:30  64x64x32 (MxNxK), SIMD-group grid 4x1  `acc = tl.dot(...)`
+  uses simdgroup instead of mpp: dbg.py:30:15: the tl.dot result feeds `reduce`,
+  which isn't an elementwise op in the loop's block
 
 Tiles (layout; registers per thread):
-dbg.py:29  loop-carried `acc` f32[64, 64]: simdgroup_matrix fragments: regs 2x16,
-lanes 8x4, warps 4x1; 32 registers  `for k in range(0, K, BK):`
-dbg.py:30  desc_load f16[64, 32]: read by tl.dot straight from device memory;
-0 registers  `acc = tl.dot(...)`
+  dbg.py:29  loop-carried `acc` f32[64, 64]: simdgroup_matrix fragments: regs 2x16,
+  lanes 8x4, warps 4x1; 32 registers  `for k in range(0, K, BK):`
+  dbg.py:30  desc_load f16[64, 32]: read by tl.dot straight from device memory;
+  0 registers  `acc = tl.dot(...)`
 
 Layout conversions:
-(none)
+  (none)
 
 Threadgroup memory: 0 bytes of 32768 (one arena that each operation reuses)</code></pre></div>
 
   <h2>Print and assert on the GPU</h2>
   <p><code>tl.device_print(prefix, *args)</code> prints one line per element to <code>stderr</code> when the stream synchronizes. <code>tl.device_assert(cond, msg, mask=None)</code> compiles only when <code>ENCELADUS_DEBUG=1</code> and raises <code>enceladus.DeviceAssertionError</code> at the next sync:</p>
   <div class="codeblock"><pre class="text"><code class="nohighlight">gather.py:12:5: device assertion failed in program (1, 0, 0): index out of range
-tl.device_assert((idx &gt;= 0) &amp; (idx &lt; n), "index out of range", mask=mask)
-^</code></pre></div>
+    tl.device_assert((idx &gt;= 0) &amp; (idx &lt; n), "index out of range", mask=mask)
+    ^</code></pre></div>
   <p>The kernel keeps running after a failed assert, so guard the access with a mask as well. For compile-time values, use <code>tl.static_print</code> and <code>tl.static_assert</code>.</p>
 
   <h2>Capture a GPU trace</h2>
   <p><code>enceladus.capture(path)</code> records GPU work to a <code>.gputrace</code> document that you can open in Xcode. Start the process with <code>MTL_CAPTURE_ENABLED=1</code>. The path must end in <code>.gputrace</code> and must not exist. Capture and <code>tl.device_print</code> can't be used in the same process.</p>
   <div class="codeblock"><div class="bar"><span class="file">python</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">with enceladus.capture("add.gputrace"):
-add_kernel[(4,)](x, y, out, 4096, BLOCK=1024)</code></pre></div>
+    add_kernel[(4,)](x, y, out, 4096, BLOCK=1024)</code></pre></div>
 </section>
 </main>

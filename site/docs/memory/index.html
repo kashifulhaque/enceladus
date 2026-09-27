@@ -42,7 +42,7 @@ c.store([pid_m * BM, pid_n * BN], acc)  # skips elements outside the array</code
   <div class="codeblock"><div class="bar"><span class="file">async_numpy.py</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-python">x = np.zeros(10_000, np.float32)
 enceladus.async_numpy(True)
 for _ in range(100):
-inc_kernel[(enceladus.cdiv(x.size, 1024),)](x, x.size, BLOCK=1024)
+    inc_kernel[(enceladus.cdiv(x.size, 1024),)](x, x.size, BLOCK=1024)
 enceladus.synchronize()  # required before reading x
 enceladus.async_numpy(False)
 assert (x == 100).all()</code></pre></div>

@@ -1,0 +1,59 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Benchmarks</p>
+  <h1>Flash attention</h1>
+  <p class="lede">Flash attention forward throughput in <code>float16</code>, causal and non-causal, against MLX's fused attention kernel.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it measures</h2>
+  <p><code>bench_attention</code> runs the autotuned flash attention kernel from <code>examples/08_flash_attention.py</code> and compares it with <code>mx.fast.scaled_dot_product_attention</code>. The benchmark uses the following setup:</p>
+  <ul class="tight">
+    <li><strong>Shapes:</strong> batch 1 and 16 heads, with sequence lengths of 2,048 and 4,096 and head dimensions of 64 and 128. Each shape runs with and without a causal mask.</li>
+    <li><strong>Data:</strong> <code>float16</code> queries, keys, and values. MLX gets copies of the same data.</li>
+    <li><strong>Configuration:</strong> the autotuner picks the block sizes and SIMD-group count on first use. The table lists the configuration as <code>BLOCK_M</code>×<code>BLOCK_N</code> and <code>w</code> SIMD groups.</li>
+    <li><strong>Timing:</strong> Enceladus and MLX alternate in one process for 3 rounds of 10 runs. Each cell shows the best round's minimum and, in parentheses, the median of the round medians. MLX's wall-clock time adds about 0.1 ms, under 2% at these sizes.</li>
+    <li><strong>FLOPs:</strong> the two matmuls, 4 × batch × heads × sequence length² × head dimension, halved for a causal mask.</li>
+  </ul>
+</section>
+
+<section class="doc prose">
+  <h2>Results</h2>
+  <p>The following table lists TFLOPS as the minimum (median). The ratio is the Enceladus minimum time divided by the MLX minimum time, so a ratio below 1.00 means Enceladus is faster:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th class="n">Sequence length</th><th class="n">Head dim</th><th>Causal</th><th>Config</th><th class="n">Enceladus</th><th class="n">MLX</th><th class="n">Ratio</th></tr></thead>
+    <tbody>
+      <tr><td class="n">2048</td><td class="n">64</td><td>No</td><td>64×32 w4</td><td class="n">5.18 (4.77)</td><td class="n">5.05 (4.77)</td><td class="n">0.97×</td></tr>
+      <tr><td class="n">2048</td><td class="n">64</td><td>Yes</td><td>32×32 w4</td><td class="n">4.84 (4.46)</td><td class="n">4.70 (4.42)</td><td class="n">0.97×</td></tr>
+      <tr><td class="n">2048</td><td class="n">128</td><td>No</td><td>64×32 w8</td><td class="n">4.81 (4.62)</td><td class="n">4.94 (4.73)</td><td class="n">1.03×</td></tr>
+      <tr><td class="n">2048</td><td class="n">128</td><td>Yes</td><td>64×32 w8</td><td class="n">4.74 (4.45)</td><td class="n">4.79 (4.66)</td><td class="n">1.01×</td></tr>
+      <tr><td class="n">4096</td><td class="n">64</td><td>No</td><td>128×32 w8</td><td class="n">4.91 (4.71)</td><td class="n">5.03 (4.79)</td><td class="n">1.02×</td></tr>
+      <tr><td class="n">4096</td><td class="n">64</td><td>Yes</td><td>64×32 w8</td><td class="n">4.54 (4.28)</td><td class="n">4.77 (4.35)</td><td class="n">1.05×</td></tr>
+      <tr><td class="n">4096</td><td class="n">128</td><td>No</td><td>64×16 w8</td><td class="n">4.32 (4.04)</td><td class="n">4.66 (4.37)</td><td class="n">1.08×</td></tr>
+      <tr><td class="n">4096</td><td class="n">128</td><td>Yes</td><td>64×32 w8</td><td class="n">4.19 (4.03)</td><td class="n">4.39 (4.26)</td><td class="n">1.05×</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="doc prose">
+  <h2>Reading the results</h2>
+  <ul class="tight">
+    <li><strong>Enceladus is within 8% of MLX everywhere.</strong> The eight shapes range from 3% faster to 8% slower, with a ratio from 0.97× to 1.08×.</li>
+    <li><strong>Enceladus leads at the smallest shapes.</strong> At sequence length 2,048 with head dimension 64, it's 3% faster by minimum time, and the medians tie at 4.77 non-causal.</li>
+    <li><strong>MLX leads as the problem grows.</strong> At sequence length 4,096, MLX is 2-8% faster, with the largest gap at head dimension 128 without a mask: 4.32 against 4.66 TFLOPS. The wall-clock overhead is under 2% here, so this gap isn't a measurement effect.</li>
+    <li><strong>Head dimension 128 runs slower than 64</strong> for both implementations, for example 4.32 against 4.91 TFLOPS for Enceladus at sequence length 4,096 without a mask.</li>
+  </ul>
+  <p>For tuning attention kernels, including <code>attention_configs</code> and <code>dot_warps</code>, see <a href="/docs/performance/">Performance</a>.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Raw output</h2>
+  <p>The following output is the <code>bench_attention</code> section of the results file:</p>
+  <!-- @results bench_attention -->
+</section>
+
+<section class="doc prose">
+  <h2>Source</h2>
+  <!-- @source benchmarks/bench_attention.py -->
+</section>
+</main>

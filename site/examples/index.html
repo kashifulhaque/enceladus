@@ -1,0 +1,28 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Examples</h1>
+  <p class="lede">Ten complete kernels from the repository's <code>examples/</code> directory, from a vector add to flash attention. Each one checks its result against a NumPy reference and prints the error.</p>
+</header>
+
+<section class="doc prose">
+  <h2>Run an example</h2>
+  <p>Each example is a standalone Python file with a kernel, a host wrapper, a NumPy reference, and a short demo. To run one, follow these steps:</p>
+  <ol class="tight" style="padding-left:22px;color:var(--ink-2)">
+    <li>Clone the repository and change to its directory:
+      <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">git clone https://github.com/kashifulhaque/enceladus
+cd enceladus</code></pre></div>
+    </li>
+    <li>Install the dependencies:
+      <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv sync</code></pre></div>
+    </li>
+    <li>Run an example:
+      <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/01_vector_add.py</code></pre></div>
+    </li>
+  </ol>
+  <p>To run an example on the CPU instead of the GPU, set <code>ENCELADUS_INTERPRET=1</code>, for example <code>ENCELADUS_INTERPRET=1 uv run python examples/03_layernorm.py</code>. For more information about the interpreter, see <a href="/docs/debugging/">Debugging</a>.</p>
+
+  <h2>All examples</h2>
+  <!-- @cards examples -->
+</section>
+</main>

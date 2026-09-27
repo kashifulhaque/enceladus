@@ -1,0 +1,35 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Fused GELU</h1>
+  <p class="lede">A scale, a bias add, and a GELU in one kernel: <code>gelu(x * scale + bias)</code>. Fusing the three operations reads and writes the data once instead of three times.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>fused_gelu(x, bias, scale)</code> takes a contiguous 2D NumPy array <code>x</code>, a bias with one value per column, and a scalar <code>scale</code>. It returns <code>gelu(x * scale + bias)</code> in the input dtype, using the exact GELU, <code>0.5 * y * (1 + erf(y / sqrt(2)))</code>.</p>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel and its host wrapper:</p>
+  <!-- @source examples/05_fused_gelu.py#L14-L30 -->
+
+  <h2>How it works</h2>
+  <ul class="tight">
+    <li>The kernel treats <code>x</code> as a flat array, like the <a href="/examples/vector-add/">vector add</a>: the grid has <code>cdiv(n, block)</code> programs of <code>BLOCK</code> elements, and <code>mask = offs &lt; n</code> guards the last one.</li>
+    <li>The bias is indexed with <code>offs % n_cols</code>, which maps each flat offset to its column. That's why <code>x</code> must be contiguous.</li>
+    <li>The math runs in <code>float32</code>. <code>0.7071067811865476</code> is <code>1 / sqrt(2)</code>, and <code>tl.erf</code> is the Gauss error function.</li>
+    <li><code>scale</code> is an ordinary scalar argument, not a constexpr, so changing it doesn't recompile the kernel.</li>
+  </ul>
+  <p>For the math builtins, see <a href="/reference/#math">Math</a> in the language reference.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/05_fused_gelu.py</code></pre></div>
+  <p>The demo applies the kernel to a 64 by 300 <code>float32</code> array with <code>scale=0.5</code>, and compares the result with a NumPy reference computed in <code>float64</code>. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error: 4.7683716e-07</code></pre></div>
+  <p>The file's docstring runs the demo in the CPU interpreter, with <code>ENCELADUS_INTERPRET=1</code>. Both ways work, and they give errors of the same size. For more information, see <a href="/docs/debugging/">Debugging</a>.</p>
+
+  <h2>Full source</h2>
+  <!-- @source examples/05_fused_gelu.py -->
+</section>
+</main>

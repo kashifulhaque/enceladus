@@ -1,0 +1,65 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Benchmarks</p>
+  <h1>Softmax and reductions</h1>
+  <p class="lede">Row softmax bandwidth on a 4096 × 4096 matrix against MLX and PyTorch, and a row-sum reduction across threadgroup sizes.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it measures</h2>
+  <p><code>bench_softmax</code> defines its own two kernels and runs them on a 4096 × 4096 matrix, one row per program with <code>BLOCK=4096</code>:</p>
+  <ul class="tight">
+    <li><strong>Row softmax</strong> in <code>float32</code> and <code>float16</code>, computed in <code>float32</code>, with 4, 8, and 16 SIMD groups (<code>num_warps</code>). It compares against <code>mx.softmax(x, axis=-1)</code> and <code>torch.softmax(x, dim=-1)</code> on MPS. GB/s counts one read and one write of the matrix.</li>
+    <li><strong>Row sum</strong> in <code>float32</code> with 4, 8, 16, and 32 SIMD groups, that is, 128 to 1,024 threads per threadgroup. GB/s counts one read of the matrix. This checks whether reductions stay fast as the threadgroup grows.</li>
+  </ul>
+  <p>Enceladus times are the minimum of 20 GPU-timed runs. MLX and PyTorch times are the minimum of 20 wall-clock runs after 10 warmup runs, so they include about 0.1 ms of launch and synchronization overhead.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Results</h2>
+  <p>The following table lists softmax bandwidth by dtype and SIMD-group count. MLX and PyTorch are measured once per dtype, so their columns repeat:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>dtype</th><th class="n">num_warps</th><th class="n">Min (ms)</th><th class="n">Enceladus GB/s</th><th class="n">MLX GB/s</th><th class="n">PyTorch GB/s</th></tr></thead>
+    <tbody>
+      <tr><td><code>float32</code></td><td class="n">4</td><td class="n">0.581</td><td class="n">231.1</td><td class="n">193.3</td><td class="n">163.9</td></tr>
+      <tr><td><code>float32</code></td><td class="n">8</td><td class="n">0.587</td><td class="n">228.8</td><td class="n">193.3</td><td class="n">163.9</td></tr>
+      <tr><td><code>float32</code></td><td class="n">16</td><td class="n">0.580</td><td class="n">231.4</td><td class="n">193.3</td><td class="n">163.9</td></tr>
+      <tr><td><code>float16</code></td><td class="n">4</td><td class="n">0.291</td><td class="n">230.9</td><td class="n">170.9</td><td class="n">152.2</td></tr>
+      <tr><td><code>float16</code></td><td class="n">8</td><td class="n">0.283</td><td class="n">236.9</td><td class="n">170.9</td><td class="n">152.2</td></tr>
+      <tr><td><code>float16</code></td><td class="n">16</td><td class="n">0.282</td><td class="n">237.9</td><td class="n">170.9</td><td class="n">152.2</td></tr>
+    </tbody>
+  </table></div>
+  <p>The following table lists row-sum bandwidth by threadgroup size:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th class="n">Threads per threadgroup</th><th class="n">GB/s</th></tr></thead>
+    <tbody>
+      <tr><td class="n">128</td><td class="n">252.2</td></tr>
+      <tr><td class="n">256</td><td class="n">251.1</td></tr>
+      <tr><td class="n">512</td><td class="n">254.8</td></tr>
+      <tr><td class="n">1024</td><td class="n">257.4</td></tr>
+    </tbody>
+  </table></div>
+  <p>The spread between the fastest and slowest row-sum configuration is 2.4%.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Reading the results</h2>
+  <ul class="tight">
+    <li><strong>Softmax runs at copy bandwidth.</strong> Enceladus reaches 228.8-237.9 GB/s, about the same as the vector add, so the max, exponent, and sum cost little on top of the memory traffic. The SIMD-group count changes the result by at most 3%.</li>
+    <li><strong>The lead over MLX is mostly overhead.</strong> Enceladus reports 20% more bandwidth than MLX in <code>float32</code> and 39% more in <code>float16</code>. Converted back to time, MLX takes about 0.11 ms longer in both dtypes, which is close to the wall-clock overhead. So the data can't show that the Enceladus kernel itself is faster; it shows that it isn't slower.</li>
+    <li><strong>PyTorch trails both.</strong> Its 163.9 and 152.2 GB/s correspond to about 0.82 and 0.44 ms, more than the overhead alone explains.</li>
+    <li><strong>Reductions scale with threadgroup size.</strong> Row sums stay within 2.4% from 128 to 1,024 threads, so the reduction doesn't slow down as the threadgroup grows.</li>
+  </ul>
+</section>
+
+<section class="doc prose">
+  <h2>Raw output</h2>
+  <p>The following output is the <code>bench_softmax</code> section of the results file:</p>
+  <!-- @results bench_softmax -->
+</section>
+
+<section class="doc prose">
+  <h2>Source</h2>
+  <!-- @source benchmarks/bench_softmax.py -->
+</section>
+</main>

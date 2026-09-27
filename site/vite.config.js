@@ -2,17 +2,16 @@ import { resolve } from "node:path";
 
 import { defineConfig } from "vite";
 
-import { layout } from "./layout.js";
-import { NOT_FOUND, PAGES } from "./pages.js";
+import { ALL_PAGES, layout } from "./layout.js";
 
 export default defineConfig({
-  // A multi-page app: /quickstart/ serves quickstart/index.html, and unknown URLs 404.
+  // A multi-page app: /docs/quickstart/ serves docs/quickstart/index.html, and unknown URLs 404.
   appType: "mpa",
   plugins: [layout()],
   build: {
     rollupOptions: {
       input: Object.fromEntries(
-        [...PAGES, NOT_FOUND].map((p) => [p.file.replace(/\/?index\.html$|\.html$/, "") || "index", resolve(import.meta.dirname, p.file)]),
+        ALL_PAGES.map((p) => [p.file.replace(/\/?index\.html$|\.html$/, "") || "index", resolve(import.meta.dirname, p.file)]),
       ),
     },
   },

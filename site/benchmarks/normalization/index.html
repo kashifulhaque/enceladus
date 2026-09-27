@@ -1,0 +1,54 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Benchmarks</p>
+  <h1>Normalization</h1>
+  <p class="lede">LayerNorm and RMSNorm forward bandwidth on a 4096 × 4096 matrix, using the kernels from the examples.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it measures</h2>
+  <p><code>bench_norms</code> runs two example kernels on a 4096 × 4096 matrix in <code>float32</code> and <code>float16</code>, one row per program, with 8 SIMD groups:</p>
+  <ul class="tight">
+    <li><strong>LayerNorm</strong> from <code>examples/03_layernorm.py</code>, with <code>BLOCK=1024</code> and <code>BLOCK=4096</code>. In the style of the Triton tutorial, the kernel reads each row three times: once for the mean, once for the variance, and once to normalize. It also writes the per-row mean and reciprocal standard deviation.</li>
+    <li><strong>RMSNorm</strong> from <code>examples/06_rmsnorm.py</code>, with <code>BLOCK=4096</code>, which holds the whole row in one block.</li>
+  </ul>
+  <p>Times are the minimum of 20 GPU-timed runs. GB/s counts the minimum traffic, one read and one write of the matrix, so the LayerNorm rereads don't count. The script has no MLX or PyTorch comparison.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Results</h2>
+  <p>The following table lists the minimum time and the bandwidth for each kernel:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Kernel</th><th>dtype</th><th class="n">BLOCK</th><th class="n">Min (ms)</th><th class="n">GB/s</th></tr></thead>
+    <tbody>
+      <tr><td>LayerNorm</td><td><code>float32</code></td><td class="n">1024</td><td class="n">0.588</td><td class="n">228.3</td></tr>
+      <tr><td>LayerNorm</td><td><code>float32</code></td><td class="n">4096</td><td class="n">0.610</td><td class="n">220.0</td></tr>
+      <tr><td>RMSNorm</td><td><code>float32</code></td><td class="n">4096</td><td class="n">0.579</td><td class="n">231.7</td></tr>
+      <tr><td>LayerNorm</td><td><code>float16</code></td><td class="n">1024</td><td class="n">0.297</td><td class="n">225.8</td></tr>
+      <tr><td>LayerNorm</td><td><code>float16</code></td><td class="n">4096</td><td class="n">0.396</td><td class="n">169.4</td></tr>
+      <tr><td>RMSNorm</td><td><code>float16</code></td><td class="n">4096</td><td class="n">0.282</td><td class="n">238.3</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="doc prose">
+  <h2>Reading the results</h2>
+  <ul class="tight">
+    <li><strong>RMSNorm runs at copy bandwidth.</strong> At 231.7 GB/s in <code>float32</code> and 238.3 GB/s in <code>float16</code>, it matches the <a href="/benchmarks/softmax/">row softmax</a> on the same matrix.</li>
+    <li><strong>LayerNorm's rereads mostly hit the cache.</strong> With <code>BLOCK=1024</code>, LayerNorm reaches 228.3 and 225.8 GB/s even though it reads each row three times.</li>
+    <li><strong>Use <code>BLOCK=1024</code> for <code>float16</code> LayerNorm.</strong> With <code>BLOCK=4096</code>, it drops to 169.4 GB/s and takes 0.396 ms against 0.297 ms. The generated code has no layout conversions, and the cause of the slowdown isn't identified. In <code>float32</code>, the larger block costs 4%.</li>
+  </ul>
+  <p>For the kernels themselves, see the LayerNorm and RMSNorm pages in <a href="/examples/">Examples</a>.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Raw output</h2>
+  <p>The following output is the <code>bench_norms</code> section of the results file:</p>
+  <!-- @results bench_norms -->
+</section>
+
+<section class="doc prose">
+  <h2>Source</h2>
+  <!-- @source benchmarks/bench_norms.py -->
+</section>
+</main>

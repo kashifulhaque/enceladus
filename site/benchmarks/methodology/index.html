@@ -1,0 +1,75 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Benchmarks</p>
+  <h1>Methodology</h1>
+  <p class="lede">How the benchmark scripts time Enceladus, MLX, and PyTorch, which statistic each table reports, the machine that produced the results, and how to run the benchmarks yourself.</p>
+</header>
+
+<section class="doc prose">
+  <h2>How Enceladus kernels are timed</h2>
+  <p>Every Enceladus throughput number comes from <code>enceladus.testing.do_bench</code>, which reads GPU timestamps instead of the wall clock. For each call, <code>do_bench</code> does the following:</p>
+  <ol>
+    <li>Raises the stream's flush threshold so that each repetition runs in its own command buffer.</li>
+    <li>Runs the function until it has spent 50 ms of GPU time. The GPU clocks down when it's idle, so cold measurements run slow.</li>
+    <li>Runs the function <code>rep</code> times, and records the GPU start and end time of each command buffer.</li>
+  </ol>
+  <p>Because the time comes from the command buffer, it excludes host-side launch cost and synchronization. The function must launch on <code>enceladus.Tensor</code> arguments; a launch that synchronizes internally can't be timed this way. For more information, see <a href="/docs/performance/">Performance</a>.</p>
+
+  <h2>How MLX and PyTorch are timed</h2>
+  <p>MLX and PyTorch don't expose per-command-buffer GPU timestamps to these scripts, so their times use the wall clock around a synchronized call: <code>mx.eval(...)</code> for MLX, and the operation followed by <code>torch.mps.synchronize()</code> for PyTorch. Each script runs a few warmup calls first.</p>
+  <p>The wall clock includes launch and synchronization overhead, which the softmax and attention scripts estimate at about 0.1 ms. That overhead is small for long kernels, for example under 1% for a 4096³ matmul, but it's a large fraction of a kernel that runs for well under a millisecond. When a comparison involves a short kernel, read the MLX and PyTorch numbers as lower bounds on their throughput.</p>
+
+  <h2>Minimum and median</h2>
+  <p>Most tables report the minimum time over the repetitions, converted to throughput. The minimum is the least noisy estimate of what the kernel can do when nothing else interferes. Where the scripts also report the median, the tables show it in parentheses or in its own column. A large gap between the two means the kernel's time varies from run to run; for example, the <code>float32</code> <code>mpp</code> matmul at 4096³ has a minimum of 5.35 TFLOPS and a median of 3.36.</p>
+
+  <h2>Interleaved rounds</h2>
+  <p>GPU clocks, temperature, and other GPU users change during a run. To spread those changes evenly across the kernels under comparison, two scripts interleave their measurements:</p>
+  <ul class="tight">
+    <li><code>bench_matmul</code> times every variant for one shape and dtype in turn, for 3 rounds of 10 runs, and reports the minimum and median over all 30 samples.</li>
+    <li><code>bench_attention</code> alternates the Enceladus kernel and MLX in one process for 3 rounds of 10 runs. It reports the best round's minimum and the median of the round medians.</li>
+  </ul>
+
+  <h2>Throughput units</h2>
+  <p>The scripts convert times to throughput as follows:</p>
+  <ul class="tight">
+    <li>Memory-bound kernels report GB/s, counting the minimum traffic: each input read once and each output written once. A kernel that rereads data from the cache can report less than its real traffic.</li>
+    <li>Matmul reports TFLOPS as 2 × M × N × K floating-point operations per time.</li>
+    <li>Attention reports TFLOPS as 4 × batch × heads × sequence length² × head dimension operations per time, halved for a causal mask.</li>
+    <li>Dispatch overhead reports microseconds per launch, measured on the host with the wall clock.</li>
+  </ul>
+
+  <h2>Machine</h2>
+  <p>All results on these pages come from one machine:</p>
+  <div class="table-wrap"><table>
+    <tbody>
+      <tr><td>Computer</td><td>MacBook Pro, Apple M4 Pro, 24 GB unified memory</td></tr>
+      <tr><td>GPU</td><td>16 cores, Apple9 family, <code>applegpu_g16s</code></td></tr>
+      <tr><td>Software</td><td>macOS 27, Xcode 27, Enceladus 0.1.0.dev0</td></tr>
+      <tr><td>Results file</td><td><code>benchmarks/results/2026-09-26-applegpu_g16s-m9.md</code>, after milestone M9</td></tr>
+    </tbody>
+  </table></div>
+  <p>The M4 Pro's GPU isn't Apple10, so the Metal 4 <code>matmul2d</code> operation behind the <code>mpp</code> <code>tl.dot</code> backend runs on the regular shader cores, not on dedicated matrix hardware. Expect different ratios on other chips.</p>
+
+  <h2>Reproduce the results</h2>
+  <p>To run the benchmarks on your own Mac, follow these steps:</p>
+  <ol>
+    <li>Clone the repository and install the development environment, which includes MLX and PyTorch:
+      <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv sync</code></pre></div>
+    </li>
+    <li>Close other GPU-heavy apps, and connect the computer to power.</li>
+    <li>Run every benchmark and write a report:
+      <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python benchmarks/run_all.py</code></pre></div>
+      <p>The script writes a Markdown report named <code>DATE-ARCHITECTURE.md</code> to <code>benchmarks/results/</code>, with one section per benchmark.</p>
+    </li>
+  </ol>
+  <p>To run one benchmark, run its script directly, for example:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python benchmarks/bench_matmul.py --quick</code></pre></div>
+  <p>The <code>--quick</code> flag limits <code>bench_matmul</code> to the 4096³ shape and <code>bench_attention</code> to sequence length 2048. <code>run_all.py</code> doesn't include <code>bench_scan_atomics.py</code>, so run that script on its own. A script skips its MLX or PyTorch rows when that framework isn't installed, except <code>bench_attention</code>, which requires MLX.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Source</h2>
+  <p>The following script runs the benchmarks and writes the report:</p>
+  <!-- @source benchmarks/run_all.py -->
+</section>
+</main>

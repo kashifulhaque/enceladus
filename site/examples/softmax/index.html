@@ -1,0 +1,35 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Row softmax</h1>
+  <p class="lede">A softmax over each row of a 2D array, with one program per row. It shows reductions with <code>tl.max</code> and <code>tl.sum</code>, and how a mask's fill value keeps them correct.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>softmax(x)</code> returns <code>exp(x - max(x)) / sum(exp(x - max(x)))</code> for each row of a 2D array, in the input dtype. It accepts NumPy arrays, <code>enceladus.Tensor</code> objects, PyTorch tensors on the <code>mps</code> device, and MLX arrays. The rows can be strided, including views with a nonzero offset, but the elements within a row must be contiguous.</p>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel and its host wrapper:</p>
+  <!-- @source examples/02_softmax.py#L15-L38 -->
+
+  <h2>How it works</h2>
+  <ul class="tight">
+    <li>The grid is <code>(m,)</code>: one program for each of the <code>m</code> rows. <code>tl.program_id(0)</code> is the row index.</li>
+    <li>One tile holds a whole row. Tile dimensions must be powers of two, so <code>BLOCK</code> is <code>enceladus.next_power_of_2(n)</code>. For the demo's 1,000 columns, that's 1,024.</li>
+    <li>Masked lanes load <code>-inf</code> through <code>other=-float("inf")</code>. That value leaves the row maximum unchanged, and its exponential adds 0 to the sum.</li>
+    <li>The kernel converts the row to <code>float32</code>, subtracts the row maximum for numerical stability, and then divides the exponentials by their sum. <code>tl.store</code> converts the result to the output's dtype.</li>
+    <li><code>enceladus.element_strides</code> returns the strides in elements for any supported array kind, so the wrapper passes the row stride of the input and the output separately.</li>
+  </ul>
+  <p>For the reduction builtins, see <a href="/reference/#reductions">Reductions</a> in the language reference.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/02_softmax.py</code></pre></div>
+  <p>The demo applies the softmax to a 64 by 1,000 <code>float32</code> array and compares the result with a NumPy reference computed in <code>float64</code>. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error: 7.450581e-09</code></pre></div>
+
+  <h2>Full source</h2>
+  <!-- @source examples/02_softmax.py -->
+</section>
+</main>

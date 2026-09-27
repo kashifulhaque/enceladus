@@ -1,0 +1,60 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Matrix multiplication</h1>
+  <p class="lede"><code>c = a @ b</code> with a <code>float32</code> accumulator, written two ways: with pointer tiles and masks, and with tensor descriptors. The descriptor version also has an autotuned wrapper.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p>The file defines three wrappers that return <code>a @ b</code> in the input dtype:</p>
+  <ul class="tight">
+    <li><code>matmul</code> uses pointer tiles with masks. The operands can have any strides.</li>
+    <li><code>matmul_desc</code> uses tensor descriptors, so <code>tl.dot</code> loads its fragments straight from device memory. This is the fast path. <code>a</code>, <code>b</code>, and <code>c</code> must be row-major.</li>
+    <li><code>matmul_tuned</code> runs the descriptor kernel with the fastest configuration for the shape and dtype.</li>
+  </ul>
+  <p>All three accept NumPy arrays, <code>enceladus.Tensor</code> objects, PyTorch tensors on the <code>mps</code> device, and MLX arrays, and return an array of the same kind.</p>
+
+  <h2>Pointer tiles</h2>
+  <p>The following code shows the pointer-tile kernel and its wrapper:</p>
+  <!-- @source examples/04_matmul.py#L21-L50 -->
+  <ul class="tight">
+    <li>The grid is two-dimensional. Axis 0 walks the <code>BN</code>-wide column blocks of <code>c</code>, and axis 1 walks the <code>BM</code>-tall row blocks. The grid is a function of <code>meta</code>, so it reads the block sizes from the launch.</li>
+    <li><code>a_ptrs</code> and <code>b_ptrs</code> are 2D tiles of pointers, built from row and column offsets with <code>[:, None]</code> and <code>[None, :]</code> broadcasting and the strides that <code>enceladus.element_strides</code> returns.</li>
+    <li>Each iteration of the K loop masks both the M or N edge and the K tail, loads zeros outside the matrices, and accumulates with <code>acc = tl.dot(a, b, acc)</code>. It then advances both pointer tiles by <code>BK</code> along K.</li>
+    <li>The store casts the accumulator to <code>c_ptr.dtype.element_ty</code> and masks the edges of <code>c</code>.</li>
+  </ul>
+  <p>Pointer-tile operands go through threadgroup memory before <code>tl.dot</code> uses them. That works for any tile, but runs slower than the descriptor version.</p>
+
+  <h2>Tensor descriptors</h2>
+  <p>The following code shows the descriptor kernel and its wrapper:</p>
+  <!-- @source examples/04_matmul.py#L53-L78 -->
+  <ul class="tight">
+    <li><code>tl.make_tensor_descriptor</code> describes each matrix by its base pointer, shape, strides, and block shape. The innermost stride must be 1, so the wrapper passes only the row strides: <code>k</code>, <code>n</code>, and <code>n</code>.</li>
+    <li>Descriptors check their own bounds. <code>a.load</code> fills out-of-bounds elements with zeros, and <code>c.store</code> skips them, so the kernel has no masks.</li>
+    <li>The defaults are 64 by 64 output blocks, a K step of 32, and 4 SIMD groups. With <code>dot_backend="mpp"</code>, the K loop runs as one Metal 4 <code>matmul2d</code> operation.</li>
+  </ul>
+  <p>For more information about the two ways to address memory, see <a href="/docs/memory/">Memory and synchronization</a>. For the <code>tl.dot</code> backends, see <a href="/docs/performance/">Performance</a>.</p>
+
+  <h2>Autotuning</h2>
+  <p>The following code wraps the descriptor kernel in <code>enceladus.autotune</code>:</p>
+  <!-- @source examples/04_matmul.py#L81-L104 -->
+  <ul class="tight">
+    <li>The candidate list is <code>matmul_configs("float16")</code>, which is a superset of the <code>float32</code> list.</li>
+    <li><code>_configs_for_dtype</code>, passed as <code>early_config_prune</code>, keeps only the configurations that <code>matmul_configs</code> lists for the dtype of <code>a</code>. This keeps the <code>float32</code> shapes that spill registers out of <code>float32</code> tuning.</li>
+    <li>The tuning key is <code>M</code>, <code>N</code>, and <code>K</code>. The autotuner also keys on the argument dtypes, so it tunes each dtype separately.</li>
+    <li>The grid is a function of <code>meta</code>, because the block sizes come from the chosen configuration.</li>
+  </ul>
+  <p>The demo doesn't call <code>matmul_tuned</code>. For more information about autotuning, see <a href="/docs/performance/">Performance</a>.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/04_matmul.py</code></pre></div>
+  <p>The demo multiplies a 100 by 70 matrix by a 70 by 90 matrix, in <code>float32</code>, with <code>matmul</code> and with <code>matmul_desc</code>. None of the dimensions is a multiple of the block sizes, so both kernels exercise their edge handling. It compares each result with NumPy, and the output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error, pointer tiles: 0.0
+max abs error, descriptors: 0.0</code></pre></div>
+
+  <h2>Full source</h2>
+  <!-- @source examples/04_matmul.py -->
+</section>
+</main>

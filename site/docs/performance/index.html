@@ -39,15 +39,15 @@
 @enceladus.autotune(configs=matmul_configs("float16"), key=["M", "N", "K"])
 @enceladus.jit
 def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bk, stride_cm,
-              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-pid_n, pid_m = tl.program_id(0), tl.program_id(1)
-a = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, 1], [BM, BK])
-b = tl.make_tensor_descriptor(b_ptr, [K, N], [stride_bk, 1], [BK, BN])
-c = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [BM, BN])
-acc = tl.zeros((BM, BN), dtype=tl.float32)
-for k in range(0, K, BK):
-    acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
-c.store([pid_m * BM, pid_n * BN], acc.to(c.dtype))
+                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+    a = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, 1], [BM, BK])
+    b = tl.make_tensor_descriptor(b_ptr, [K, N], [stride_bk, 1], [BK, BN])
+    c = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [BM, BN])
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+    c.store([pid_m * BM, pid_n * BN], acc.to(c.dtype))
 
 
 grid = lambda meta: (enceladus.cdiv(N, meta["BN"]), enceladus.cdiv(M, meta["BM"]))

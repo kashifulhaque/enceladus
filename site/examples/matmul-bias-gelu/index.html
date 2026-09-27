@@ -1,0 +1,35 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Examples</p>
+  <h1>Matmul with bias and GELU</h1>
+  <p class="lede">A descriptor matmul with a fused epilogue: <code>gelu(a @ b + bias)</code>. The bias add, the GELU, and the cast run on the accumulator registers before the store.</p>
+</header>
+
+<section class="doc prose">
+  <h2>What it computes</h2>
+  <p><code>matmul_bias_gelu(a, b, bias)</code> returns <code>gelu(a @ b + bias)</code> in the input dtype, where <code>bias</code> has one value per output column. <code>a</code>, <code>b</code>, and the output must be row-major. For a NumPy <code>a</code>, the wrapper allocates a NumPy output; for any other input, it allocates an <code>enceladus.Tensor</code>, unless you pass <code>c</code>.</p>
+
+  <h2>The kernel</h2>
+  <p>The following code shows the kernel and its host wrapper:</p>
+  <!-- @source examples/07_matmul_fused.py#L17-L49 -->
+
+  <h2>How it works</h2>
+  <p>The K loop is the same as in the descriptor kernel of the <a href="/examples/matmul/">matrix multiplication</a> example: three tensor descriptors, a 2D grid over the output blocks, and <code>acc = tl.dot(a_tile, b_tile, acc)</code> with a <code>float32</code> accumulator. After the loop, the kernel runs the epilogue on the accumulator:</p>
+  <ol class="tight" style="padding-left:22px;color:var(--ink-2)">
+    <li>Load the <code>BN</code> bias values for the block's columns with a pointer tile, masking columns past <code>N</code>.</li>
+    <li>Add the bias to every row with <code>bias[None, :]</code> broadcasting.</li>
+    <li>Apply the exact GELU with <code>tl.erf</code>.</li>
+    <li>Cast to the output dtype and store through the output descriptor, which skips out-of-bounds elements.</li>
+  </ol>
+  <p>These steps work on the accumulator's registers in place, so the fused kernel costs about the same as a plain matmul. With <code>dot_backend="mpp"</code>, the epilogue runs on the elements of the Metal 4 <code>matmul2d</code> cooperative tensor. For more information, see <a href="/docs/performance/">Performance</a>.</p>
+
+  <h2>Run the example</h2>
+  <p>From the root of a clone of the repository, run the following command:</p>
+  <div class="codeblock"><div class="bar"><span class="file">shell</span><span class="spacer"></span><button class="copy" type="button">Copy</button></div><pre><code class="language-bash">uv run python examples/07_matmul_fused.py</code></pre></div>
+  <p>The demo multiplies a 200 by 96 matrix by a 96 by 130 matrix in <code>float32</code>, adds a 130-element bias, and compares the result with a NumPy reference computed in <code>float64</code>. The output is similar to the following:</p>
+  <div class="codeblock"><pre class="text"><code class="nohighlight">max abs error: 1.335144e-05</code></pre></div>
+
+  <h2>Full source</h2>
+  <!-- @source examples/07_matmul_fused.py -->
+</section>
+</main>

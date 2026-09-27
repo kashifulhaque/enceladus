@@ -1,0 +1,55 @@
+<main>
+<header class="page-head prose">
+  <p class="sec-label">Reference</p>
+  <h1>Data types and tiles</h1>
+  <p class="lede">The element types that tiles, pointers, and tensors hold, and the attributes, operators, and methods of a tile.</p>
+</header>
+
+<section class="doc prose">
+  <h2>Element types</h2>
+  <p>The following element types are available as <code>tl</code> attributes. In a kernel, write <code>tl.float16</code>. In the host allocators, pass the string <code>"float16"</code> or a short name. Enceladus has no 64-bit floating-point type.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Kind</th><th>Type</th><th>Bits</th><th>Short names</th></tr></thead>
+    <tbody>
+      <tr><td>Boolean</td><td><code>tl.int1</code></td><td>1</td><td><code>i1</code>, <code>bool</code></td></tr>
+      <tr><td>Signed integer</td><td><code>tl.int8</code></td><td>8</td><td><code>i8</code></td></tr>
+      <tr><td>Signed integer</td><td><code>tl.int16</code></td><td>16</td><td><code>i16</code></td></tr>
+      <tr><td>Signed integer</td><td><code>tl.int32</code></td><td>32</td><td><code>i32</code></td></tr>
+      <tr><td>Signed integer</td><td><code>tl.int64</code></td><td>64</td><td><code>i64</code></td></tr>
+      <tr><td>Unsigned integer</td><td><code>tl.uint8</code></td><td>8</td><td><code>u8</code></td></tr>
+      <tr><td>Unsigned integer</td><td><code>tl.uint16</code></td><td>16</td><td><code>u16</code></td></tr>
+      <tr><td>Unsigned integer</td><td><code>tl.uint32</code></td><td>32</td><td><code>u32</code></td></tr>
+      <tr><td>Unsigned integer</td><td><code>tl.uint64</code></td><td>64</td><td><code>u64</code></td></tr>
+      <tr><td>Floating point</td><td><code>tl.float16</code></td><td>16</td><td><code>fp16</code></td></tr>
+      <tr><td>Floating point</td><td><code>tl.bfloat16</code></td><td>16</td><td><code>bf16</code></td></tr>
+      <tr><td>Floating point</td><td><code>tl.float32</code></td><td>32</td><td><code>fp32</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Math functions such as <code>tl.exp</code> take float inputs only. For 16-bit floats, they compute in <code>float32</code> and round the result back.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Tile attributes</h2>
+  <p>A tile <code>x</code> has the following attributes:</p>
+  <ul class="tight">
+    <li><code>x.shape</code>: the shape, as a tuple of ints.</li>
+    <li><code>x.dtype</code>: the element type. For a pointer, it's the pointee type, so both <code>x_ptr.dtype</code> and <code>x_ptr.dtype.element_ty</code> give the element type.</li>
+    <li><code>x.numel</code>: the number of elements.</li>
+    <li><code>x.T</code>: the transpose, the same as <code>tl.trans(x)</code>.</li>
+  </ul>
+</section>
+
+<section class="doc prose">
+  <h2>Operators</h2>
+  <p>Tiles support the operators <code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>//</code>, <code>%</code>, <code>&amp;</code>, <code>|</code>, <code>^</code>, <code>~</code>, <code>&lt;&lt;</code>, <code>&gt;&gt;</code>, and the comparisons. Operands broadcast to one shape.</p>
+  <p><code>**</code> and <code>@</code> aren't supported on runtime values. For matrix products, use <a href="/reference/#matrix-multiplication"><code>tl.dot</code></a>.</p>
+  <p>Indexing with <code>None</code> and <code>:</code> inserts dimensions. For example, <code>x[:, None]</code> turns a tile of shape <code>(N,)</code> into one of shape <code>(N, 1)</code>.</p>
+</section>
+
+<section class="doc prose">
+  <h2>Tile methods</h2>
+  <p>You can call the following builtins as methods of a tile. Each one takes the same arguments as the <code>tl</code> function of the same name, without the first argument. For example, <code>x.sum(axis=0)</code> is <code>tl.sum(x, axis=0)</code>.</p>
+  <p class="methods"><code>x.abs()</code>, <code>x.argmax()</code>, <code>x.argmin()</code>, <code>x.associative_scan()</code>, <code>x.broadcast_to()</code>, <code>x.cast()</code>, <code>x.ceil()</code>, <code>x.cos()</code>, <code>x.cumsum()</code>, <code>x.erf()</code>, <code>x.exp()</code>, <code>x.exp2()</code>, <code>x.expand_dims()</code>, <code>x.floor()</code>, <code>x.log()</code>, <code>x.log2()</code>, <code>x.max()</code>, <code>x.min()</code>, <code>x.permute()</code>, <code>x.reduce()</code>, <code>x.reshape()</code>, <code>x.rsqrt()</code>, <code>x.sigmoid()</code>, <code>x.sin()</code>, <code>x.sqrt()</code>, <code>x.sum()</code>, <code>x.tanh()</code>, <code>x.trans()</code></p>
+  <p><code>x.to(dtype)</code> is the same as <code>x.cast(dtype)</code>.</p>
+</section>
+</main>
