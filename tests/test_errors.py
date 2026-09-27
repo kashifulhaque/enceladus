@@ -52,6 +52,13 @@ def _fp16_atomic_add(p, BLOCK: tl.constexpr):
 
 
 @enceladus.jit
+def _join_mixed_dtypes(x_ptr, BLOCK: tl.constexpr):
+    x = tl.load(x_ptr + tl.arange(0, BLOCK))
+    j = tl.join(x, x.to(tl.float16))  # error
+    tl.store(x_ptr + tl.arange(0, BLOCK), tl.sum(j, axis=1))
+
+
+@enceladus.jit
 def _pow_on_tile(x_ptr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + tl.arange(0, BLOCK))
     tl.store(x_ptr + tl.arange(0, BLOCK), x**2)  # error
@@ -70,6 +77,15 @@ def _small_dot_k(x_ptr, M: tl.constexpr, K: tl.constexpr):
     a = tl.load(x_ptr + rm[:, None] * K + rk[None, :])
     b = tl.load(x_ptr + rk[:, None] * M + rm[None, :])
     tl.store(x_ptr + rm[:, None] * M + rm[None, :], tl.dot(a, b))  # error
+
+
+@enceladus.jit
+def _int_dot_float_acc(x_ptr, out_ptr, N: tl.constexpr):
+    r = tl.arange(0, N)
+    x = tl.load(x_ptr + r[:, None] * N + r[None, :])
+    acc = tl.zeros((N, N), dtype=tl.float32)
+    acc = tl.dot(x, x, acc)  # error
+    tl.store(out_ptr + r[:, None] * N + r[None, :], acc)
 
 
 @enceladus.jit
@@ -168,6 +184,33 @@ def _callable_instance_attribute(x_ptr):
     tl.store(x_ptr, _cfg.scale(1.0))  # error
 
 
+class _Settings:
+    def __init__(self):
+        self.scale = 2.0
+
+
+_SETTINGS = _Settings()
+
+
+def _read_settings():  # a Python helper that reads an attribute of an object instance
+    return _SETTINGS.scale
+
+
+class _UsesSettings:
+    def scale(self):
+        return _read_settings()
+
+
+@enceladus.jit
+def _helper_reads_instance_attribute(x_ptr):
+    tl.store(x_ptr, _read_settings())  # error
+
+
+@enceladus.jit
+def _method_reads_instance_attribute(x_ptr):
+    tl.store(x_ptr, _UsesSettings().scale())  # error
+
+
 def _tg_overflow_launch():
     x = np.zeros((128, 128), np.float32)
     _tg_overflow.warmup(x, x, x, M=128, N=128)
@@ -187,11 +230,17 @@ KERNEL_CASES = [
      ("interpret", "compiled"), "Accumulate in a float32 buffer"),
     (_pow_on_tile, lambda: _pow_on_tile[(1,)](X, BLOCK=16), ("interpret", "compiled"),
      "Multiply explicitly"),
+    (_join_mixed_dtypes, lambda: _join_mixed_dtypes[(1,)](X, BLOCK=16), ("interpret", "compiled"),
+     "Convert one operand with `.to(dtype)`"),
     (_print_runtime, lambda: _print_runtime[(1,)](X, BLOCK=16), ("compiled",),
      "Use tl.device_print"),
     (_small_dot_k, lambda: _small_dot_k[(1,)](np.zeros((16, 16), np.float32), M=16, K=4),
      ("compiled",), "Use a K block size of at least 8"),
     (_tg_overflow, _tg_overflow_launch, ("compiled",), "Use smaller blocks"),
+    (_int_dot_float_acc,
+     lambda: _int_dot_float_acc[(1,)](np.zeros((16, 16), np.int8), np.zeros((16, 16), np.float32),
+                                     N=16),
+     ("interpret", "compiled"), "`tl.zeros(..., dtype=tl.int32)`"),
     (_literal_out_of_range_merge,
      lambda: _literal_out_of_range_merge[(1,)](X, np.zeros(1, np.uint8), 0), ("compiled",),
      "Convert the tl.uint8 value with `.to(tl.int32)`"),
@@ -214,6 +263,10 @@ KERNEL_CASES = [
      "Use a plain function"),
     (_callable_instance_attribute, lambda: _callable_instance_attribute[(1,)](X),
      ("compiled",), "Use a plain function"),
+    (_helper_reads_instance_attribute, lambda: _helper_reads_instance_attribute[(1,)](X),
+     ("compiled",), "`_read_settings` reads `_SETTINGS.scale`, which reaches a _Settings"),
+    (_method_reads_instance_attribute, lambda: _method_reads_instance_attribute[(1,)](X),
+     ("compiled",), "`_read_settings` reads `_SETTINGS.scale`"),
 ]
 
 

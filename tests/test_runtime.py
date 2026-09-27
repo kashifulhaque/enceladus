@@ -4,6 +4,7 @@ import ctypes
 import dataclasses
 import gc
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -328,7 +329,7 @@ class _BigBuffer:
     ptr, nbytes = 0, 1 << 34
 
 
-@pytest.mark.parametrize("case", ["grid", "pipeline_threads", "span", "read_only"])
+@pytest.mark.parametrize("case", ["grid", "pipeline_threads", "read_only"])
 def test_jit_refuses_launches_it_would_run_wrong(case):
     x, out = enceladus.ones(8), enceladus.zeros(8)
     if case == "grid":
@@ -340,17 +341,6 @@ def test_jit_refuses_launches_it_would_run_wrong(case):
         small = SimpleNamespace(max_total_threads_per_threadgroup=64, name=ck.name)
         with pytest.raises(ValueError, match="allows at most 64"):
             dataclasses.replace(ck, pipeline=small).launch((1, 1, 1), (x, out, 8))
-    elif case == "span":
-        # Offsets are 32-bit ints, so the last element must be at most 2^31 - 1 away.
-        huge = enceladus.Tensor(_BigBuffer(), ((1 << 31) + 1,), "float32")
-        with pytest.raises(ValueError, match="spans 2147483649 elements"):
-            _add_one[(1,)](huge, out, 8, BLOCK=8)
-        one = np.zeros(1, np.float32)
-        view = np.lib.stride_tricks.as_strided(one, shape=(2, 8), strides=(8 << 30, 4))
-        with pytest.raises(ValueError, match="spans 2147483656 elements"):
-            _add_one[(1,)](x, view, 8, BLOCK=8)
-        edge = np.lib.stride_tricks.as_strided(one, shape=(1 << 31,), strides=(4,))
-        launcher.check_index_range(edge, "edge")  # exactly 2^31 elements fit
     else:
         # A kernel may read a read-only array, but it must not write one.
         ro = np.frombuffer(bytes(32), np.float32)
@@ -362,6 +352,67 @@ def test_jit_refuses_launches_it_would_run_wrong(case):
         with pytest.raises(ValueError, match="read-only NumPy array"):
             _add_one[(1,)](x, np.broadcast_to(np.zeros(1, np.float32), (8,)), 8, BLOCK=8)
         assert not np.frombuffer(ro.tobytes(), np.float32).any()
+
+
+@enceladus.jit
+def _masked_tail(x_ptr, y_ptr, n, STEP: tl.constexpr, BLOCK: tl.constexpr):
+    # Program p covers elements p * STEP onward; program 2 passes 2^31. Each program
+    # reads and writes a small window, so small arrays serve every program.
+    pid = tl.program_id(0)
+    offs = pid * STEP + tl.arange(0, BLOCK)
+    local = offs - pid * STEP
+    tl.store(y_ptr + pid * BLOCK + local, tl.load(x_ptr + local) + 1.0, mask=offs < n)
+
+
+# The register array of the `local` offsets, by the C type of its elements.
+_LOCAL_TYPE = re.compile(r"\b(\w+) local_\d+\[\d+\];")
+
+
+def test_arrays_past_2_31_elements_compile_a_64_bit_variant():
+    x = np.arange(16, dtype=np.float32)
+    n = (1 << 31) + 3  # program 2 keeps 3 elements, if its mask computes in 64 bits
+    huge = enceladus.Tensor(_BigBuffer(), ((1 << 31) + 1,), "float32")
+    one = np.zeros(1, np.float32)
+    view = np.lib.stride_tricks.as_strided(one, shape=(2, 8), strides=(8 << 30, 4))
+    small = _masked_tail.warmup(x, x, n, STEP=1 << 30, BLOCK=16)
+    assert not small.idx64 and _LOCAL_TYPE.search(small.msl)[1] == "int"
+    for big_arg in (huge, view):
+        big = _masked_tail.warmup(big_arg, x, n, STEP=1 << 30, BLOCK=16)
+        assert big.idx64 and _LOCAL_TYPE.search(big.msl)[1] == "long"
+    # The 64-bit variant computes the exact offsets, so the mask of program 2 keeps only
+    # offsets 2^31 to 2^31 + 2. Launched on small arrays, it shows that directly.
+    y = np.zeros(48, np.float32)
+    big.launch((3, 1, 1), (x, y, n))
+    enceladus.synchronize()
+    expected = np.concatenate([x + 1, x + 1, np.where(np.arange(16) < 3, x + 1, 0)])
+    np.testing.assert_array_equal(y, expected)
+    # A kernel with 32-bit offsets refuses the array.
+    with pytest.raises(ValueError, match="spans 2147483649 elements"):
+        small.launch((1, 1, 1), (huge, y, n))
+    edge = np.lib.stride_tricks.as_strided(one, shape=(1 << 31,), strides=(4,))
+    assert not launcher.needs_idx64(edge)  # exactly 2^31 elements fit in 32-bit offsets
+
+
+@enceladus.jit
+def _bump(x_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    tl.store(x_ptr + offs, tl.load(x_ptr + offs, mask=m) + 1, mask=m)
+
+
+@pytest.mark.slow
+def test_kernel_addresses_every_byte_of_a_2_gb_array():
+    n = (1 << 31) + 77
+    x = enceladus.zeros(n, dtype="uint8")
+    try:
+        x.numpy()[-5:] = np.arange(5, dtype=np.uint8)
+        _bump[(enceladus.cdiv(n, 4096),)](x, n, BLOCK=4096)
+        got = x.numpy()
+        assert (got[:-5] == 1).all()
+        np.testing.assert_array_equal(got[-5:], np.arange(1, 6, dtype=np.uint8))
+    finally:
+        del x
+        gc.collect()
 
 
 def test_raw_kernel_refuses_to_write_read_only_arrays(vadd):

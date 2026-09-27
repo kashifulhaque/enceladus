@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 import re
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from enceladus.compiler import ir
 from enceladus.compiler import layout as L
 from enceladus.compiler.codegen.emitter import Emitter, NameGen
 from enceladus.compiler.errors import CompilationError, Loc, internal_error
+from enceladus.compiler.passes.axis_info import vector_width
 from enceladus.compiler.passes.layouts import (
     ANCHORED,
     CHEAP,
@@ -32,6 +34,7 @@ from enceladus.compiler.passes.layouts import (
     store_layout,
     view_source_layout,
 )
+from enceladus.compiler.passes.widen_index import needs_idx64
 
 PRELUDE = (Path(__file__).parent / "prelude.metal").read_text()
 
@@ -44,13 +47,11 @@ STRUCT_FORMATS = {
     "i1": "?", "i8": "b", "i16": "h", "i32": "i", "i64": "q",
     "u8": "B", "u16": "H", "u32": "I", "u64": "Q", "f16": "e", "f32": "f",
 }  # fmt: skip
-# Kernels compile with fast FP32 functions (`MTLMathFloatingPointFunctions.fast`). The fast
-# `tanh` returns 0 at 44 and NaN from 45 and is inaccurate near 0, so `tg_tanh` in the
-# prelude replaces it: within 1.4 ulp everywhere, and 1.7x the time of the fast `tanh` in
-# compute-bound code, against 6x for `precise::tanh`. The fast `sin` and `cos` return 0
-# from about 1e7 and at NaN and infinity, so they use the precise variants, as Triton does
-# with libdevice. Those take 3.3x the time of the fast ones in compute-bound code, and
-# nothing in memory-bound code. The fast `exp` and `log` stay accurate, so they remain.
+# Every launch path compiles with precise FP32 functions, so that NumPy, PyTorch, and MLX
+# inputs give identical results (see `raw.MATH_FP32_FUNCTIONS`). `tanh` uses `tg_tanh` from
+# the prelude, which is within 1.4 ulp everywhere and cheaper than `precise::tanh`. `sin`
+# and `cos` name the precise variants explicitly: the fast ones return 0 from about 1e7
+# and at NaN and infinity.
 MATH_FUNCS = {
     "exp": "exp", "exp2": "exp2", "log": "log", "log2": "log2", "sqrt": "sqrt",
     "rsqrt": "rsqrt", "sin": "precise::sin", "cos": "precise::cos", "tanh": "tg_tanh",
@@ -63,6 +64,12 @@ BIN_SYMBOLS = {
 CMP_SYMBOLS = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 BARRIER = "threadgroup_barrier(mem_flags::mem_threadgroup);"
 MAX_REGS_WARN, MAX_REGS_ERROR = 128, 256
+# Pointer-tile loads and stores that `axis_info` proves contiguous and aligned become
+# `vec<T, N>` accesses of up to MAX_VEC elements. On an M4 Pro, that made a float16
+# pointer-tile matmul 26% faster and an int8 vector add 18% faster, and it didn't change
+# float32 or float16 elementwise kernels, softmax, or norms measurably.
+VECTORIZE = True
+MAX_VEC = 4
 
 
 def ctype(t: ir.Type, offset_type: str = "int") -> str:
@@ -81,8 +88,11 @@ def offset_type(module: ir.Module) -> str:
     """Returns the C type of pointer-tile offsets in `module`.
 
     Offsets are `int` unless some pointer tile gets an offset that doesn't fit in 32 bits,
-    such as an `int64` one. Then every pointer tile in the kernel uses `long` offsets.
+    such as an `int64` one, or some argument has the `idx64` fact. Then every pointer tile
+    in the kernel uses `long` offsets.
     """
+    if needs_idx64(module):
+        return "long"
     for op in module.walk():
         if op.name == "addptr" and isinstance(op.result.type, ir.TileType):
             if ir.elem_of(op.operands[1].type).name in WIDE_OFFSETS:
@@ -186,6 +196,8 @@ class GeneratedKernel:
             every `tl.dot` uses `simdgroup_matrix`, and None for a kernel without `tl.dot`.
         dot_fallbacks: Why each `tl.dot` that `dot_backend="mpp"` asked for uses
             `simdgroup` instead.
+        idx64: Whether some argument has the `idx64` fact, so the kernel computes its
+            index math and pointer offsets in 64 bits.
     """
 
     name: str
@@ -202,6 +214,7 @@ class GeneratedKernel:
     plan: Any = None
     dot_backend: str | None = None
     dot_fallbacks: list[str] = field(default_factory=list)
+    idx64: bool = False
 
 
 class _Codegen:
@@ -239,6 +252,7 @@ class _Codegen:
         # With ENCELADUS_DEBUG set, the code of each source line starts with a
         # `// file.py:LINE` comment. The debug flag is part of the cache key.
         self.debug_locs = bool(module.attrs.get("debug"))
+        self.vectorize = VECTORIZE
         from enceladus.compiler.codegen.dot import find_direct_operands, use_counts
 
         self.direct: set[int] = find_direct_operands(module, plan)
@@ -249,6 +263,14 @@ class _Codegen:
             from enceladus.compiler.codegen.mpp import plan_mpp
 
             self.mpp = plan_mpp(module)
+        from enceladus.compiler.passes.edge_versioning import plan_edge_versioning
+
+        self.versioning = plan_edge_versioning(
+            module, self.direct, self.mpp.handled if self.mpp is not None else frozenset()
+        )
+        # How each covered `dot` loads direct operands in the loop version being emitted:
+        # "fast" (unmasked) or "checked". A `dot` missing here branches on its own bounds.
+        self.dot_modes: dict[int, str] = {}
 
     # ---- helpers ----
 
@@ -523,6 +545,9 @@ class _Codegen:
         try:
             if op.name in VIEWS:
                 tile = self.mat_view(op, lay)
+            elif op.name == "split":
+                i = op.results.index(v)
+                tile = self.split_parts(op, L.join(lay), lay, 0, (i,))[0]
             else:
                 assert k == CHEAP
                 tile = self.mat_cheap(op, lay)
@@ -561,6 +586,8 @@ class _Codegen:
                 c = self.coord(lay, r, 0)
                 self.e.line(f"{arr}[{r}] = {c if not start else f'{start} + {c}'};")
             return Tile(lay, arr)
+        if name == "join":
+            return self.join(op, lay)
         return self.elementwise(op, lay, lazy=True)
 
     def elementwise(self, op: ir.Op, lay: L.BitLayout, lazy: bool) -> Tile:
@@ -663,6 +690,60 @@ class _Codegen:
                 self.e.line(f"{name}[{r}] = buf[{_add(dst_flat, dst_c[r])}];")
         return Tile(lay, name, base=t.base, root=t.root)
 
+    def join(self, op: ir.Op, lay: L.BitLayout) -> Tile:
+        """Emits `tl.join(a, b)` in `lay`, any layout of the result.
+
+        Each result register reads one operand register in the same thread: `a` and `b`
+        materialize in the layout that `lay` has without its trailing dimension. When a
+        register bit selects the trailing coordinate, as in `layout.join`, the choice of
+        operand is known at compile time. Otherwise a lane or SIMD-group bit selects it,
+        and each thread picks its operand by its coordinate.
+        """
+        last = lay.rank - 1
+        src_lay = L.slice_layout(lay, last)
+        a, b = (self.mat(v, src_lay) for v in op.operands)
+        k = next((i for i, basis in enumerate(lay.reg) if basis[last]), None)
+        tc = self.thread_coord(lay, last) if k is None else None
+        arr = self.declare(op.result.type, lay, op.result.name_hint or "jn")
+        for r in range(lay.num_regs):
+            if k is None:
+                self.e.line(f"{arr}[{r}] = {tc} ? {b.get(r)} : {a.get(r)};")
+            else:
+                j = (r & ((1 << k) - 1)) | (r >> (k + 1) << k)
+                self.e.line(f"{arr}[{r}] = {(b if r >> k & 1 else a).get(j)};")
+        return Tile(lay, arr)
+
+    def split_parts(self, op: ir.Op, src_lay: L.BitLayout, lay: L.BitLayout, k: int,
+                    which: tuple[int, ...]) -> list[Tile]:  # fmt: skip
+        """Emits results `which` of `tl.split`, reading the operand in `src_lay`.
+
+        Register bit `k` of `src_lay` selects the trailing coordinate, and `lay` is
+        `src_lay` without it (see `layout.split`), so every result register copies one
+        operand register of the same thread.
+        """
+        src = self.mat(op.operands[0], src_lay)
+        out = []
+        for i in which:
+            res = op.results[i]
+            arr = self.declare(res.type, lay, res.name_hint or "sp")
+            for j in range(lay.num_regs):
+                self.e.line(f"{arr}[{j}] = {src.get(L.insert_bit(j, k, i))};")
+            out.append(Tile(lay, arr))
+        return out
+
+    def op_split(self, op: ir.Op) -> None:
+        if self.plan.classify(op.results[0]) != ANCHORED:
+            return  # emitted lazily at each use
+        lay = self.plan.layout_of(op.results[0])
+        v = op.operands[0]
+        src_lay = L.split_source(self.plan.natural(v) or self.plan.default(v.type))
+        res_lay, k = L.split(src_lay)
+        if res_lay != lay:
+            src_lay, k = L.join(lay), 0
+        for r, tile in zip(op.results, self.split_parts(op, src_lay, lay, k, (0, 1)),
+                           strict=True):  # fmt: skip
+            self.tiles[id(r)] = tile
+
     # ---- ops ----
 
     def block(self, block: ir.Block) -> None:
@@ -701,6 +782,8 @@ class _Codegen:
             elif name in ("binary", "cmp", "unary", "fma", "select", "cast", "bitcast",
                           "addptr"):  # fmt: skip
                 self.tiles[id(res)] = self.elementwise(op, lay, lazy=False)
+            elif name == "join":
+                self.tiles[id(res)] = self.join(op, lay)
             elif name == "dot":
                 from enceladus.compiler.codegen.dot import emit_dot
 
@@ -750,23 +833,102 @@ class _Codegen:
         if id(p) in self.roots:
             self.roots[id(op.result)] = self.roots[id(p)]
 
+    def op_hint(self, op: ir.Op) -> None:
+        # `tl.multiple_of` and `tl.max_contiguous` only carry facts for `axis_info`.
+        x = op.operands[0]
+        self.sv[id(op.result)] = self.s(x)
+        if id(x) in self.roots:
+            self.roots[id(op.result)] = self.roots[id(x)]
+
     def op_splat(self, op: ir.Op) -> None:
         raise internal_error("scalar splat", self.loc)
+
+    def vector_plan(self, ptr: ir.Value, lay: L.BitLayout, mask: ir.Value | None) -> int:
+        """Returns how many registers each vector access of a pointer tile covers, or 1.
+
+        A vector access covers `w` registers when the layout's first `w` registers step
+        by one element along a dimension `d`, no other basis touches the low bits of `d`,
+        and `axis_info` proves that each such group of addresses is contiguous, aligned to
+        `w` elements, and, for a masked access, under a constant mask. The first register
+        of each group then sits at a coordinate along `d` that's a multiple of `w`.
+        """
+        if not self.vectorize or not lay.reg:
+            return 1
+        first = lay.reg[0]
+        if sorted(first) != [0] * (len(first) - 1) + [1]:
+            return 1
+        d = first.index(1)
+        k = 0
+        while k < len(lay.reg) and lay.reg[k] == tuple((1 << k) if i == d else 0
+                                                       for i in range(lay.rank)):  # fmt: skip
+            k += 1
+        w = 1 << k
+        if any(0 < b[d] < w for b in lay.reg[k:] + lay.lane + lay.warp):
+            return 1
+        eb = ir.elem_of(ptr.type).elem.dtype.itemsize
+        info = self.plan.axis
+        w = min(w, vector_width(info.get(ptr), d, eb, info.get(mask) if mask else None))
+        return min(w, MAX_VEC)
+
+    @staticmethod
+    def vec_read(e: ir.ScalarType, c: int, addr: str, tmp: str) -> tuple[str, list[str]]:
+        """Returns a declaration of `tmp` read from `addr`, and its `c` element expressions."""
+        vt = f"vec<{CTYPES[e.name]}, {c}>"
+        return (f"const {vt} {tmp} = *(device const {vt}*)({addr});",
+                [f"{tmp}[{i}]" for i in range(c)])  # fmt: skip
+
+    @staticmethod
+    def vec_write(e: ir.ScalarType, c: int, addr: str, vals: list[str]) -> str:
+        """Returns a statement that writes `c` element expressions to `addr`."""
+        vt = f"vec<{CTYPES[e.name]}, {c}>"
+        return f"*(device {vt}*)({addr}) = {vt}({', '.join(vals)});"
+
+    def vloop(self, n: int, c: int, body: Callable[[str], str]) -> None:
+        """Emits `body(r)` for the first register `r` of each group of `c` registers.
+
+        `r` is the counter of an unrolled loop, or a literal when there's only one group
+        or the body indexes `simdgroup_matrix` elements, which need literal indices.
+        """
+        if n == c or "thread_elements" in body("r"):
+            for r in range(0, n, c):
+                self.e.line(body(str(r)))
+            return
+        self.e.line("#pragma unroll")
+        self.e.line(f"for (int r = 0; r < {n}; r += {c}) {body('r')}")
 
     def load(self, op: ir.Op, lay: L.BitLayout) -> Tile:
         res = op.result
         p = self.mat(op.operands[0], lay)
         arr = self.declare(res.type, lay, res.name_hint)
+        m = o = None
         if len(op.operands) == 3:
             m = self.mat(op.operands[1], lay)
             o = self.mat(op.operands[2], lay)
             if m.uniform == "true":
-                body = f"{arr}[{{r}}] = {p.base}[{p.get('{r}')}];"
-            else:
-                body = f"{arr}[{{r}}] = {m.get('{r}')} ? {p.base}[{p.get('{r}')}] : {o.get('{r}')};"
+                m = None
+        c = 1
+        if p.uniform is None:
+            c = self.vector_plan(op.operands[0], lay, op.operands[1] if m is not None else None)
+        if c > 1:
+            tmp = self.fresh("vl")
+
+            def body(r: str) -> str:
+                decl, elems = self.vec_read(res.type.elem, c, f"{p.base} + {p.get(r)}", tmp)
+                get = decl + " " + " ".join(f"{arr}[{_plus(r, i)}] = {x};"
+                                            for i, x in enumerate(elems))  # fmt: skip
+                if m is None:
+                    return f"{{ {get} }}"
+                other = " ".join(f"{arr}[{_plus(r, i)}] = {o.get(_plus(r, i))};"
+                                 for i in range(c))  # fmt: skip
+                return f"{{ if ({m.get(r)}) {{ {get} }} else {{ {other} }} }}"
+
+            self.vloop(lay.num_regs, c, body)
+            return Tile(lay, arr)
+        if m is not None:
+            body_s = f"{arr}[{{r}}] = {m.get('{r}')} ? {p.base}[{p.get('{r}')}] : {o.get('{r}')};"
         else:
-            body = f"{arr}[{{r}}] = {p.base}[{p.get('{r}')}];"
-        self.loop(lay.num_regs, body)
+            body_s = f"{arr}[{{r}}] = {p.base}[{p.get('{r}')}];"
+        self.loop(lay.num_regs, body_s)
         return Tile(lay, arr)
 
     def op_load(self, op: ir.Op) -> None:
@@ -794,17 +956,35 @@ class _Codegen:
         if p.root:
             self.written.add(p.root)
         elem = CTYPES[ptr.type.elem.elem.name]
-        store = f"{p.base}[{p.get('{r}')}] = {elem}({v.get('{r}')});"
-        if mask is not None:
-            mt = self.mat(mask, lay)
-            if mt.uniform != "true":
+        mt = self.mat(mask, lay) if mask is not None else None
+        if mt is not None and mt.uniform == "true":
+            mt = None
+        c = 1
+        if p.uniform is None:
+            c = self.vector_plan(ptr, lay, mask if mt is not None else None)
+        if c > 1:
+
+            def body(r: str) -> str:
+                vals = [f"{elem}({v.get(_plus(r, i))})" for i in range(c)]
+                s = self.vec_write(ptr.type.elem.elem, c, f"{p.base} + {p.get(r)}", vals)
+                return f"{{ if ({mt.get(r)}) {s} }}" if mt is not None else f"{{ {s} }}"
+
+            def emit() -> None:
+                self.vloop(lay.num_regs, c, body)
+        else:
+            store = f"{p.base}[{p.get('{r}')}] = {elem}({v.get('{r}')});"
+            if mt is not None:
                 store = f"if ({mt.get('{r}')}) {store}"
+
+            def emit() -> None:
+                self.loop(lay.num_regs, store)
+
         own = self.owner(lay)
         if own == "true":
-            self.loop(lay.num_regs, store)
+            emit()
         else:
             with self.e.block(f"if ({own})"):
-                self.loop(lay.num_regs, store)
+                emit()
 
     def op_return(self, op: ir.Op) -> None:
         pass
@@ -978,18 +1158,81 @@ class _Codegen:
         for arg, c in zip(body.args[1:], carried, strict=True):
             self._bind(arg, c)
         iv = body.args[0]
-        ivn = self.fresh(iv.name_hint or "i")
-        self.sv[id(iv)] = ivn
-        header, iv_def = self.for_header(op, ivn)
-        with self.e.block(header):
-            if iv_def:
-                self.e.line(iv_def)
-            self.push_scope()
-            self.block(_body_ops(body))
-            self._yield_into(carried, body.ops[-1].operands)
-            self.pop_scope()
+        plan = self.versioning.get(id(op))
+        if plan is not None:
+            self._versioned_for(op, plan, carried)
+        else:
+            ivn = self.fresh(iv.name_hint or "i")
+            self.sv[id(iv)] = ivn
+            header, iv_def = self.for_header(op, ivn)
+            with self.e.block(header):
+                if iv_def:
+                    self.e.line(iv_def)
+                self._loop_body(body, carried)
         for r, c in zip(op.results, carried, strict=True):
             self._bind(r, c)
+
+    def _loop_body(self, body: ir.Block, carried: list[Tile | str]) -> None:
+        self.push_scope()
+        self.block(_body_ops(body))
+        self._yield_into(carried, body.ops[-1].operands)
+        self.pop_scope()
+
+    def _versioned_for(self, op: ir.Op, plan, carried: list[Tile | str]) -> None:
+        """Emits a `tl.dot` loop as interior and edge versions (see `passes.edge_versioning`)."""
+        body = op.regions[0].block
+        iv = body.args[0]
+        lb, ub = self.s(op.operands[0]), self.s(op.operands[1])
+        step = op.operands[2].defining_op.attrs["value"]
+        conds: list[str] = []
+        ends: list[str] = []
+        wide = False
+        for b in plan.bounds:
+            desc = self.descs[id(b.desc)]
+            shape = desc.shape[b.dim]
+            ext = desc.block[b.dim]
+            wide |= b.desc.defining_op.operands[1 + b.dim].type != ir.i32
+            off = self.s(b.offset) if b.offset is not None else None
+            if b.offset is not None:
+                wide |= b.offset.type != ir.i32
+            if not b.uses_counter:
+                conds.append(f"{off} >= 0 && {off} + {ext} <= {shape}")
+                continue
+            if off is not None or not lb.lstrip("-").isdigit() or int(lb) < 0:
+                conds.append(f"{lb if off is None else f'{lb} + {off}'} >= 0")
+            # Iteration i reads [i + off, i + off + ext), in bounds while i < shape - off - ext + 1.
+            end = shape if off is None else f"{shape} - {off}"
+            ends.append(f"{end} - {ext - 1}" if ext > 1 else end)
+        ity = "long" if wide else "int"
+        k_end = f"{ity}({ub})"
+        for e in sorted(set(ends)):
+            k_end = f"min({k_end}, {ity}({e}))"
+        interior = self.fresh("interior")
+        k_name = self.fresh("k_end")
+        self.e.line(f"const bool {interior} = {' && '.join(sorted(set(conds))) or 'true'};")
+        self.e.line(f"const {ity} {k_name} = {k_end};")
+        saved = dict(self.dot_modes)
+
+        def version(mode: str, header: str, ivn: str) -> None:
+            self.dot_modes = {**saved, **dict.fromkeys(plan.dots, mode)}
+            self.sv[id(iv)] = ivn
+            with self.e.block(header):
+                self._loop_body(body, carried)
+
+        with self.e.block(f"if ({interior})"):
+            ivn = self.fresh(iv.name_hint or "i")
+            self.e.line(f"int {ivn} = {lb};")
+            version("fast", f"for (; {ivn} < {k_name}; {ivn} += {step})", ivn)
+            # The later versions repeat the body's conversions and threadgroup requests;
+            # report each only once.
+            first = {k: len(v) for k, v in self.report.items()}
+            version("checked", f"for (; {ivn} < {ub}; {ivn} += {step})", ivn)
+        with self.e.block("else"):
+            ivn = self.fresh(iv.name_hint or "i")
+            version("checked", f"for (int {ivn} = {lb}; {ivn} < {ub}; {ivn} += {step})", ivn)
+        for k, n in first.items():
+            del self.report[k][n:]
+        self.dot_modes = saved
 
     def op_if(self, op: ir.Op) -> None:
         cond = self.s(op.operands[0])
@@ -1127,7 +1370,7 @@ class _Codegen:
             kname, out.text(), args, self.nw, self.tg_bytes, self.warnings,
             language_version=self.language_version, enable_logging=self.enable_logging,
             asserts=self.asserts, assert_buffer_index=assert_index, report=self.report,
-            plan=self.plan,
+            plan=self.plan, idx64=needs_idx64(self.m),
         )  # fmt: skip
         if any(op.name == "dot" for op in self.m.walk()):
             gen.dot_backend = "mpp" if self.mpp is not None and self.mpp.loops else "simdgroup"
@@ -1135,6 +1378,13 @@ class _Codegen:
             if self.mpp is not None:
                 self.m.attrs["dot_backend"] = gen.dot_backend  # for `kernel.explain`
         return gen
+
+
+def _plus(r: str, i: int) -> str:
+    """Returns the register index `r + i`, where `r` is an index expression."""
+    if i == 0:
+        return r
+    return str(int(r) + i) if r.isdigit() else f"{r} + {i}"
 
 
 def _add(expr: str, c: int) -> str:

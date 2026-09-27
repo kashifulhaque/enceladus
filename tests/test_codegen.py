@@ -109,20 +109,21 @@ def test_axis_info_tracks_contiguity_and_order():
 
 
 @enceladus.jit
-def _dot_shared_acc(a_ptr, b_ptr, out_ptr, iters, N: tl.constexpr, CASE: tl.constexpr):
+def _dot_shared_acc(a_ptr, b_ptr, out_ptr, iters, N: tl.constexpr, CASE: tl.constexpr,
+                    ACC: tl.constexpr):  # fmt: skip
     r = tl.arange(0, N)
     a = tl.load(a_ptr + r[:, None] * N + r[None, :])
     b = tl.load(b_ptr + r[:, None] * N + r[None, :])
     acc = tl.dot(a, b)
     if CASE == "loop":
-        res = tl.zeros((N, N), tl.float32)
+        res = tl.zeros((N, N), ACC)
         for _ in range(iters):
             res = tl.dot(a, b, acc)
         acc = res
     elif CASE == "nested":
         # `acc` is carried by the outer loop but reused unchanged by every inner iteration.
         for _ in range(iters):
-            res = tl.zeros((N, N), tl.float32)
+            res = tl.zeros((N, N), ACC)
             for _ in range(iters):
                 res = tl.dot(a, b, acc)
             acc = res
@@ -132,23 +133,26 @@ def _dot_shared_acc(a_ptr, b_ptr, out_ptr, iters, N: tl.constexpr, CASE: tl.cons
     tl.store(out_ptr + r[:, None] * N + r[None, :], acc)
 
 
+# Integer dots keep the accumulator in plain registers, so their in-place logic differs.
+@pytest.mark.parametrize(("dtype", "acc"), [(np.float32, np.float32), (np.int8, np.int32)])
 @pytest.mark.parametrize(("case", "iters", "scale"), [
     ("loop", 1, 2), ("loop", 2, 2), ("loop", 3, 2), ("nested", 2, 3), ("nested", 3, 4),
     ("view", 1, 3),
 ])  # fmt: skip
-def test_dot_updates_its_accumulator_in_place_only_when_nothing_rereads_it(rng_np, case, iters,
-                                                                           scale):  # fmt: skip
+def test_dot_updates_its_accumulator_in_place_only_when_nothing_rereads_it(
+        rng_np, case, iters, scale, dtype, acc):  # fmt: skip
     # Each case gives the accumulator a single use, the dot, while its storage is read again:
     # by the next loop iteration, or through another value.
-    a = rng_np.integers(-2, 3, (16, 16)).astype(np.float32)
-    b = rng_np.integers(-2, 3, (16, 16)).astype(np.float32)
+    a = rng_np.integers(-2, 3, (16, 16)).astype(dtype)
+    b = rng_np.integers(-2, 3, (16, 16)).astype(dtype)
 
     def run(a, b):
-        out = np.empty_like(a)
-        _dot_shared_acc[(1,)](a, b, out, iters, N=16, CASE=case)
+        out = np.empty(a.shape, acc)
+        acc_t = tl.float32 if acc is np.float32 else tl.int32
+        _dot_shared_acc[(1,)](a, b, out, iters, N=16, CASE=case, ACC=acc_t)
         return out
 
-    check_kernel(run, (a, b), lambda a, b: scale * (a @ b))
+    check_kernel(run, (a, b), lambda a, b: scale * (a.astype(acc) @ b.astype(acc)))
 
 
 @enceladus.jit
@@ -219,6 +223,75 @@ def test_descriptor_accesses_outside_the_tensor_are_masked(rng_np, kind, offsets
         return guarded(t[b : b + m, b : b + n])
 
     check_kernel(run, (x, src), reference)
+
+
+@enceladus.jit
+def _versioned_dot(a_ptr, b_ptr, out_ptr, M, N, K, lo, hi, koff, STEP: tl.constexpr,
+                   TRANS_B: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                   BK: tl.constexpr):  # fmt: skip
+    pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+    da = tl.make_tensor_descriptor(a_ptr, [M, K], [K, 1], [BM, BK])
+    do = tl.make_tensor_descriptor(out_ptr, [M, N], [N, 1], [BM, BN])
+    acc = tl.zeros((BM, BN), tl.float32)
+    if TRANS_B:
+        db = tl.make_tensor_descriptor(b_ptr, [N, K], [K, 1], [BN, BK])
+        for k in range(lo, hi, STEP):
+            acc = tl.dot(da.load([pid_m * BM, k + koff]), tl.trans(db.load([pid_n * BN, k])), acc)
+    else:
+        db = tl.make_tensor_descriptor(b_ptr, [K, N], [N, 1], [BK, BN])
+        for k in range(lo, hi, STEP):
+            acc = tl.dot(da.load([pid_m * BM, koff + k]), db.load([k, pid_n * BN]), acc)
+    do.store([pid_m * BM, pid_n * BN], acc)
+
+
+def _tile(x, o0, o1, r, c):
+    """Returns the r x c block of `x` at (o0, o1), zero outside `x`."""
+    out = np.zeros((r, c), x.dtype)
+    rows, cols = np.arange(o0, o0 + r), np.arange(o1, o1 + c)
+    rm, cm = (rows >= 0) & (rows < x.shape[0]), (cols >= 0) & (cols < x.shape[1])
+    out[np.ix_(rm, cm)] = x[np.ix_(rows[rm], cols[cm])]
+    return out
+
+
+# (M, N, K, lo, hi, koff, STEP, TRANS_B): aligned; ragged M, N, and K; a shifted K offset
+# that makes the last block ragged; negative offsets in early iterations; a step smaller
+# than the block; and K smaller than one block.
+VERSIONED_CASES = [
+    (64, 64, 64, 0, 64, 0, 16, False), (40, 48, 47, 0, 47, 0, 16, True),
+    (64, 32, 64, 0, 64, 1, 16, False), (32, 64, 40, -16, 40, 3, 16, True),
+    (32, 32, 48, 0, 48, 0, 8, True), (40, 32, 5, 0, 5, 0, 16, False),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("case", VERSIONED_CASES, ids=str)
+def test_edge_versioned_dot_loops(rng_np, case):
+    m, n, k, lo, hi, koff, step, trans_b = case
+    bm, bn, bk = 32, 32, 16
+    a = rng_np.integers(-3, 4, (m, k)).astype(np.float32)
+    b = rng_np.integers(-3, 4, (n, k) if trans_b else (k, n)).astype(np.float32)
+    grid = (-(-n // bn), -(-m // bm))
+
+    def run(a, b):
+        out = np.zeros((m, n), np.float32)
+        _versioned_dot[grid](a, b, out, m, n, k, lo, hi, koff, STEP=step, TRANS_B=trans_b,
+                             BM=bm, BN=bn, BK=bk)  # fmt: skip
+        return out
+
+    def reference(a, b):
+        out = np.zeros((grid[1] * bm, grid[0] * bn), np.float32)
+        bt = b.T if trans_b else b
+        for pm in range(grid[1]):
+            for pn in range(grid[0]):
+                for kk in range(lo, hi, step):
+                    out[pm * bm:(pm + 1) * bm, pn * bn:(pn + 1) * bn] += \
+                        _tile(a, pm * bm, kk + koff, bm, bk) @ _tile(bt, kk, pn * bn, bk, bn)
+        return out[:m, :n]
+
+    check_kernel(run, (a, b), reference, atol=0, rtol=0)
+    # The loop runs as an unmasked main loop, a checked K tail, and a checked edge version.
+    ck = _versioned_dot.warmup(a, b, np.zeros((m, n), np.float32), m, n, k, lo, hi, koff,
+                               STEP=step, TRANS_B=trans_b, BM=bm, BN=bn, BK=bk)  # fmt: skip
+    assert ck.msl.count("simdgroup_multiply_accumulate") == 3
 
 
 @enceladus.jit
@@ -376,7 +449,23 @@ _consts.BIAS = 1.0
 
 
 def _py_factor():  # a plain Python helper that the kernel calls at compile time
-    return FACTOR * 2.0
+    return FACTOR * float(np.exp2(1.0))  # a NumPy ufunc is keyed by the NumPy version
+
+
+CLASS_GLOBAL = 2.0
+BASE_GLOBAL = 0.25
+
+
+class _CfgBase:
+    def bias(self):
+        return BASE_GLOBAL  # a global read by an inherited method
+
+
+class _Cfg(_CfgBase):
+    K = 3.0
+
+    def factor(self):
+        return self.K * CLASS_GLOBAL  # a class attribute and a global read by a method
 
 
 @enceladus.jit
@@ -397,6 +486,8 @@ def _scale_by_globals(x_ptr, out_ptr):
     offs = tl.arange(0, 16)
     x = tl.load(x_ptr + offs)
     y = _consts.add_offset(x * SCALE) + TUP[1] * _py_factor() + _consts.BIAS
+    cfg = _Cfg()  # an instance that the kernel builds at compile time
+    y = y + cfg.factor() + cfg.bias()
     tl.store(out_ptr + offs, y)
     tl.store(out_ptr + 16 + offs, 1.0 / ((x + 1.0) * ZERO))
 
@@ -404,6 +495,7 @@ def _scale_by_globals(x_ptr, out_ptr):
 def _scale_by_globals_reference(x):
     offset = OFFSET if _consts.add_offset is _add_offset else -OFFSET
     y = x * SCALE + offset + TUP[1] * FACTOR * 2.0 + _consts.BIAS
+    y = y + _Cfg.K * CLASS_GLOBAL + BASE_GLOBAL
     with np.errstate(divide="ignore"):
         return np.concatenate([y, np.float32(1.0) / ((x + 1) * np.float32(ZERO))])
 
@@ -426,9 +518,12 @@ def _start_new_process(kernel):
         (None, "ZERO", -0.0),  # equal to 0.0, but 1 / -0.0 is -inf
         (_consts, "BIAS", 5.0),
         (_consts, "add_offset", _sub_offset),
+        (None, "CLASS_GLOBAL", 5.0),  # read by a method of a class that the kernel uses
+        (None, "BASE_GLOBAL", 5.0),  # read by a method of a base class
+        (_Cfg, "K", 5.0),  # a class attribute, read through `self`
     ],
     ids=["global", "helper_global", "tuple", "python_helper", "signed_zero", "module_attr",
-         "module_jit_helper"],
+         "module_jit_helper", "method_global", "base_method_global", "class_attr"],
 )  # fmt: skip
 def test_changed_dependency_recompiles(monkeypatch, tmp_path, owner, name, value, new_process):
     monkeypatch.setenv("ENCELADUS_CACHE_DIR", str(tmp_path))

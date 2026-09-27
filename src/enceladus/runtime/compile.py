@@ -72,6 +72,7 @@ def _from_cache_entry(key: str, meta_text: str, msl: str) -> CompiledKernel | No
             assert_buffer_index=meta.get("assert_buffer_index"),
             dot_backend=meta.get("dot_backend"),
             dot_fallbacks=list(meta.get("dot_fallbacks", [])),
+            idx64=bool(meta.get("idx64", False)),
         )  # fmt: skip
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         log.debug("enceladus: ignoring the corrupt cache entry %s: %s", key[:32], e)
@@ -124,7 +125,7 @@ def compile_specialization(fn: JITFunction, spec: Specialization, num_warps: int
                             enable_logging=gen.enable_logging, asserts=gen.asserts,
                             assert_buffer_index=gen.assert_buffer_index,
                             dot_backend=gen.dot_backend,
-                            dot_fallbacks=gen.dot_fallbacks)  # fmt: skip
+                            dot_fallbacks=gen.dot_fallbacks, idx64=gen.idx64)  # fmt: skip
         meta = {
             "name": ck.name,
             "args": [dataclasses.asdict(a) for a in ck.args],
@@ -138,6 +139,7 @@ def compile_specialization(fn: JITFunction, spec: Specialization, num_warps: int
             "assert_buffer_index": ck.assert_buffer_index,
             "dot_backend": gen.dot_backend,
             "dot_fallbacks": gen.dot_fallbacks,
+            "idx64": gen.idx64,
         }
         try:
             d = cache.write_entry(key, {"kernel.metal": ck.msl, "ir.txt": ck.ir}, meta)

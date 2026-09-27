@@ -307,6 +307,62 @@ def test_int_to_half_casts(mode, src, dst):
         check_kernel(run, (x,), lambda x: x.astype(dst), modes=(mode,), atol=0, rtol=0)
 
 
+# Edge values for float-to-int casts: NaN, infinities, fractions, negatives for unsigned
+# types, and values just inside and just past each integer type's range. Values that the
+# source type can't hold round to it (float16 overflows to inf).
+FLOAT_TO_INT_VALUES = [
+    math.nan, -math.nan, math.inf, -math.inf, -0.0, 0.5, -0.5, -0.99, -1.0, -2.5, 1e-40,
+    127.5, 128.0, -128.5, -129.0, 255.5, 256.0, -255.0, 32767.5, 32768.0, -32769.0,
+    65535.5, 65536.0, -65536.0, 2.0**31 - 128, 2.0**31, -(2.0**31), -(2.0**31) - 256,
+    2.0**32 - 256, 2.0**32, 2.0**63 - 2**39, 2.0**63, -(2.0**63), 2.0**63 + 2**40,
+    -(2.0**63) - 2**40, 1.5 * 2.0**64, 2.0**64, -(2.0**64), 2.0**70 + 2**47,
+    -(2.0**70) - 2**47, 3e38, -3e38,
+]  # fmt: skip
+INT_DSTS = {"i8": (np.int8, tl.int8), "u8": (np.uint8, tl.uint8), "i16": (np.int16, tl.int16),
+            "u16": (np.uint16, tl.uint16), "i32": (np.int32, tl.int32),
+            "u32": (np.uint32, tl.uint32), "i64": (np.int64, tl.int64),
+            "u64": (np.uint64, tl.uint64)}  # fmt: skip
+
+
+def metal_float_to_int(v: float, dst: type) -> int:
+    """What Metal gives for `dst(v)` on Apple GPUs, measured with raw MSL.
+
+    NaN becomes 0. `long` wraps the truncated value modulo 2**64 and maps infinities to 0.
+    Every other integer type saturates.
+    """
+    if math.isnan(v):
+        return 0
+    info = np.iinfo(dst)
+    if dst is np.int64:
+        if math.isinf(v):
+            return 0
+        r = math.trunc(v) % (1 << 64)
+        return r - (1 << 64) if r >= 1 << 63 else r
+    if math.isinf(v):
+        return int(info.max) if v > 0 else int(info.min)
+    return min(max(math.trunc(v), int(info.min)), int(info.max))
+
+
+@pytest.mark.filterwarnings("ignore:_cast_kernel has been compiled")
+@pytest.mark.parametrize("dst", list(INT_DSTS))
+@pytest.mark.parametrize("src", [F32, F16, BF16], ids=["f32", "f16", "bf16"])
+def test_float_to_int_casts_match_metal(mode, src, dst):
+    with np.errstate(over="ignore"):
+        x = np.zeros(64, src)
+        x[: len(FLOAT_TO_INT_VALUES)] = np.array(FLOAT_TO_INT_VALUES, np.float32).astype(src)
+    dnp, dt = INT_DSTS[dst]
+
+    def run(x):
+        out = np.zeros(x.size, dnp)
+        _cast_kernel[(1,)](x, out, DT=dt, BLOCK=x.size)
+        return out
+
+    def reference(x):
+        return np.array([metal_float_to_int(float(v), dnp) for v in x.tolist()], dnp)
+
+    check_kernel(run, (x,), reference, modes=(mode,))
+
+
 SHAPE_OPS = {
     "trans": lambda x: x.T, "T": lambda x: x.T, "reshape": lambda x: x.reshape(16, 8),
     "row_bcast": lambda x: x - x.max(1, keepdims=True),
@@ -707,6 +763,76 @@ def test_descriptor_matmul(mode, rng, dtype, mkn, trans_b):
 
     check_kernel(run, (randn(rng, (m, k), dtype), randn(rng, (k, n), dtype)), ref,
                  modes=(mode,), atol=1e-4 if dtype is F32 else None)  # fmt: skip
+
+
+@enceladus.jit
+def _int_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr,
+                       BK: tl.constexpr, VARIANT: tl.constexpr):  # fmt: skip
+    pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.int32)
+    if VARIANT == "desc":
+        a = tl.make_tensor_descriptor(a_ptr, [M, K], [K, 1], [BM, BK])
+        b = tl.make_tensor_descriptor(b_ptr, [K, N], [N, 1], [BK, BN])
+        for k in range(0, K, BK):
+            acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+    else:
+        # "hoist" loads A (K <= BK) once, so the dot reads it from registers.
+        a = tl.load(a_ptr + rm[:, None] * K + rk[None, :],
+                    mask=(rm[:, None] < M) & (rk[None, :] < K), other=0)  # fmt: skip
+        for k in range(0, K, BK):
+            if VARIANT == "pointer":
+                a = tl.load(a_ptr + rm[:, None] * K + (k + rk)[None, :],
+                            mask=(rm[:, None] < M) & ((k + rk)[None, :] < K), other=0)  # fmt: skip
+            b = tl.load(b_ptr + (k + rk)[:, None] * N + rn[None, :],
+                        mask=((k + rk)[:, None] < K) & (rn[None, :] < N), other=0)  # fmt: skip
+            acc = tl.dot(a, b, acc)
+    tl.store(c_ptr + rm[:, None] * N + rn[None, :], acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+def _int_matmul(a, b, variant="desc", bm=32, bn=32, bk=32, num_warps=4):
+    (m, k), n = a.shape, b.shape[1]
+    c = np.zeros((m, n), np.int32)
+    grid = (enceladus.cdiv(n, bn), enceladus.cdiv(m, bm))
+    _int_matmul_kernel[grid](a, b, c, m, n, k, BM=bm, BN=bn, BK=bk, VARIANT=variant,
+                             num_warps=num_warps)  # fmt: skip
+    return c
+
+
+def _int_matmul_ref(a, b, **_):
+    return (a.astype(np.int64) @ b.astype(np.int64)).astype(np.int32)  # wraps like int32
+
+
+@pytest.mark.parametrize("variant", ["desc", "pointer", "hoist"])
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8, np.int16, np.int32])
+@pytest.mark.parametrize("mkn", [(64, 64, 64), (50, 100, 33)])
+def test_integer_dot(mode, rng, dtype, mkn, variant):
+    # Full-range values: 16-bit and 32-bit products and sums wrap modulo 2^32.
+    m, k, n = mkn
+    info = np.iinfo(dtype)
+    a = rng.integers(info.min, info.max, (m, k), dtype, endpoint=True)
+    b = rng.integers(info.min, info.max, (k, n), dtype, endpoint=True)
+    blocks = {"bm": 16, "bk": enceladus.next_power_of_2(k)} if variant == "hoist" else {}
+    check_kernel(_int_matmul, (a, b), _int_matmul_ref, kwargs={"variant": variant, **blocks},
+                 modes=(mode,))  # fmt: skip
+
+
+@pytest.mark.parametrize("dtype, k, bk, variant", [
+    (np.int8, 2048, 32, "desc"),
+    # One block of K = 512 needs two float32 partial sums of 256 steps each.
+    (np.uint8, 512, 512, "desc"),
+    (np.uint8, 512, 512, "hoist"),
+])  # fmt: skip
+def test_integer_dot_is_exact_past_float32_precision(mode, dtype, k, bk, variant):
+    # Every sum exceeds 2^24 and is odd, so float32 accumulation would round it.
+    extreme = np.iinfo(dtype).min if dtype == np.int8 else np.iinfo(dtype).max
+    a = np.full((8, k), extreme, dtype)
+    b = np.full((k, 8), extreme, dtype)
+    a[:, 0] = 1
+    check_kernel(_int_matmul, (a, b), _int_matmul_ref, modes=(mode,),
+                 kwargs={"variant": variant, "bm": 8, "bn": 8, "bk": bk, "num_warps": 1})
 
 
 # Argument names that generated code also uses: the register loop index `r`, the MMA

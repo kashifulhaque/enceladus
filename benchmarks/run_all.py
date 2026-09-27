@@ -5,6 +5,10 @@ Run with `uv run python benchmarks/run_all.py`. The runner discovers every
 report of that name exists, the new one gets a numeric suffix, such as
 `<date>-<architecture>-2.md`, so an earlier run is never overwritten. Pass `--dry-run` to
 print the benchmarks and the report path without running anything.
+
+On a laptop, sustained GPU work lowers the GPU clock within about a minute, so a benchmark
+that follows the matmul benchmark can run slower than it would alone. To let the GPU cool
+between scripts, pass `--cooldown SECONDS`.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import argparse
 import datetime
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import enceladus
@@ -40,6 +45,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true",
                         help="print the benchmarks and the report path, and exit")  # fmt: skip
+    parser.add_argument("--cooldown", type=float, default=0.0, metavar="SECONDS",
+                        help="idle time before each benchmark after the first")  # fmt: skip
     args = parser.parse_args()
     caps = enceladus.get_device().caps
     date = datetime.date.today().isoformat()
@@ -54,9 +61,13 @@ def main() -> None:
         "",
         f"Device: {caps.name} ({caps.architecture}). Enceladus {enceladus.__version__}.",
         "Enceladus times use GPU timestamps; MLX and PyTorch times use the wall clock.",
+        *([f"Each benchmark after the first ran after {args.cooldown:g} s of idle time."]
+          if args.cooldown else []),
         "",
     ]
-    for name in names:
+    for i, name in enumerate(names):
+        if i and args.cooldown:
+            time.sleep(args.cooldown)
         print(f"running {name}...", flush=True)
         r = subprocess.run([sys.executable, str(HERE / f"{name}.py")], capture_output=True,
                            text=True)  # fmt: skip

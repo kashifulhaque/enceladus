@@ -7,9 +7,9 @@
 
 <section class="doc prose">
   <h2>What it measures</h2>
-  <p><code>bench_elementwise</code> runs the vector add from <code>examples/01_vector_add.py</code>, <code>out = x + y</code>, on 2<sup>26</sup> elements. That's 256 MB per array in <code>float32</code> and 128 MB in <code>float16</code>, far larger than the GPU's caches. The script measures the following:</p>
+  <p><code>bench_elementwise</code> runs the vector add from <code>examples/01_vector_add.py</code>, <code>out = x + y</code>, on 2<sup>26</sup> elements in <code>float32</code> and <code>float16</code>, and on 2<sup>28</sup> elements in <code>int8</code>. That's 256 MB per array in <code>float32</code> and <code>int8</code>, and 128 MB in <code>float16</code>, far larger than the GPU's caches. The script measures the following:</p>
   <ul class="tight">
-    <li>Enceladus with <code>BLOCK=1024</code> and <code>BLOCK=4096</code>, in <code>float32</code> and <code>float16</code>, as the minimum of 20 GPU-timed runs.</li>
+    <li>Enceladus with <code>BLOCK=1024</code> and <code>BLOCK=4096</code>, in <code>float32</code>, <code>float16</code>, and <code>int8</code>, as the minimum of 20 GPU-timed runs.</li>
     <li>MLX's <code>x + y</code> on the same shape and dtype, as the minimum of 20 wall-clock runs after 10 warmup runs. The script measures MLX again for each row.</li>
     <li>The compile time of the vector add, from the Python frontend to MSL, as the median of 50 compilations. This excludes Metal's own compilation of the MSL.</li>
   </ul>
@@ -22,22 +22,24 @@
   <div class="table-wrap"><table>
     <thead><tr><th>dtype</th><th>BLOCK</th><th class="n">Min (ms)</th><th class="n">Enceladus GB/s</th><th class="n">MLX GB/s</th></tr></thead>
     <tbody>
-      <tr><td><code>float32</code></td><td>1024</td><td class="n">3.594</td><td class="n">224.1</td><td class="n">206.2</td></tr>
-      <tr><td><code>float32</code></td><td>4096</td><td class="n">3.723</td><td class="n">216.3</td><td class="n">214.6</td></tr>
-      <tr><td><code>float16</code></td><td>1024</td><td class="n">1.819</td><td class="n">221.4</td><td class="n">206.6</td></tr>
-      <tr><td><code>float16</code></td><td>4096</td><td class="n">1.825</td><td class="n">220.6</td><td class="n">205.8</td></tr>
+      <tr><td><code>float32</code></td><td>1024</td><td class="n">3.404</td><td class="n">236.6</td><td class="n">227.4</td></tr>
+      <tr><td><code>float32</code></td><td>4096</td><td class="n">3.451</td><td class="n">233.4</td><td class="n">228.3</td></tr>
+      <tr><td><code>float16</code></td><td>1024</td><td class="n">1.691</td><td class="n">238.1</td><td class="n">213.0</td></tr>
+      <tr><td><code>float16</code></td><td>4096</td><td class="n">1.697</td><td class="n">237.2</td><td class="n">215.8</td></tr>
+      <tr><td><code>int8</code></td><td>1024</td><td class="n">3.407</td><td class="n">236.4</td><td class="n">214.6</td></tr>
+      <tr><td><code>int8</code></td><td>4096</td><td class="n">3.479</td><td class="n">231.5</td><td class="n">214.4</td></tr>
     </tbody>
   </table></div>
-  <p>The vector add compiles from the frontend to MSL in 0.37 ms.</p>
+  <p>The vector add compiles from the frontend to MSL in 0.46 ms.</p>
 </section>
 
 <section class="doc prose">
   <h2>Reading the results</h2>
   <ul class="tight">
-    <li><strong>Both dtypes reach the same bandwidth.</strong> <code>float16</code> moves half the bytes in about half the time, so the kernel is bound by memory bandwidth, not by instruction count.</li>
-    <li><strong>Block size matters little.</strong> <code>BLOCK=1024</code> is slightly faster than <code>BLOCK=4096</code> in both dtypes: 224.1 against 216.3 GB/s in <code>float32</code>, and 221.4 against 220.6 GB/s in <code>float16</code>.</li>
-    <li><strong>Enceladus leads MLX by 1-9%.</strong> MLX's own number varies from 205.8 to 214.6 GB/s between rows of the same run, so treat differences of a few percent as noise. MLX's time also includes wall-clock overhead.</li>
-    <li><strong>Compilation is cheap.</strong> At 0.37 ms, the Python-to-MSL step costs less than one launch of this kernel on 256 MB arrays.</li>
+    <li><strong>All three dtypes reach the same bandwidth.</strong> Every configuration runs at 231.5-238.1 GB/s. <code>float16</code> moves half the bytes in about half the time, and <code>int8</code> adds four times as many elements as <code>float32</code> in the same time, so the kernel is bound by memory bandwidth, not by instruction count.</li>
+    <li><strong>Block size matters little.</strong> <code>BLOCK=1024</code> is slightly faster than <code>BLOCK=4096</code> in every dtype: 236.6 against 233.4 GB/s in <code>float32</code>, 238.1 against 237.2 GB/s in <code>float16</code>, and 236.4 against 231.5 GB/s in <code>int8</code>.</li>
+    <li><strong>Enceladus leads MLX by 2-12%.</strong> In <code>float32</code>, the 2-4% lead is about the size of MLX's wall-clock overhead. In <code>float16</code> and <code>int8</code>, Enceladus leads by 8-12%, and MLX takes 0.17-0.35 ms longer, more than the overhead of about 0.1 ms explains.</li>
+    <li><strong>Compilation is cheap.</strong> At 0.46 ms, the Python-to-MSL step costs less than one launch of this kernel on 256 MB arrays.</li>
   </ul>
   <p>For guidance on block sizes and SIMD groups for memory-bound kernels, see <a href="/docs/performance/">Performance</a>.</p>
 </section>

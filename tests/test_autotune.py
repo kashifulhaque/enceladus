@@ -191,6 +191,63 @@ def test_restore_value_resets_before_every_benchmark_run():
     np.testing.assert_array_equal(out.numpy(), 6.0)
 
 
+# Scripted GPU times in ms by BLOCK, for the first phase (every config) and the second
+# (interleaved re-timing of the fastest few), and the config that tuning must pick.
+TWO_PHASE_CASES = {
+    # Phase 1 favors 512 by noise; phase 2 finds 1024 10% faster.
+    "second_phase_decides": ({256: 1.10, 512: 1.00, 1024: 1.05},
+                             {256: 1.10, 512: 1.00, 1024: 0.90}, 1024),
+    # In phase 2, 256 is within the 1% tolerance of 512, and it comes first in the list.
+    "tolerance_prefers_earlier": ({256: 1.10, 512: 1.00, 1024: 1.05},
+                                  {256: 1.005, 512: 1.00, 1024: 1.20}, 256),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("case", list(TWO_PHASE_CASES))
+def test_second_phase_and_tolerance_pick_the_winner(monkeypatch, case):
+    phase1, phase2, expected = TWO_PHASE_CASES[case]
+    running = []
+    configs = [enceladus.Config({"BLOCK": b}, pre_hook=lambda a, b=b: running.append(b))
+               for b in (256, 512, 1024)]  # fmt: skip
+
+    def fake_do_bench(fn, warmup_ms=50.0, rep=20, return_mode="median"):
+        fn()
+        enceladus.synchronize()
+        block = running[-1]
+        if return_mode == "all":  # the second phase drops the first sample of a batch
+            return [100.0] + [phase2[block]] * (rep - 1)
+        return phase1[block]
+
+    monkeypatch.setattr("enceladus.testing.do_bench", fake_do_bench)
+    tuned = Autotuner(_accumulate, configs, key=["n"], reset_to_zero=["out_ptr"], rep=8)
+    x, out = enceladus.randn(4096), enceladus.zeros(4096)
+    tuned[_grid](x, out, 4096)
+    assert tuned.config_for(x, out, 4096).kwargs["BLOCK"] == expected
+    np.testing.assert_array_equal(out.numpy(), x.numpy())
+
+
+@enceladus.jit
+def _strided_copy(x_ptr, out_ptr, n, stride, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs * stride, mask=mask), mask=mask)
+
+
+def test_tuning_benchmarks_the_specialization_that_the_launch_runs():
+    # Views that start 4 bytes into their arrays: neither pointer is 16-byte aligned, and
+    # `x` has a stride of 2 that the kernel applies itself.
+    x = np.arange(2 * 4096, dtype=np.float32)[1::2]
+    out = np.zeros(4096 + 1, np.float32)[1:]
+    tuned = Autotuner(_strided_copy, CONFIGS[1:], key=["n"], rep=3, warmup_ms=1)
+    tuned[_grid](x, out, 4096, 2)
+    np.testing.assert_array_equal(out, x)
+    # Tuning compiled every config, and the launch compiled or reused the chosen one. All
+    # of them specialize both pointers as unaligned, as the launch does.
+    f32 = np.dtype(np.float32)
+    assert len(_strided_copy._compiled) == 2
+    assert {k[0][:2] for k in _strided_copy._compiled} == {((f32, False), (f32, False))}
+
+
 def test_concurrent_saves_keep_every_result():
     tuners = [Autotuner(_accumulate, CONFIGS, key=["n"]) for _ in range(16)]
     for i, t in enumerate(tuners):

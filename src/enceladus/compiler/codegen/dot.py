@@ -21,6 +21,8 @@ Operands come from one of three sources:
 Direct loads take an unmasked fast path when the whole block is in bounds, chosen by a
 threadgroup-uniform branch per `dot`. Otherwise each fragment tests its own bounds
 (uniform across the SIMD group) and only straddling fragments use masked per-lane loads.
+In a loop that `passes.edge_versioning` covers, the loop version decides instead, and
+each `dot` emits only the path that its version needs.
 """
 
 from __future__ import annotations
@@ -119,8 +121,8 @@ def find_direct_operands(module: ir.Module, plan: LayoutPlan) -> set[int]:
         return False
 
     for op in module.walk():
-        if op.name != "dot":
-            continue
+        if op.name != "dot" or not is_float(op.operands[0].type.elem):
+            continue  # integer dots stage their operands (see `emit_int_dot`)
         a, b = op.operands[:2]
         a_direct = id(a) not in plan.hoisted and direct(a, op)
         if not stages_b(plan, op, a_direct):
@@ -167,6 +169,8 @@ def _frag_consts(cg: _Codegen) -> tuple[str, str]:
 
 def emit_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
     a, b, c = op.operands
+    if not is_float(a.type.elem):
+        return emit_int_dot(cg, op, lay)
     bm, bk = a.type.shape
     bn = b.type.shape[1]
     tm, tn, wm, wn = L.frag_grid(lay)
@@ -290,13 +294,140 @@ def emit_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
             mma_step(checked, None)
 
     conds = [x for x in (_in_bounds(da, bm, bk), _in_bounds(db, bk, bn)) if x]
-    if not conds:
+    mode = cg.dot_modes.get(id(op))  # set by an edge-versioned loop
+    if not conds or mode == "fast":
         mma_loop(False)
+    elif mode == "checked":
+        mma_loop(True)
     else:
         with cg.e.block(f"if ({' && '.join(conds)})"):
             mma_loop(False)
         with cg.e.block("else"):
             mma_loop(True)
+    return out
+
+
+# The largest K that one float32 partial sum of integer products can cover exactly,
+# for each operand type that `simdgroup_matrix` takes as `half`: float32 holds every
+# integer up to 2^24, and |a * b| is at most 2^14 for int8 and 255^2 for uint8.
+_INT_MMA_CHUNK = {"i8": (1 << 24) // (1 << 14), "u8": (1 << 24) // (255 * 255) // 8 * 8}
+
+
+def emit_int_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
+    """Emits an integer `tl.dot` that accumulates exactly in int32.
+
+    `simdgroup_matrix` has no integer types, so `int8` and `uint8` operands convert to
+    `half`, which holds them exactly, and multiply-accumulate in float32 fragments. A
+    float32 sum is exact while every partial sum stays within 2^24, so the fragments add
+    into the int32 accumulator and restart from zero at least every `_INT_MMA_CHUNK`
+    steps of K. Wider integer operands have products that float32 can't hold, so they
+    run as scalar 32-bit multiply-adds from threadgroup memory. Both paths wrap modulo
+    2^32, like Triton's int32 accumulation.
+    """
+    a, b, c = op.operands
+    bm, bk = a.type.shape
+    bn = b.type.shape[1]
+    tm, tn, wm, wn = L.frag_grid(lay)
+    elem = a.type.elem.name
+    n = lay.num_regs
+
+    acc_in = cg.mat(c, lay)
+    if acc_in.name and acc_in.frag is None and acc_in.uniform is None and \
+            cg.uses.get(id(c)) == 1 and _can_clobber(cg, c, op) and \
+            op.result.type == c.type:  # fmt: skip
+        out = acc_in
+    else:
+        out = Tile(lay, cg.declare(op.result.type, lay, op.result.name_hint or "acc"))
+        cg._assign(out, acc_in, n)
+    d = out.name
+
+    mma = elem in _INT_MMA_CHUNK
+    in_t = "half" if mma else CTYPES[elem]
+    ra = _register_a(cg, a, bm, bk, wm, wn, in_t) if mma else None
+    tg = _stage(cg, ([a] if ra is None else []) + [b], in_t)
+
+    if not mma:
+        # acc[r] += A[row(r), k] * B[k, col(r)], in uint so that overflow wraps.
+        ta, lda = tg[id(a)]
+        tb, ldb = tg[id(b)]
+        rows = [cg.coord(lay, r, 0) for r in range(n)]
+        cols = [cg.coord(lay, r, 1) for r in range(n)]
+        with cg.e.block(f"for (int kk = 0; kk < {bk}; ++kk)"):
+            for r in range(n):
+                cg.e.line(f"{d}[{r}] = as_type<int>(as_type<uint>({d}[{r}]) + "
+                          f"uint({ta}[({rows[r]}) * {lda} + kk]) * "
+                          f"uint({tb}[kk * {ldb} + {cols[r]}]));")  # fmt: skip
+        return out
+
+    sm, sn = bm // wm, bn // wn
+    lwm = wm.bit_length() - 1
+    sr = cg.pro(f"sr|{wm}|{sm}", "sr", "int", f"int(warp & {wm - 1}u) * {sm}") if wm > 1 else "0"
+    sc = cg.pro(f"sc|{lwm}|{sn}", "sc", "int", f"int(warp >> {lwm}) * {sn}") if wn > 1 else "0"
+    fs = cg.fresh("fsum")
+    part = Tile(lay, fs, frag=(tm, tn))
+    cg.e.line(f"simdgroup_matrix<float, 8, 8> {fs}[{tm}][{tn}];")
+    chunk = _INT_MMA_CHUNK[elem]
+    for k0 in range(0, bk, chunk):
+        k1 = min(bk, k0 + chunk)
+        for i in range(tm):
+            for j in range(tn):
+                cg.e.line(f"{fs}[{i}][{j}] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);")
+        if ra is not None:
+            # Register fragments need constant indices (see `emit_dot`).
+            steps = [(str(kc * 8), kc) for kc in range(k0 // 8, k1 // 8)]
+        else:
+            steps = [("kk", None)]
+            cg.e.line("#pragma unroll")
+        for kk, kc in steps:
+            head = f"for (int kk = {k0}; kk < {k1}; kk += 8)" if kc is None else ""
+            with cg.e.block(head):
+                cg.e.line(f"simdgroup_matrix<half, 8, 8> fa[{tm}], fb[{tn}];")
+                if ra is not None:
+                    cg.e.line(f"for (int i = 0; i < {tm}; ++i) fa[i] = {ra}[i][{kc}];")
+                else:
+                    name, ld = tg[id(a)]
+                    cg.e.line(f"for (int i = 0; i < {tm}; ++i) simdgroup_load(fa[i], {name} + "
+                              f"({_add(sr, 'i * 8')}) * {ld} + {kk}, {ld});")  # fmt: skip
+                name, ld = tg[id(b)]
+                cg.e.line(f"for (int j = 0; j < {tn}; ++j) simdgroup_load(fb[j], {name} + "
+                          f"{kk} * {ld} + {_add(sc, 'j * 8')}, {ld});")  # fmt: skip
+                cg.e.line(f"for (int i = 0; i < {tm}; ++i)")
+                cg.e.line(f"  for (int j = 0; j < {tn}; ++j) simdgroup_multiply_accumulate("
+                          f"{fs}[i][j], fa[i], fb[j], {fs}[i][j]);")  # fmt: skip
+        # Each partial sum is an exact integer, so the conversion to int is exact.
+        for r in range(n):
+            cg.e.line(f"{d}[{r}] = as_type<int>(as_type<uint>({d}[{r}]) + "
+                      f"as_type<uint>(int({part.get(r)})));")  # fmt: skip
+    return out
+
+
+def _stage(cg: _Codegen, vals: list[ir.Value], in_t: str) -> dict[int, tuple[str, int]]:
+    """Writes 2D dot operands to threadgroup memory as `in_t`, rows padded by 16 bytes.
+
+    Returns {id(operand): (pointer name, row stride in elements)}.
+    """
+    if not vals:
+        return {}
+    eb = 2 if in_t in ("half", "short", "ushort") else 1 if in_t in ("char", "uchar") else 4
+    pad = 16 // eb
+    off, out, plan = 0, {}, []
+    for v in vals:
+        rows, cols = v.type.shape
+        ld = cols + pad
+        plan.append((v, off, ld))
+        off += -(-rows * ld * eb // 16) * 16
+    cg.use_tg(off)
+    cg.e.line(BARRIER)
+    for v, o, ld in plan:
+        t = cg.mat(v, cg.plan.natural(v) or cg.plan.default(v.type))
+        name = cg.fresh("tgop")
+        out[id(v)] = (name, ld)
+        cg.e.line(f"threadgroup {in_t}* {name} = (threadgroup {in_t}*)(tg_mem + {o});")
+        flat, consts = cg.flat(t.layout, (ld, 1))
+        with cg.e.block(f"if ({cg.owner(t.layout)})"):
+            for r in range(t.layout.num_regs):
+                cg.e.line(f"{name}[{_add(flat, consts[r])}] = {in_t}({t.get(r)});")
+    cg.e.line(BARRIER)
     return out
 
 

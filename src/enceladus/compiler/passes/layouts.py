@@ -29,7 +29,13 @@ from enceladus.compiler.passes.axis_info import AxisAnalysis, contiguous_order
 
 CHEAP_SOURCES = frozenset(["const", "splat", "arange", "full"])
 ELEMENTWISE = frozenset(["binary", "cmp", "unary", "fma", "select", "cast", "bitcast", "addptr"])
-VIEWS = frozenset(["expand_dims", "broadcast", "reshape", "trans"])
+# `hint` (`tl.multiple_of` and `tl.max_contiguous`) is an identity that only carries
+# facts for `axis_info`, so it's a view whose layout is its input's.
+VIEWS = frozenset(["expand_dims", "broadcast", "reshape", "trans", "hint"])
+# Shape ops that combine or separate tiles. They're cheap over cheap operands, and
+# anchored otherwise, in a layout derived from the operand's (see `layout.join` and
+# `layout.split`).
+JOIN_SPLIT = frozenset(["join", "split"])
 
 CHEAP, VIEW, ANCHORED = "cheap", "view", "anchored"
 
@@ -83,6 +89,8 @@ class LayoutPlan:
 def view_layout(op: ir.Op, src: L.BitLayout) -> L.BitLayout:
     """Returns the layout of a shape op's result given its input layout."""
     t = op.result.type
+    if op.name == "hint":
+        return src
     if op.name == "expand_dims":
         return L.expand(src, op.attrs["axis"])
     if op.name == "reshape":
@@ -101,6 +109,8 @@ def view_layout(op: ir.Op, src: L.BitLayout) -> L.BitLayout:
 def view_source_layout(op: ir.Op, dst: L.BitLayout) -> L.BitLayout:
     """Returns the input layout that makes a shape op produce `dst` without moving data."""
     src_t = op.operands[0].type
+    if op.name == "hint":
+        return dst
     if op.name == "expand_dims":
         ax = op.attrs["axis"]
         return L.BitLayout(
@@ -231,6 +241,8 @@ class _Assigner:
                     k = CHEAP if all(p.classify(v) == CHEAP for v in tiles) else ANCHORED
                 elif op.name in VIEWS:
                     k = CHEAP if p.classify(op.operands[0]) == CHEAP else VIEW
+                elif op.name in JOIN_SPLIT:
+                    k = CHEAP if all(p.classify(v) == CHEAP for v in tiles) else ANCHORED
                 else:
                     k = ANCHORED
                 p.kind[id(r)] = k
@@ -308,7 +320,10 @@ class _Assigner:
                     if lay is not None:
                         return lay
             return None
-        if op.name in ELEMENTWISE:
+        if op.name == "split":
+            src = op.operands[0]
+            return L.split(L.split_source(self.resolve(src) or p.default(src.type)))[0]
+        if op.name in ELEMENTWISE or op.name == "join":
             tiles = [x for x in op.operands if isinstance(x.type, ir.TileType)]
             # Prefer operands with a layout of their own, then loop-carried values (whose
             # layout may depend on this op), then views.
@@ -320,7 +335,7 @@ class _Assigner:
                 if rank(x) < 3:
                     lay = self.resolve(x)
                     if lay is not None:
-                        return lay
+                        return L.join(lay) if op.name == "join" else lay
             return None
         if op.name == "dot":
             bm, bn = t.shape

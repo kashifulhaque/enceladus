@@ -1429,7 +1429,9 @@ unchanged.
   bias and GELU epilogue. The FP16 and BF16 `mpp` results are stable.
 - In this run, the autotuner picked a slower FP32 config at 4096³ (4.81 TFLOPS against
   5.09 for the fixed simdgroup config). The tuning benchmark is short, so noise at tuning
-  time can pick a config within about 5% of the best.
+  time can pick a config within about 5% of the best. The
+  [known-gap fixes after M9](#known-gap-fixes-after-m9) add a second, interleaved
+  tuning phase.
 - `mpp` is the largest gain at small and ragged shapes: tuned 32 x 32 `mpp` reaches 3.75
   (FP32) and 4.32 (FP16) TFLOPS at 513³, against 1.71 and 1.81 for simdgroup and 1.33 and
   1.39 for MLX.
@@ -1556,15 +1558,836 @@ without it, except where the known gaps say otherwise.
 ### Known gaps
 
 - `multiple_of`, `max_contiguous`, `join`, `split`, and vector loads aren't implemented.
+  The hints and vector loads are added in the
+  [hints, vector loads, and 64-bit offsets](#hints-vector-loads-and-64-bit-offsets) entry, and `join` and
+  `split` in the
+  [join, split, constant folding, and edge versioning](#join-split-constant-folding-and-edge-versioning) entry.
 - Full 64-bit offsets aren't supported; offsets that need them are refused instead of
-  wrapping.
-- Edge versioning and constant folding aren't implemented.
+  wrapping. The [hints, vector loads, and 64-bit offsets](#hints-vector-loads-and-64-bit-offsets) entry adds them.
+- Edge versioning and constant folding aren't implemented. Both are added in the
+  [join, split, constant folding, and edge versioning](#join-split-constant-folding-and-edge-versioning) entry.
 - 64-bit atomics other than `uint64` `max` and `min`, and integer `tl.dot`, aren't
-  supported.
-- MLX arrays aren't evaluated lazily; launches synchronize.
+  supported. Integer `tl.dot` is added in the [integer `tl.dot` and 64-bit atomics](#integer-tldot-and-64-bit-atomics) entry; Metal has no other
+  64-bit atomics.
+- MLX arrays aren't evaluated lazily; launches synchronize. The [interop pass after
+  M9](#interop-pass-after-m9) adds opt-in lazy launches.
 - The `dl_delete` finalization guard has no test.
 - A plain helper function that reads an attribute of an untracked object still gets a
   token that holds only for the process, because the frontend doesn't see inside the
-  helper.
+  helper. Fixed in the [known-gap fixes after M9](#known-gap-fixes-after-m9): the
+  frontend refuses it.
 - Converting an out-of-range runtime float to an integer type differs between modes:
-  the GPU saturates and the interpreter wraps. Both are undefined in C.
+  the GPU saturates and the interpreter wraps. Both are undefined in C. Fixed in the
+  [known-gap fixes after M9](#known-gap-fixes-after-m9): the interpreter follows Metal.
+
+## Integer `tl.dot` and 64-bit atomics
+
+This entry covers two features that earlier entries listed as gaps: integer `tl.dot`,
+and 64-bit atomics beyond `uint64` `max` and `min`.
+
+### What was built
+
+- `tl.dot` takes `int8`, `uint8`, `int16`, `uint16`, `int32`, and `uint32` operands of
+  one dtype and accumulates in `int32`, as in Triton. The result is exact: products and
+  sums wrap modulo 2^32, in both modes. `out_dtype` defaults to `None`, which means
+  `float32` for float operands and `int32` for integer operands.
+- `int8` and `uint8` dots, in `emit_int_dot` in `compiler/codegen/dot.py`:
+  - `simdgroup_matrix` has no integer types, so operands convert to `half`, which holds
+    every 8-bit integer exactly. They stage through threadgroup memory, or come from
+    registers when the left operand is loaded outside the loop.
+  - Fragments multiply-accumulate into float32 partial sums. A float32 sum is exact
+    while every partial sum stays within 2^24, and an 8-bit product is at most 2^14
+    (`int8`) or 255^2 (`uint8`). So the partial sums add into the `int32` accumulator
+    and restart from zero at least every 1,024 (`int8`) or 256 (`uint8`) steps of K.
+    With the usual BK of 32 or 64, that's once per `tl.dot`.
+- 16-bit and 32-bit integer dots stage both operands in their own type and run scalar
+  `uint` multiply-adds, because float32 can't hold their products.
+- The integer accumulator is a plain register array in the `simd_acc` layout, so
+  epilogues, reductions, and stores work unchanged. The in-place accumulator rule is the
+  same as for float dots.
+- Integer dots never take the `mpp` backend; `explain` and the debug log give the
+  reason.
+- 64-bit atomics: the supported set is unchanged, because Metal offers nothing more
+  (see the probe results). The errors for other 64-bit atomics now say which ones exist
+  and suggest a replacement per operation:
+  - `add`: two `uint32` halves, adding the carry of the low half to the high half.
+  - `int64` `max` and `min`: store values as `uint64` with the sign bit flipped, which
+    keeps the order, and use `uint64` `max` and `min`.
+  - `and`, `or`, and `xor`: apply the operation to each `uint32` half.
+  - `xchg` and `cas`: 32-bit elements.
+
+### Metal probe results
+
+These results come from compiling raw MSL with `enceladus.metal_kernel` on the M4 Pro
+(Apple9, macOS 27, `GPUCompiler` 32023):
+
+- 64-bit atomics, in MSL 3.2, 4.0, and 4.1: only `atomic_max_explicit` and
+  `atomic_min_explicit` on `device atomic_ulong` compile, and they return `void`.
+  `atomic_long` doesn't exist. `atomic_fetch_{add,sub,max,min,and,or,xor}_explicit`,
+  `atomic_exchange_explicit`, `atomic_load_explicit`, `atomic_store_explicit`, and
+  `atomic_compare_exchange_weak_explicit` on `atomic_ulong` have no overload, and
+  `atomic_compare_exchange_strong_explicit` doesn't exist. Calling the compiler builtins
+  directly (`__metal_atomic_fetch_add_explicit`, `__metal_atomic_compare_exchange_weak_explicit`,
+  and `__metal_atomic_fetch_max_explicit` on `ulong`) fails with "invalid parameter
+  type". Threadgroup `atomic_ulong` max doesn't compile. The header
+  (`metal_atomic`) enables `ulong` only for device max and min. There's no 64-bit
+  compare-and-swap, so no other 64-bit atomic can be built as a real atomic, and none
+  was added. A two-word emulation wouldn't be atomic, so it's refused.
+- `simdgroup_matrix`: `half` operands with a `float` accumulator give exact results for
+  `int8` and `uint8` values, including sums of exactly 2^24 and odd sums just under it
+  (the tests check both).
+- Metal 4 `matmul2d` (MPP): the header lists `int8 x int8 -> int32` and
+  `uint8 x uint8 -> int32` (the element types must be `int8_t` and `uint8_t`; `char`
+  fails a `static_assert`). On this Apple9 GPU it compiles and runs at about 6.0 TOPS
+  at 4096³, the same rate as `float16`, but it isn't exact: `int8` sums past 2^24 came
+  back rounded (3,052 off in the test case), and `uint8` with random data was already
+  wrong (up to 270 off). It evidently converts to floating point and accumulates in
+  float32 without chunking.
+
+### Benchmarks
+
+`benchmarks/bench_matmul.py` has an `int8` row per shape (TOPS, minimum and median of 3
+interleaved rounds of 10 runs), taken while other agents shared the GPU:
+
+| Shape | `int8` 64x64x32 w4 | `int8` 64x64x64 w4 | `int8` 128x64x32 w8 | `float16` simdgroup 64x64x32 w4 |
+|---|---|---|---|---|
+| 4096³ | 4.71 / 4.49 | 4.92 / 4.49 | 4.47 / 4.40 | 5.70 / 5.63 |
+| 2000³ | 4.28 / 3.49 | 4.49 / 3.90 | 4.17 / 3.87 | 4.51 / 3.66 |
+| 513³ | 2.38 / 1.60 | 2.19 / 1.39 | 2.12 / 1.78 | 1.80 / 1.76 |
+| 1024 x 4096 x 1024 | 4.43 / 4.40 | 4.83 / 4.80 | 4.73 / 4.71 | 5.76 / 5.74 |
+
+- Exact `int8` reaches 83-86% of `float16` `simdgroup` at 4096³. Converting the same
+  `int8` tiles to `float16` in the kernel, which is inexact past 2^24, measured 4.95
+  TOPS at 64x64x32, so the int32 flush costs about 8%.
+- `int16` and `int32` dots run at about 1.5 TOPS at 1024³ and 2048³, about a third of
+  `int8`.
+- MLX matmul accepts only floating-point types, and PyTorch MPS `int8` matmul returns
+  `int8`, so there's no comparable number. MPP `int8` (inexact here) measured 5.96 TOPS.
+
+### Tests
+
+- `uv run pytest -q`: 973 passed, 19 skipped, and 1 deselected in about 7 s. With
+  `ENCELADUS_DEBUG=1`: the same counts in about 14 s.
+- `test_integer_dot`: every integer operand width except 16-bit and 32-bit unsigned,
+  with full-range values, through descriptor loads, pointer loads, and a left operand in
+  registers, on aligned and ragged shapes, against the interpreter and NumPy.
+- `test_integer_dot_is_exact_past_float32_precision`: sums above 2^24 that are odd, for
+  `int8` (K = 2048) and for `uint8` with BK = 512, which needs two partial sums per
+  `tl.dot`, from threadgroup memory and from registers. Removing the `uint8` chunking
+  fails it.
+- The in-place accumulator test runs for `int8` too; dropping the clobber check fails
+  5 of its cases.
+- The `uint64` contention test covers `atomic_min` as well as `atomic_max`. The
+  unsupported-atomic test checks the `int64` and `uint64` `atomic_add` hints in both
+  modes. The error test covers a float accumulator with `int8` operands.
+
+### Deviations from the plan
+
+- The plan gave integer `tl.dot` to the M8 MPP backend. MPP isn't exact for integers on
+  Apple9, so integer dots use the `simdgroup` backend with chunked float32 partial sums
+  instead.
+- Unlike Triton, which ignores `out_dtype` for integer operands, a float `out_dtype` or
+  accumulator with integer operands is an error.
+- `02-apple-gpu-and-metal.md` said that Apple9 has full 64-bit atomics. It now notes the
+  probe result.
+
+### Known gaps
+
+- `int8` operands always go through threadgroup memory or registers; there's no direct
+  device-to-fragment path, because `simdgroup_load` needs `half` memory. A per-lane
+  converting load could close part of the gap to `float16`.
+- `matmul_configs` doesn't accept `int8`, so the matmul autotuner has no integer list.
+- Mixed operand dtypes, such as `int8` with `uint8`, and `int64` operands are refused.
+- 64-bit atomics other than `uint64` `max` and `min` stay unsupported, because Metal has
+  no 64-bit compare-and-swap. `uint64` `max` and `min` still can't return old values
+  and need Apple9.
+
+## Known-gap fixes after M9
+
+This pass fixes four gaps from the [bug-fix pass after M9](#bug-fix-pass-after-m9) and
+the [benchmarks after M9](#benchmarks-and-acceptance-after-m9). Each fix has a test
+that fails without it.
+
+### What changed
+
+**Float-to-integer conversion.** A raw-MSL probe measured what Metal gives for `T(x)`
+from `float`, and from `half` and `bfloat` both directly and through `float`, to every
+integer type. It covered NaN, infinities, fractions, negatives to unsigned types, and
+values just past each range, and then every `float` exponent with 15 mantissas per
+exponent and 2^20 random bit patterns. The results were the same in the safe,
+relaxed, and fast math modes:
+
+| Destination | In range | Out of range | NaN | +inf, -inf |
+|---|---|---|---|---|
+| `char`, `short`, `int` | Truncates | Saturates | 0 | Maximum, minimum |
+| `uchar`, `ushort`, `uint`, `ulong` | Truncates | Saturates; negatives give 0 | 0 | Maximum, 0 |
+| `long` | Truncates | Truncated value modulo 2^64 | 0 | 0, 0 |
+
+Codegen converts `half` and `bfloat` to integers through `float`, so these rules cover
+every source type. A direct `ulong(bfloat)` differs (values from 2^64 up give 2^63),
+but codegen doesn't emit it. The interpreter's `float_to_int` now follows the table;
+before, NumPy casts wrapped, so -2.5 converted to `uint8` gave 254 instead of 0. The
+`tl.cast` docstring, the language reference, and the debugging guide describe the
+rules.
+
+**Dependency hash.**
+
+- A user class is hashed with its bases, its methods (followed like plain helpers,
+  with the same recursion guard), and its class attributes. Rebinding a class
+  attribute recompiles, and so does changing a global that a method reads.
+- The frontend checks every Python callable that a kernel calls at compile time with
+  `jit.untracked_reason`, which follows helpers, classes, and methods transitively. A
+  callable that reaches a value without a deterministic token, such as an attribute of
+  an object instance or `os.environ`, is refused with an error at the call that names
+  the helper and the chain it reads.
+- Callable attributes of installed modules, such as `np.log2`, are keyed by name and
+  library version, in kernels and helpers. A classmethod read from its class is
+  tracked.
+
+**Autotuning.**
+
+- Tuning takes two phases. The fastest configs from the first phase, up to 3 within
+  15% of the best, are timed again in 4 interleaved rounds of `max(3, rep // 4)` runs,
+  after a dropped run, and compete on the median of all their samples. A new
+  `tolerance` option (default 0.01) picks the earliest config in the list among those
+  within the tolerance of the fastest. `matmul_configs` lists the fixed M4 config
+  first.
+- `ENCELADUS_PRINT_AUTOTUNING=1` prints the tuning time. `TUNING_VERSION` is part of the
+  results path, so saved results are re-tuned once; the file format is unchanged.
+- Benchmark copies of NumPy arguments keep the argument's element strides and its
+  alignment to 16 bytes, so tuning compiles and times the specialization that the
+  launch runs. Before, an unaligned view was copied to aligned, contiguous memory:
+  tuning timed the aligned specialization, and a kernel that applies the view's
+  strides read and wrote past the copy's end during tuning.
+
+### Benchmarks
+
+The GPU was shared with other agents for every measurement in this section, so absolute
+numbers are 20-35% below the quiet-GPU numbers in earlier sections, and MLX varied from
+1.2 to 5.3 TFLOPS within runs.
+
+In 8 alternating re-tunes of FP32 4096³ in one process
+(`matmul_desc_tuned`, 6 simdgroup and 3 `mpp` candidates), the previous algorithm
+(first phase only) picked 5 different configs; the new one picked `mpp` 64 x 64 six
+times, `mpp` 64 x 32 once, and simdgroup 32 x 64 once. A head-to-head run of 12
+interleaved rounds right after measured, in minimum and median TFLOPS:
+
+| Config | Min | Median |
+|---|---|---|
+| simdgroup 64 x 64, 4 warps (fixed) | 3.64 | 3.48 |
+| simdgroup 32 x 64, 2 warps | 3.64 | 3.49 |
+| simdgroup 128 x 64, 8 warps | 3.62 | 3.45 |
+| `mpp` 64 x 64, 4 warps | 3.87 | 3.70 |
+| `mpp` 64 x 32, 4 warps | 3.80 | 3.58 |
+
+The simdgroup configs are within 1% of each other, which is why the single-phase tuner
+picked among them at random. Tuning took 8.1-21.6 s with the previous algorithm and
+11.1-21.7 s with the new one (typically 8.5 s against 11.5 s).
+
+`benchmarks/bench_matmul.py --quick` with a fresh cache per run (so each run re-tunes)
+gave these FP32 4096³ results, tuned against fixed, in minimum TFLOPS from the same
+interleaved run:
+
+| Tuner | Runs: chosen config and tuned / fixed |
+|---|---|
+| Previous | sg 64x64: 5.26 / 5.22; sg 32x64 w2: 4.47 / 4.49; sg 64x64: 4.18 / 4.17; sg 64x64: 3.33 / 3.52 |
+| New (4 finalists, 5 rounds) | sg 64x64: 3.82 / 3.84; sg 32x64 w2: 3.62 / 3.73; sg 64x64: 3.77 / 3.66; sg 64x64: 3.68 / 3.69; `mpp` 64x32: 3.60 / 3.44 |
+
+Runs that picked the fixed config itself still differ by up to 5% between the two
+rows, so on this shared GPU the benchmark's own noise is as large as the effect it
+measures. The benchmark runs used an earlier setting of 4 finalists in 5 rounds, which
+took 8.1-22.3 s per dtype; the committed setting is 3 finalists in 4 rounds.
+
+### Tests
+
+- `uv run pytest -q`: 965 passed, 19 skipped, and 1 deselected in about 8 s, and the
+  same with `ENCELADUS_DEBUG=1`. `uv run pytest -q -m slow`: 1 passed.
+- New tests: a float-to-int differential test over float32, float16, and bfloat16 to
+  all eight integer types with 42 edge values, in both modes (48 cases); 3 dependency
+  staleness cases, each in the same and a new process (a method's global, a base
+  class method's global, and a class attribute); 2 error cases for helpers and
+  methods that read an object instance's attribute; a scripted-timing test for the
+  second phase and the tolerance (2 cases); and an unaligned, strided NumPy tuning
+  test.
+- Every example runs compiled and in the interpreter.
+
+### Deviations from the plan
+
+- Behavior changes: helpers, classes, and methods that reach untracked values are
+  refused where they ran before. Kernels that read callables of installed modules,
+  such as `np.log2`, compile where they were refused.
+- `@enceladus.autotune` takes a `tolerance` argument, which Triton doesn't have.
+
+### Known gaps
+
+- The float-to-int rules were measured on Apple9 (M4 Pro) with Xcode 27's Metal
+  compiler. `long` conversion is likely a compiler routine, so another GPU family or
+  compiler version might differ; the differential test would catch it.
+- Tuning on a busy GPU can still pick a slower config; interleaving spreads the
+  contention across the finalists but doesn't remove it.
+- The dependency hash still doesn't see values that a helper reaches only through its
+  arguments, such as an object that the kernel builds and passes to it. Such objects
+  come from compile-time values that the hash covers, so they're deterministic.
+
+## Join, split, constant folding, and edge versioning
+
+This pass adds three planned features that the bug-fix pass listed as gaps: `tl.join`
+and `tl.split` (M1, P1), constant folding and algebraic identities in `simplify` (M2),
+and edge versioning of `tl.dot` loops (M4).
+
+### What was built
+
+- **`tl.join(a, b)` and `tl.split(a)`**, with Triton's semantics, also as tile methods.
+  `join` stacks two tiles along a new last dimension of size 2, and `split` separates a
+  last dimension of size 2. Operands broadcast to one shape, and a Python number takes
+  the other operand's dtype. Joining two scalars gives a `(2,)` tile, and splitting a
+  `(2,)` tile gives two scalars.
+  - IR: new `join` and `split` ops, with verifier rules.
+  - Layouts: `layout.join` maps the new dimension to a new lowest register bit, so a
+    join never moves data. A split is free when a register bit selects the last
+    coordinate, as it does after a join, a contiguous load, or a reshape of a `dot`
+    accumulator (the element bit of a fragment). Otherwise `layout.split_source`
+    trades the lane or SIMD-group bit that selects it for a register bit, and codegen
+    converts through threadgroup memory.
+  - Codegen lowers `join` in any result layout. When a lane bit selects the operand,
+    each thread picks it by its coordinate. Both ops over cheap values are rebuilt in
+    each consumer's layout.
+- **Constant folding** (`passes/simplify.py`, `fold`), which runs before CSE and DCE:
+  - Arithmetic, comparisons, and casts on constants (`const`, `full`, and shape ops or
+    `splat` over them) become constants. The results come from the interpreter's own
+    functions, so compiled and interpreted runs agree bit for bit.
+  - Undefined operations stay unfolded: integer division or remainder by zero,
+    `INT_MIN / -1`, shifts out of range, negation and `abs` of the most negative
+    integer, and float-to-integer conversions of NaN, infinity, or out-of-range values.
+    16-bit float constants that `float32` can't hold exactly stay unfolded, because the
+    GPU rounds their literals twice.
+  - Identities that hold for every value: `x + 0`, `x * 1`, `x * 0`, `x - x`, and the
+    bitwise ones for integers; `x * 1.0`, `x / 1.0`, `x + (-0.0)`, and `x - 0.0` for
+    floats; `tl.where` on a constant condition or equal values; double negation; and
+    lossless round-trip casts such as `float16` to `float32` and back.
+  - An `if` on a condition that folds to a constant keeps only the taken branch.
+- **Loop-invariant hoisting** (`simplify.hoist`): pure scalar ops and `make_desc` whose
+  operands are all defined outside a `for` loop move before it, innermost loops first.
+- **Edge versioning** (`passes/edge_versioning.py` and `_versioned_for` in
+  `codegen/msl.py`). A loop qualifies when its dots read direct operands from
+  descriptors defined before the loop, at offsets that are loop-invariant or the loop
+  counter plus an invariant, and the loop counts up by a constant step with a 32-bit
+  counter. Codegen emits an unmasked main loop over the K blocks that fit, a checked
+  loop for the ragged K tail, and a checked loop for programs whose M or N block
+  crosses an edge. The tail is empty when K is a multiple of the block size.
+
+### Benchmarks
+
+Other agents used the GPU throughout, so absolute numbers ran 5-60% below the idle
+numbers of M4, and whole rounds sometimes ran at half speed. Each comparison ran the
+64 x 64 x 32, 4-SIMD-group descriptor matmul compiled twice in one process, without
+(A) and with (B) edge versioning and hoisting, timed in alternating rounds of 10 GPU-timed
+runs. The table shows B/A for the median time over all rounds, and for the best single
+run, from the three quietest of six runs (20-40 rounds each):
+
+| Shape | FP32 median | FP32 best | FP16 median | FP16 best |
+|---|---|---|---|---|
+| 4096³ | 1.06 | 1.00 | 1.00 | 1.00 |
+| 2000³ | 1.00-1.03 | 1.00-1.01 | 1.01 | 1.00-1.01 |
+| 1000³ | 1.01-1.05 | 1.00-1.05 | 1.04-1.05 | 1.04-1.06 |
+| 513³ | 0.99-1.01 | 1.01 | 1.01 | 1.01-1.02 |
+| 1000 x 777 x 300 | 0.89 (a slow round) | 1.02 | 1.01 | 0.98 |
+
+- Edge versioning is neutral within noise at 4096³, 2000³, and 513³. At 1000³, FP16
+  ran 2-6% faster in all six runs, and FP32 1-5% faster in the quieter runs. The best
+  single runs at 4096³ reached 5.34 TFLOPS in FP32 and 5.05 in FP16 with versioning.
+- The flash attention kernels never qualify, because they stage K and V through
+  threadgroup memory, so `bench_attention.py` needs no A/B: its generated MSL is
+  byte-identical with and without versioning and hoisting, for all seven shapes in
+  `attention_configs` at head dimensions 64 and 128, causal and not.
+- Constant folding doesn't change the MSL of the attention kernels. Hoisting moves the
+  program-offset math of both matmul examples out of the K loop.
+- `tl.join` and `tl.split` have no benchmark. In the tests, joins after loads, dots,
+  and reductions use no threadgroup memory; only a split whose last dimension sits on
+  a lane bit does.
+
+### Tests
+
+- `uv run pytest -q`: 954 passed, 20 skipped, and 1 deselected in about 9 s. With
+  `ENCELADUS_DEBUG=1`: the same counts. `uv run ruff check src tests examples
+  benchmarks`: clean. Every example runs compiled and interpreted.
+- `tests/test_join_split.py`: a differential test over eight producers (interleave and
+  deinterleave of loads, a transposed load whose split crosses lanes, a tile with
+  fewer elements than threads, reductions, a loop, aranges, and scalars) in `float32`,
+  `float16`, and `int32`, and join and split of `dot` results in three dtypes and two
+  SIMD-group counts.
+- `tests/test_layout.py`: `layout.join`, `layout.split_source`, and `layout.split` keep
+  every element in its thread.
+- `tests/test_simplify.py`: compiled against interpreted results on NaN, infinity,
+  `-0.0`, `INT_MIN`, and overflowing values; constant expressions and branches fold
+  away; identities keep narrow and unsigned dtypes; and invariant scalars leave nested
+  loops while loop-dependent ones stay.
+- `tests/test_codegen.py`: versioned dot loops at aligned and ragged shapes, a K
+  offset whose last block overhangs by one element, negative offsets in early
+  iterations, a step smaller than the block, and K smaller than one block. The
+  overhang case fails when `k_end` is off by one.
+- `tests/test_errors.py`: `tl.join` on mixed dtypes, in both modes.
+
+### Deviations from the plan
+
+- Edge versioning runs in codegen, from a plan that `passes/edge_versioning.py`
+  computes, rather than as an IR rewrite, because the loop versions differ only in how
+  each `dot` loads fragments. The checked versions test each fragment's bounds, as the
+  per-dot branch did.
+- The K tail is a loop over the remaining iterations rather than one peeled
+  iteration, so steps smaller than the block and invariant K offsets need no special
+  case. The specialization fact `K % 16 == 0` isn't used; the tail loop runs no
+  iterations when K is a multiple of the block.
+- The `desc_store` epilogue keeps its per-element masks; M4 measured `vec<T, 2>` stores
+  within noise.
+- `tl.join` and `tl.split` refuse tiles of pointers.
+- Constant folding follows the interpreter where the GPU is less precise: a folded
+  float division or `fmod` is correctly rounded, while the GPU's fast versions may
+  differ in the last place.
+
+### Known gaps
+
+- In the default relaxed math mode, Metal assumes that no zero is signed, so a runtime
+  `x + 0.0` returns `-0.0` for `x = -0.0`, where the interpreter returns `0.0`. This
+  predates this pass; folding doesn't change it.
+- Edge versioning needs a constant positive step, a 32-bit counter, descriptors defined
+  before the loop, and offsets of the form `k + invariant`. Other dot loops keep the
+  per-dot branch. It skips loops that contain `tl.device_print` or `tl.device_assert`,
+  so their output doesn't repeat.
+- Folding doesn't evaluate math functions other than `floor` and `ceil`, `fma`, or
+  bitcasts, and doesn't fold `tl.minimum` and `tl.maximum` of two zeros.
+- `multiple_of`, `max_contiguous`, vector loads, and 64-bit offsets were open when this
+  entry was written; the [hints, vector loads, and 64-bit offsets](#hints-vector-loads-and-64-bit-offsets) entry adds them.
+
+## Interop pass after M9
+
+This pass cut the launch cost on PyTorch tensors, made results bit-identical across
+launch paths, added opt-in lazy MLX launches, and fixed a race with queued MLX work.
+
+### What changed
+
+**PyTorch launch cost.** A sustained `@enceladus.jit` launch on MPS tensors measured
+5.10 µs, above the 5 µs target. PyTorch runs the queued GPU work only after the host
+loop, so each launch costs its host time plus about 1.4 µs of GPU time; only host time
+could shrink. Profiling showed three costs that could go:
+
+- `JITFunction.run` read `ENCELADUS_INTERPRET` through `os.environ.get`, about 0.3 µs
+  per compiled launch on every path. It now uses the bound C method that
+  `ENCELADUS_DEBUG` already used.
+- The launch looped over the arguments to check them. `TorchLaunch` now generates a
+  `try_launch` function per kernel that checks the array arguments (exact
+  `torch.Tensor`, `is_mps`, and storage of at most 2 GB), converts scalars, and calls
+  `compile_shader` in one unrolled function. For 1-D grids it passes `threads` and
+  `group_size` as ints, which cost about 0.12 µs less than tuples. Arguments that fail
+  the precheck take the fully checked path, as before.
+- Ints bind without `arg_casts`, which cost about 0.09 µs. `compile_shader` binds an
+  int as the 8 bytes of an `int64`, and a narrower parameter reads the low bytes, which
+  hold the value's bit pattern at that width. The existing test that binds every ABI
+  scalar type at its extreme values covers this.
+
+`torch_spec_key` also skips `element_size()` at storage offset 0.
+
+**Math settings.** The native path compiled with fast fp32 math functions, and
+`compile_shader` compiles with precise ones and takes no compile options. MSL has no
+pragma for the function variant, and defining `__METAL_MATH_FP32_FUNCTIONS_FAST__` in
+the source has no effect, because Metal includes its standard library before the
+source. The native path now compiles with precise functions too
+(`raw.MATH_FP32_FUNCTIONS`), and the math mode still comes from the kernel. A kernel
+that calls every transcendental function gave results up to 18 ULP apart on NumPy and
+PyTorch inputs, and now gives bit-identical ones in both math modes.
+
+**Lazy MLX launches.** `enceladus.lazy_mlx(True)` adds eligible launches on MLX arrays to
+MLX's graph through `mx.fast.metal_kernel` (`runtime/mlx_lazy.py`):
+
+- MLX kernels are functional: MLX allocates each output. A launch is lazy only when
+  every array that the kernel writes is a *fresh output*, an array from
+  `enceladus.new_empty` or `enceladus.new_zeros` (lazy `mx.zeros` in this mode) that no
+  launch has written. The kernel writes a new array with `init_value=0`, so it sees
+  what the fresh output holds, and `out[...] = result` rebinds the argument without a
+  copy. A registry of weak references tracks fresh outputs; eager writes,
+  `enceladus.Tensor` views, and lazy writes remove an array from it.
+- In-place writes, aliased outputs, empty arrays, kernels that print or assert, and
+  grids too large for MLX's `int` grid keep the synchronized path, which logs the reason
+  once per kernel.
+- The adapter reuses the generated MSL. The prelude becomes the `header`, inside
+  `namespace enc_lazy`, and the kernel body becomes the `source`, after a prologue that
+  binds the kernel's thread-position parameters to MLX's attributes of the same name.
+  Threadgroup memory stays in the body, where MSL allows it. Scalars become MLX scalar
+  inputs (`bool`, `int`, `float`) or 0-d `int64` and `uint64` arrays.
+- MLX compiles with fast math functions. Using-declarations of the float-only
+  `metal::precise` functions, in the namespace and in the body, select the precise
+  variants, so lazy results match the other paths bit for bit. `abs`, `min`, `max`, and
+  `clamp` aren't declared, because a using-declaration would hide their integer
+  overloads; generated code uses `fabs`, `fmin`, and `fmax` for floats.
+- MLX caches kernels by name, so the name includes a hash of the MSL. MLX compiles a
+  kernel only when it evaluates it, so the first launch of each kernel evaluates its
+  results; a compile error then selects the synchronized path instead of surfacing at
+  a later `mx.eval`.
+- In lazy mode, specialization doesn't evaluate MLX arguments: only fresh outputs count
+  as 16-byte aligned. `element_strides` of a fresh output doesn't evaluate it.
+
+**Queued MLX readers.** `mx.eval(a)` waits only for the work that computes `a`. A
+synchronized launch that wrote `a` on Enceladus's queue raced with MLX work queued
+earlier that reads `a`, such as work from `mx.async_eval`. Synchronized launches, timed
+launches, and `as_tensor` on MLX arrays now call `mx.synchronize()` after evaluating the
+arguments. MLX exposes no wait for the readers of one array.
+
+### Benchmarks
+
+`benchmarks/bench_dispatch.py` method, 5 runs of 10,000 launches each, with baseline
+(`f04f800`) and new runs interleaved five times while other agents used the machine.
+Minimum and median are over the five runs' minimums and medians:
+
+| Launch | Baseline min | Baseline median | New min | New median |
+|---|---|---|---|---|
+| `@enceladus.jit` on PyTorch MPS tensors, sustained | 5.18-5.30 µs | 5.36 µs | 4.44-4.59 µs | 4.57 µs |
+| `@enceladus.jit` on `enceladus.Tensor`, sustained | 3.53-3.61 µs | 3.59 µs | 3.02-3.23 µs | 3.17 µs |
+
+The same session measured the other rows once, with `bench_dispatch.py`:
+
+| Launch | Min | Median |
+|---|---|---|
+| `torch.mps.compile_shader` call made directly, sustained | 2.26 µs | 2.33 µs |
+| `@enceladus.jit` on MLX arrays, sync round trip | 120 µs | 161 µs |
+| `@enceladus.jit` on MLX arrays, lazy, chain of 1,000 dependent launches | 12.8 µs | 13.4 µs |
+| MLX `x + y`, chain of 1,000 | 1.67 µs | 1.75 µs |
+
+- A lazy launch costs about 9.5 µs of host time: about 1.2 µs for `new_empty`, 1.6 µs for
+  the specialization lookup, 1.3 µs for the `mx.fast.metal_kernel` call, and 1 µs for
+  the eligibility check. The rest is the shared launch path.
+- The `mx.synchronize()` call adds about 7 µs to a synchronized MLX launch: 125-133 µs
+  median before, 133 µs after, in four interleaved runs.
+- Precise math functions, measured on a compute-bound kernel that applies a function 64
+  times per element over 4M elements: `tl.exp` takes 1.7 times as long as with fast
+  functions, `tl.log` 2.4, `tl.rsqrt` 3.0, `tl.sqrt` 3.4, and `tl.tanh` 1.4. `tl.exp2`
+  compiles to the same code. Softmax, LayerNorm, and RMSNorm at 4096 x 4096 didn't
+  change (interleaved runs, within noise), and attention uses `tl.exp2`.
+
+### Tests
+
+- `test_math_is_bit_identical_across_launch_paths`: a kernel that calls every
+  transcendental function, in both math modes, on the PyTorch path and the lazy MLX
+  path against the native path. It fails with fast functions on the native path, or
+  without the using-declarations on the MLX path.
+- The framework example test runs every example on `mlx-lazy` too, with and without
+  offset views, and asserts that no launch takes the synchronized path.
+- `test_lazy_mlx_writes_only_fresh_outputs`: an accumulating kernel runs lazily into a
+  fresh output, then in place and aliased on the synchronized path, and logs once. It
+  fails if a written array counts as fresh after a launch.
+- `test_lazy_mlx_falls_back_when_mlx_cant_compile`: a forced MSL error on the first lazy
+  launch runs the kernel eagerly, with correct results and one warning.
+- `test_mlx_write_waits_for_queued_mlx_readers`: 33 queued elementwise ops read `a`, a
+  kernel overwrites `a`, and the ops' result must match. It failed in 5 of 5 runs
+  without `mx.synchronize()`.
+
+### Deviations from the plan
+
+- The native path compiles with precise math functions, which slows compute-bound
+  `tl.exp`, `tl.log`, `tl.sqrt`, `tl.rsqrt`, and `tl.tanh` (see the benchmarks). The
+  comment on `MATH_FUNCS` in `compiler/codegen/msl.py`, which says the fast `exp` and
+  `log` remain, is stale; the compiler's owner should update it.
+- Lazy MLX launches are opt-in, and only for fresh outputs, because MLX can't donate an
+  existing array's buffer to a custom kernel: `init_value` fills outputs with a constant
+  only, so a kernel that updates an array in place can't see its old contents.
+- `jit.py` changed in two places outside dependency hashing: `run` reads
+  `ENCELADUS_INTERPRET` through `core.env_lookup`, and `_spec_key` has an MLX fast path.
+  `enceladus/__init__.py` exports `lazy_mlx`.
+
+### Known gaps
+
+- Lazy launches don't check that a strided MLX view spans fewer than 2^31 elements,
+  because MLX reports strides only for evaluated arrays; they check the element count.
+- A fresh output that you modify yourself, for example with `out[0] = 1`, still counts
+  as fresh, and a lazy launch ignores its contents. Enceladus can't detect the change.
+- Lazy launches fill each output with zeros first, one extra dispatch that writes the
+  whole output.
+- In a chain, a lazy launch costs about 7.5 times as much as an MLX op, mostly host
+  time.
+- `mx.synchronize()` covers MLX's default stream only; readers on other streams can
+  still race.
+- Raw `metal_kernel` launches on PyTorch tensors still rebuild the argument mask on each
+  launch; they weren't measured.
+
+## Hints, vector loads, and 64-bit offsets
+
+This pass adds three planned features that earlier milestones deferred: the
+`tl.multiple_of` and `tl.max_contiguous` hints (M2), vector loads and stores (M2), and
+64-bit offsets for arrays past 2^31 elements (`idx64`, M2).
+
+### What was built
+
+**AxisInfo** (`compiler/passes/axis_info.py`)
+
+- The analysis now keeps every fact a sound lower bound, because vector accesses rely
+  on it. Three rules claimed too much before. `expand_dims` gave the new dimension a
+  divisibility of 2^30, so `rm[:, None] * stride + rn[None, :]` claimed aligned rows for
+  any stride. `mul` multiplied divisibilities of contiguous operands, so
+  `tl.arange(0, 16) * 8` claimed 2^30. Loop-carried values kept their initial
+  contiguity even when the loop body changed it. The rules now follow Triton's, with
+  one more correction: an add whose result is less contiguous than an operand keeps only
+  the divisibility at the result's block starts.
+- Loops run to a fixed point over their carried values, and loop results get the
+  carried facts. A loop counter gets the divisibility of its start and step.
+- New rules: constancy through elementwise ops and loads; constancy of comparisons
+  between a contiguous value and a constant one (`offs < n` is constant on blocks that
+  divide `n`, and only for `<`, `>=`, and their mirrors); value-preserving integer
+  casts.
+- `vector_width` returns how many elements one access can move.
+
+**Hints** (`language/ops.py`, `compiler/ir.py`)
+
+- `tl.multiple_of(x, values)` and `tl.max_contiguous(x, values)` take an int for a
+  scalar or 1D tile and a tuple per dimension otherwise, as in Triton. They lower to an
+  identity `hint` op that `axis_info` reads and that layouts and codegen treat as a
+  view, so the promise covers only the hint's result. For pointers, divisibility counts
+  bytes, as in Triton. A float tile, a wrong number of values, or a non-positive value is
+  a `CompilationError`.
+- The interpreter returns the input unchanged. With `ENCELADUS_DEBUG=1`, it checks the
+  part of the promise that the compiler uses (the largest power of two that divides
+  each value) and raises `DeviceAssertionError` at the hint's line. The check caught a
+  false promise in this pass's own test.
+
+**Vector loads and stores** (`compiler/codegen/msl.py`)
+
+- A pointer-tile `load` or `store` uses `vec<T, N>` accesses, N up to 4, when the
+  layout's first N registers step along one dimension, `axis_info` proves the
+  addresses contiguous and aligned to N elements, and the mask, if any, is constant
+  across each vector. Otherwise, the scalar path runs. Masked-off vectors take `other`
+  per element. `tl.dot` results store two elements per vector.
+- Misaligned vector loads read wrong data on this GPU, silently: with the alignment
+  check removed, the new differential test mismatches up to 99% of elements. That's why
+  the AxisInfo fixes had to come first.
+
+**64-bit offsets** (`compiler/passes/widen_index.py`, `runtime/launcher.py`,
+`runtime/jit.py`)
+
+- The launcher no longer refuses arrays that span more than 2^31 - 1 elements. Instead,
+  `arg_facts` and the in-memory key mark such an array `idx64`, including under
+  `do_not_specialize`, and the kernel compiles a variant for it. The check costs one
+  attribute read per array (about 0.05 µs for a PyTorch tensor), and the exact span is
+  computed only for buffers over 2 GB and non-contiguous NumPy arrays.
+- In an `idx64` variant, `widen_index_math` recomputes in 64 bits the signed 32-bit
+  math that feeds pointer offsets, plus the comparisons that read it, so
+  `pid * BLOCK + tl.arange(0, BLOCK)` and its mask `offs < n` stay exact past 2^31.
+  Pointer tiles use `long` offsets. The 32-bit path stays the default.
+- `CompiledKernel.idx64` (and `GeneratedKernel.idx64`, and `meta.json`) records the
+  variant. A kernel with 32-bit offsets still refuses a too-large array if you launch it
+  directly with `CompiledKernel.launch`.
+- A tensor descriptor over an `idx64` argument is a `CompilationError`, because
+  descriptor addressing computes in 32 bits.
+
+### Benchmarks
+
+Other agents shared the GPU during this pass, so single runs varied by up to 10x. Each
+row interleaves scalar and vector builds of the same script (A/B) 5-8 times. Each run
+reports the minimum of 30-50 GPU-timestamped repetitions, and the table shows the median
+over runs.
+
+| Kernel | Scalar ms | Vector ms | Speedup |
+|---|---|---|---|
+| Pointer-tile matmul, float16, 2048^3, 64x64x32 | 3.651 | 2.904 | 1.26x |
+| Vector add, int8, 256 MB per array | 4.106 | 3.479 | 1.18x |
+| Vector add, float32, 256 MB per array | 3.588 | 3.549 | 1.01x |
+| Vector add, float16, 256 MB per array | 1.760 | 1.722 | 1.02x |
+| Softmax, 4096 x 4096, float32 / float16 | 0.581 / 0.306 | 0.579 / 0.280 | noise |
+| LayerNorm, 4096 x 4096, float32 / float16 | 0.610 / 0.296 | 0.610 / 0.283 | noise |
+| RMSNorm, 4096 x 4096, float32 / float16 | 0.590 / 0.279 | 0.587 / 0.275 | noise |
+| 2D copy, 8192 x 8192, float32 / float16 | 2.381 / 1.162 | 2.361 / 1.159 | 1.00x |
+| Descriptor matmul, float16, 2048^3 | 2.971 | 2.969 | 1.00x |
+| Flash attention, float16, 4 x 16 x 2048 x 64 | 13.835 | 13.763 | 1.00x |
+
+The float16 softmax and LayerNorm medians favor vectors by 5-9%, but their scalar runs
+include outliers, and the minimum over runs is equal (0.27 ms both ways), so they count
+as noise. A variant that moved 16-byte `uint4` words for 8-bit and 16-bit types measured
+the same as `vec<T, 4>` and was dropped. `bench_elementwise.py` now includes an int8 row.
+
+Compile time, frontend to MSL, median of 200 in one process: vector add 0.40 ms with
+the old AxisInfo and 0.42 ms with the new one; the pointer-tile matmul 2.37 ms and
+2.52 ms. `@enceladus.jit` launch overhead measured 3.55 µs sustained, and 5.38 µs on
+PyTorch tensors, within the noise of earlier runs.
+
+### Tests
+
+- `tests/test_axis_info.py` (new, 33 cases): AxisInfo facts for 9 probes, each of which
+  the old analysis got wrong or that guards a new rule; a differential test of vector
+  and scalar accesses over 4 dtypes and 4 cases (aligned, odd row stride, unaligned
+  view, ragged mask) that also checks which accesses vectorize; the hints in both modes,
+  including the debug check of a false promise; and two misuse errors with their lines.
+- `tests/test_runtime.py`: the old span-refusal case became a test that fake arrays
+  past 2^31 elements (a 16 GB stand-in buffer and a strided NumPy view) compile an
+  `idx64` variant with `long` offsets, that the variant's mask is exact past 2^31 when
+  launched on small arrays, and that a 32-bit kernel still refuses the array. A
+  `@pytest.mark.slow` test increments every byte of a real 2^31 + 77-byte array (2 GB,
+  about 1 s) with 32-bit index math and checks the last bytes.
+- `uv run pytest -q`: 939 passed, 19 skipped, and 2 deselected in about 6 s. With
+  `ENCELADUS_DEBUG=1`: the same. `uv run pytest -q -m slow`: 2 passed.
+- Every example runs compiled and in the interpreter.
+
+### Deviations from the plan
+
+- The hints are an IR op rather than an attribute on the defining op, as in Triton, so
+  a hint inside an `if` doesn't leak to uses outside it. A hint in a `matmul2d`
+  epilogue makes that loop fall back to `simdgroup_matrix`.
+- The plan's `idx64` switched offsets to `long`. That alone would keep
+  `pid * BLOCK` wrapping in 32 bits, and the mask would disagree with the address, so
+  the variant also widens the index math. This differs from Triton, which computes the
+  same kernel in 32 bits; the results differ only where 32-bit signed math overflows,
+  which is undefined behavior in Metal.
+- The in-memory key marks `idx64` arrays by span in elements, not by size in bytes.
+
+### Known gaps
+
+- In an `idx64` variant, 32-bit offsets that a loop carries across iterations still
+  wrap, and tensor descriptors refuse `idx64` arguments.
+- The interpreter computes index math in 32 bits, so it differs from an `idx64`
+  variant where that math overflows. It's too slow for such arrays anyway.
+- AxisInfo has no rules for `//`, `%`, shifts, `trans`, `reshape`, or `where`, so
+  offsets built with them don't vectorize.
+- Masked accesses under a ragged bound stay scalar; there's no runtime check for a
+  fully true vector mask.
+- The debug check of a hint checks the power-of-two part of each value, not the full
+  promise.
+
+## Benchmarks and acceptance after the follow-up pass
+
+This pass looked for the cause of the run-to-run variance in the `mpp` matmul, checked
+the two-phase autotuner, refreshed every benchmark, and fixed a launch-cost regression
+that the refresh found. The full suite ran twice with `run_all.py --cooldown 90`, with
+no other GPU work on the machine. The site and the table use the second report,
+`benchmarks/results/2026-09-27-applegpu_g16s-2.md`. The first,
+`benchmarks/results/2026-09-27-applegpu_g16s.md`, ran on battery power before the
+lazy MLX fix; the laptop was connected to power during the second.
+
+### Acceptance status
+
+Values are TFLOPS, GB/s, or µs at the minimum time, with the median in parentheses where
+the script reports one. MLX runs in the same process and, for matmul, in the same
+interleaved rounds.
+
+| Milestone | Criterion | Result |
+|---|---|---|
+| Target | Vector add, 256 MB per array, 220 GB/s or more | Met: 236.6 float32, 238.1 float16, 236.4 int8 (MLX 227.4); M9 224.1 |
+| Target | Softmax 4096 x 4096, 215 GB/s or more | Met: 241.9 float32, 256.3 float16 (MLX 193.7 and 171.3) |
+| Target | LayerNorm and RMSNorm 4096 x 4096, 200 GB/s or more | Met: 234.4-247.4 in every row; float16 LayerNorm at BLOCK=4096 rose from 169.4 to 241.9 |
+| M4 | `simdgroup` matmul 4096³ FP16, 5.3 TFLOPS or more | Met: 5.73 (5.60), 97% of MLX's 5.88 (5.75) |
+| M4 | `simdgroup` matmul 4096³ FP32, 4.9 TFLOPS or more | Met: 5.27 (5.14); MLX 5.21 (5.14) |
+| M4 | Fused bias and GELU within 5% of plain matmul | Met: FP16 `simdgroup` 5.73 against 5.73, `mpp` 6.00 against 6.04 |
+| M8 | `mpp` matmul 4096³ FP16, 5.9 TFLOPS or more | Met: 6.04 (5.93), MLX 5.88 (5.75); 6.16 (6.15) on a cool GPU; first report 5.94 (5.82) |
+| M7 | FP16 attention within 1.3x of MLX, head dims 64 and 128 | Met: 0.96x-1.05x of MLX's time, causal and not |
+| Target | Sustained launch of 5 µs or less | Met: `@enceladus.jit` 3.39 (3.41), raw `metal_kernel` 1.15 (1.18) |
+| M6 | Sustained launch on PyTorch tensors, 5 µs or less | Met: 4.59 (4.60); M9 5.10 (5.17) |
+| Target | Compile time of a matmul, excluding Metal, 20 ms or less | Met: descriptor matmul 1.11 ms (`simdgroup`) and 0.51 ms (`mpp`), pointer-tile matmul 2.52 ms, vector add 0.42 ms; medians of 200 |
+| M5 | Autotuned matmul at least as fast as the fixed config | Met: 33 of 33 cases (3 shapes, 2-3 dtypes, 4 fresh-cache runs); see the notes |
+| New | Vector loads | Pointer-tile matmul FP16 2048³ 1.26x faster; memory-bound kernels within 2% |
+| New | Edge versioning | 1.02x-1.07x at 1000³ and 1000 x 777 x 300, under 1.01x at 2000³ |
+| New | Exact `int8` `tl.dot` | 4.57-4.75 TOPS at 4096³, 80-83% of FP16 `simdgroup`; 2.58 at 513³ |
+
+### Variance of the `mpp` matmul
+
+Recorded FP16 `mpp` runs at 4096³ ranged from 5.70 to 6.13 TFLOPS, and FP32 `mpp` was
+bimodal. The causes differ by dtype.
+
+- **FP16 and BF16 follow the GPU clock.** In a 24-round run of back-to-back 4096³ FP16
+  matmuls (about 50 s), every kernel slowed by the same amount after about 35 s: the
+  Enceladus `mpp` kernel from 6.16 to 5.84 TFLOPS per round, Apple's reference
+  `matmul2d` kernel from 6.18 to 5.83, `simdgroup` from 5.85 to 5.45, and MLX from 6.03
+  to 5.64. After several minutes of matmul work on battery power, every kernel,
+  `simdgroup` and MLX included, ran 20-35% slower until the GPU cooled. In the cooler
+  rounds, `mpp` ran at 6.15-6.18 TFLOPS, within 0.5% of the reference kernel. So the
+  spread between recorded runs is the GPU's clocks, not the kernel, and a comparison
+  with MLX is meaningful only in the same rounds.
+- **FP32 `matmul2d` is unstable on its own.** In 10 interleaved rounds, the Enceladus
+  `mpp` kernel's round medians ranged from 4.71 to 5.37 TFLOPS and the reference kernel's
+  from 3.32 to 5.47, while `simdgroup` (4.91-5.34) and MLX (4.94-5.36) held steady in the
+  same rounds. Between those episodes, FP32 `mpp` ran steadily at 5.5-5.7. The
+  instability is in Apple's kernel, so Enceladus can't remove it.
+- **Program order doesn't help.** Metal's 2D dispatch order already gives the caches
+  enough reuse: remapping program IDs into groups of 2-16 rows, as Triton's grouped
+  ordering does, measured the same in FP16 and the same or less stable in FP32. A plain
+  row-major 1D order dropped FP32 `matmul2d` to 2.2 TFLOPS, because it rereads B for every
+  row of tiles, while FP16 didn't change. The research sweep found the same for
+  `simdgroup`, so the examples keep the 2D grid.
+- **The tile list is right.** Of 10 `mpp` tiles (32x32 to 128x128, 2 to 8 SIMD groups),
+  the three in `matmul_configs` were the fastest or within 1% of the fastest: FP16 at
+  4096³ and 2000³, and FP32 at 4096³ and 1024 x 4096 x 1024. The list is unchanged. Its
+  comment, which said FP32 `matmul2d` ran 20-30% slower than `simdgroup`, now records
+  these measurements.
+
+What changed: `bench_matmul.py` times MLX and PyTorch in the same interleaved rounds as
+the Enceladus variants and reports their minimum and median, where before it timed them
+once, before the Enceladus variants, on a cooler GPU. `run_all.py` takes
+`--cooldown SECONDS`, so a benchmark that follows the matmul benchmark doesn't inherit
+its lowered clock.
+
+### Notes
+
+- **Autotuning.** In 4 runs, each with a fresh cache and at least 2 minutes of idle time
+  before it, the tuner picked `mpp` 64 x 64 at 4096³ every time (FP32 and FP16 in 4
+  runs, BF16 in 3), 3-6% faster than the fixed `simdgroup` config by minimum and within
+  1% of fixed `mpp` 64 x 64. At 2000³ it picked `mpp` 64 x 64 (FP32) or 64 x 32
+  (FP16), and at 1024 x 4096 x 1024 in FP32 it picked the fixed config. Tuning took
+  7.9-8.3 s at 4096³ and 1.0-1.6 s at the other shapes. Where the tuner picked the fixed
+  config, the two timings of that one config differed by up to 3.4%, which is the
+  benchmark's noise. In the suite report, the FP32 4096³ tuner also picked the fixed
+  config: 5.23 (5.14) against 5.27 (5.14).
+- **Autotuning on a hot GPU.** Right after a minute of matmul work, 3 more runs picked a
+  `simdgroup` config in 5 of 9 cases at 4096³, giving up the 2-7% that `mpp` gains. The
+  picks were never slower than the fixed config beyond the noise, which was 4% between
+  two timings of one config. Phase 1 times the configs in list order, and the `mpp`
+  configs come last, so they run on the hottest GPU; timing them in alternating order
+  would cancel a steady drift.
+- **Precise math functions.** A kernel that applies a function 64 times per element over
+  4M `float32` elements, compiled with fast and then precise functions, measured these
+  times: `exp` 0.338 and 0.684 ms (2.0x), `log` 0.338 and 0.792 ms (2.3x), `sqrt` 0.339
+  and 1.132 ms (3.3x), `rsqrt` 0.338 and 0.998 ms (3.0x), and `sin` 1.010 and 2.367 ms
+  (2.3x). The same chain written with `tl.exp` took 0.553 ms (1.6x the fast `exp`) and
+  with `tl.sqrt` 1.161 ms (3.4x). These match the
+  [interop pass](#interop-pass-after-m9) (1.7x and 3.4x). Memory-bound kernels don't
+  pay it: softmax, LayerNorm, and RMSNorm ran faster than in the M9 report.
+- **Vector loads and edge versioning on a quiet GPU.** Each A/B alternated builds with
+  the feature on and off, in separate processes and caches, 3 times, and compared
+  minimum times. The pointer-tile FP16 matmul at 2048³ took 2.903 ms against 3.644 ms.
+  The `int8` vector add took 3.38 ms against 3.43 ms: the 1.18x in the
+  [hints entry](#hints-vector-loads-and-64-bit-offsets) came from a shared GPU, where the
+  scalar version suffered more. Edge versioning: FP16 1000³ 0.560 against 0.600 ms, FP32
+  0.599 against 0.611 ms, 1000 x 777 x 300 0.162 against 0.167 ms (FP16) and 0.164
+  against 0.172 ms (FP32), and 2000³ under 1% faster in both dtypes.
+- **Regression fixed: lazy MLX launches.** The first report measured 131.6 µs per launch
+  in a chain of lazy MLX launches, against 12.8 µs in the interop pass. The 64-bit offset
+  check from the hints pass read each MLX argument's strides, which evaluates the array
+  and waits for its work. With `lazy_mlx(True)`, the check now uses the element count, as
+  the lazy launch path does, and the chain measures 13.4 µs. A regression test fails
+  without the fix.
+- **Other changes against the M9 report.**
+  - Raw `metal_kernel` launches measured 1.13-1.15 µs against 1.04 µs, and native
+    dispatch 1.02-1.04 µs against 1.00 µs. This wasn't investigated.
+  - The MLX synchronized round trip measured 121-126 µs against 99.8 µs; the interop
+    pass added about 7 µs for `mx.synchronize()` and measured 120 µs.
+  - Vector add compile time measured 0.42-0.46 ms against 0.37 ms, from the AxisInfo
+    rewrite in the hints pass.
+  - FP32 `mpp` at 4096³ measured 5.40 (4.69) and 5.38 (5.13) in the two reports, against
+    5.35 (3.36) in the M9 report; see the variance section.
+
+### Tests
+
+- `uv run pytest -q`: 1159 passed, 20 skipped, and 2 deselected in about 9 s. `uv run
+  ruff check src tests examples benchmarks`: clean.
+- New test: `test_lazy_mlx_chain_never_evaluates_its_inputs` runs a chain of lazy
+  launches whose inputs are unevaluated results and fails if any launch evaluates one.
+
+### Deviations from the plan
+
+- The FP16 `mpp` target holds on a cool GPU but not after a minute of sustained matmul
+  work on this laptop, where MLX slows by the same amount. The table reports the suite
+  run, which follows 90 s of idle time.
+- The performance scripts for this section (the dispatch-order and tile sweeps, the
+  math-function chain, and the feature A/Bs) were one-off measurements and aren't in
+  `benchmarks/`.
+
+### Known gaps
+
+- FP32 `matmul2d` stays unstable at 4096³; tuning can pick it on a good run.
+- Autotuning phase 1 still times configs in list order, so on a GPU whose clock is
+  falling it favors the configs that come first.
+- The site's benchmark pages come from the second report. Neither report ran with the
+  laptop on power the whole time.

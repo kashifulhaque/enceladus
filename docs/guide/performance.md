@@ -52,6 +52,31 @@ the tile's element count, times its element size in 32-bit words, divided by
 because the kernel might spill registers to memory and slow down by several times. For
 a tile of more than 256, compilation fails. `kernel.explain` lists the register count of every tile.
 
+## Let the compiler emit vector loads
+
+When the compiler can prove that each thread's elements of a pointer-tile load or store
+are consecutive in memory, aligned, and under one mask value, it moves them with one
+vector access (`vec<T, 4>`) instead of one access per element. On an M4 Pro, vector
+accesses made a `float16` pointer-tile matmul 26% faster and an `int8` vector add 18%
+faster. They didn't change `float32` or `float16` elementwise kernels, softmax, or norms
+measurably, because those already run at full bandwidth.
+
+The proof needs the following facts:
+
+- **Contiguity:** offsets built from `tl.arange` along the fastest dimension, such as
+  `row * stride + tl.arange(0, BLOCK)`.
+- **Alignment:** array arguments whose data starts on 16 bytes, which holds for newly
+  allocated arrays, and integer arguments such as strides that are multiples of 16.
+  Enceladus specializes each kernel on both facts, as Triton does. A row stride of 1,000
+  elements prevents vector accesses; padding it to 1,024 allows them.
+- **A uniform mask:** a mask such as `offs < n` is the same across each vector when `n` is
+  a multiple of 16. With a ragged `n`, masked loads and stores stay scalar.
+
+When the compiler can't see a fact that you know holds, promise it with
+`tl.multiple_of(x, m)` or `tl.max_contiguous(x, c)`, for example for offsets computed
+from a loop counter or loaded from an index array. A false promise gives wrong results;
+run the kernel in the interpreter with `ENCELADUS_DEBUG=1` to check your promises.
+
 ## Feed `tl.dot` from tensor descriptors
 
 `tl.dot` can get its operands in two ways:
@@ -70,7 +95,7 @@ as "read by tl.dot straight from device memory; 0 registers."
 
 Epilogues fuse for free. Operations on the accumulator after the loop, such as adding a
 bias, applying an activation, or casting, work on the accumulator's registers in place.
-A matmul with a fused bias and GELU runs within about 2-3% of a plain matmul.
+A matmul with a fused bias and GELU runs within about 1% of a plain matmul.
 
 ## Autotune kernels
 
@@ -80,10 +105,29 @@ model predicts. The autotuner measures instead of guessing.
 
 `@enceladus.autotune(configs, key)` compiles every candidate `enceladus.Config` in
 parallel, times each one with `do_bench`, and uses the fastest for each combination
-of the `key` arguments and the argument dtypes. It rejects configurations that run more
-than 3 times slower than the median, and it saves each result on disk, in
+of the `key` arguments and the argument dtypes. It saves each result on disk, in
 `~/.cache/enceladus/autotune/`, keyed by the kernel's source, the compiler version, and
 the GPU. Later processes reuse saved results without benchmarking.
+
+GPU timings vary by a few percent from run to run, so the autotuner times in two
+phases. The first phase times every configuration. The second times the fastest few
+again, up to three within 15% of the fastest, in four interleaved rounds, and compares
+the medians of all their samples. Interleaving spreads GPU clock changes and other GPU
+work across the configurations. Among the configurations within `tolerance` (1% by
+default) of the fastest, the one listed first wins. The autotuner also benchmarks
+each configuration with the same argument alignment and strides as the real launch, so
+it times the code that the launch runs.
+
+To tune reliably, follow these guidelines:
+
+- List a known-good default configuration first, as `matmul_configs` does. It then
+  stays in use unless another configuration is measurably faster.
+- Tune on a quiet GPU. Other GPU work during tuning, such as another process, can
+  still make a slower configuration win.
+- To check what tuning costs, set `ENCELADUS_PRINT_AUTOTUNING=1`, which prints the
+  tuning time with each result. The second phase adds about a third to the tuning
+  time: the FP32 matmul at 4096³ tuned in 11-12 seconds on a busy M4 Pro GPU.
+- For stable choices in production, freeze the printed configuration in your code.
 
 Enceladus ships pre-validated configuration lists for the two kernels that need them
 most:
@@ -135,7 +179,7 @@ The grid must be a function of `meta`, because the block sizes come from the cho
 configuration. The output is similar to the following:
 
 ```text
-enceladus: autotuning matmul_kernel [1024|1024|512|float16,float16,float16] chose enceladus.Config({'BM': 64, 'BN': 32, 'BK': 32}, num_warps=4, dot_warps=(4, 1), dot_backend='mpp') (0.186 ms)
+enceladus: autotuning matmul_kernel [1024|1024|512|float16,float16,float16] chose enceladus.Config({'BM': 64, 'BN': 32, 'BK': 32}, num_warps=4, dot_warps=(4, 1), dot_backend='mpp') (0.186 ms, tuned in 1.2 s)
 ```
 
 The autotuner has the following options, which match Triton's:
@@ -150,12 +194,15 @@ The autotuner has the following options, which match Triton's:
 - `enceladus.heuristics({"BLOCK": fn})` computes constexprs from the other arguments
   instead of benchmarking them.
 
+Enceladus adds one option that Triton doesn't have: `tolerance=0.01` sets the fraction
+of the fastest time within which the first-listed configuration wins.
+
 Set `ENCELADUS_ALWAYS_COMPILE=1` to ignore saved results and tune again.
 
 ## Keep launches asynchronous
 
 Each launch that waits for the GPU costs about 70-100 µs, most of it in the GPU driver.
-An asynchronous launch costs about 3.3 µs of host time for a `@enceladus.jit` kernel,
+An asynchronous launch costs about 3.2 µs of host time for a `@enceladus.jit` kernel,
 and the stream batches up to 64 launches into one command buffer, which brings the
 GPU-side cost of a small launch to about 1 µs. For code that runs many small kernels,
 asynchronous launches are 20-30 times faster.
@@ -172,7 +219,9 @@ To keep launches asynchronous, follow these guidelines:
   `enceladus.synchronize()` before you read them.
 - With PyTorch, pass only MPS tensors to a kernel. A launch that mixes PyTorch tensors
   with other arrays takes the synchronized path.
-- MLX launches always wait. Batch work into fewer, larger kernels where you can.
+- With MLX, call `enceladus.lazy_mlx(True)` and allocate outputs with
+  `enceladus.new_empty`, so that launches join MLX's lazy graph instead of waiting. For
+  the conditions, see [Lazy MLX launches](interop.md#lazy-mlx-launches).
 
 `enceladus.from_numpy` shares the array's memory only when the array is C-contiguous
 and starts on a 16 KB page boundary. Otherwise, it copies the array, and later changes
@@ -201,10 +250,15 @@ NaNs. `@enceladus.jit(math_mode="fast")` lets the Metal compiler assume that no 
 infinite or NaN, which can speed up math-heavy kernels. Don't use it for kernels that
 rely on `-inf`, such as a softmax that masks with `-float("inf")`.
 
-In both modes, `tl.sin` and `tl.cos` use Metal's precise variants, because the fast ones
-return 0 for inputs above about 1e7. In compute-bound code, they take up to 3.3 times as
-long as the fast ones. `tl.tanh` takes about 1.7 times as long as Metal's fast `tanh`,
-which is inaccurate near 0 and returns NaN for inputs of 45 and more.
+In both modes, math functions such as `tl.exp` compile with Metal's precise variants,
+on every launch path, so a kernel gives bit-identical results on NumPy arrays, PyTorch
+tensors, and MLX arrays. PyTorch's `compile_shader` offers no other choice. In
+compute-bound code, the precise variants take longer than the fast ones: about 1.7 times
+as long for `tl.exp`, 2.4 times for `tl.log`, 3 times for `tl.rsqrt`, 3.4 times for
+`tl.sqrt`, and 3.3 times for `tl.sin` and `tl.cos`. Memory-bound kernels, such as a softmax or a
+LayerNorm, don't slow down. `tl.tanh` uses an accurate implementation of its own,
+because Metal's fast `tanh` is inaccurate near 0 and returns NaN for inputs of 45 and
+more.
 
 For exponentials, prefer `tl.exp2` and fold the factor `log2(e)` into a scale that you
 compute once, as `examples/08_flash_attention.py` does.
@@ -239,6 +293,8 @@ A `tl.dot` loop is eligible for `mpp` when it meets the following conditions:
   counters, and non-negative constants.
 - The operands are `float16` accumulating in `float32` or `float16`, `bfloat16`
   accumulating in `float32` or `bfloat16`, or `float32` accumulating in `float32`.
+  Integer `tl.dot` always uses `"simdgroup"`: on an M4 Pro, `int8` `matmul2d` sums in
+  floating point and returned wrong `int32` results once a sum passed 2^24.
 - The output tile is 16 to 128 in each dimension, and the kernel uses at most 8 SIMD
   groups.
 - After the loop, the result reaches a single descriptor store through elementwise

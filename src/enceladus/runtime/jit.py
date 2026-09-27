@@ -35,6 +35,8 @@ from enceladus.compiler.pipeline import compile_module
 from enceladus.interpreter import interp
 from enceladus.language import core
 from enceladus.runtime import interop
+from enceladus.runtime.launcher import _INDEX_CHECK_BYTES, needs_idx64
+from enceladus.runtime.tensor import Tensor
 
 __all__ = [
     "JITFunction",
@@ -148,7 +150,8 @@ def arg_facts(value: Any) -> dict[str, Any]:
 
     Integers get `divisibility = 16` when `value % 16 == 0` and `equal_to_1` when
     `value == 1`. Arrays get `divisibility = 16` when their data pointer is 16-byte
-    aligned. Facts become IR attributes; they never remove an argument.
+    aligned, and `idx64` when an element lies more than 2^31 - 1 elements past the first,
+    which needs 64-bit offsets. Facts become IR attributes; they never remove an argument.
     """
     if isinstance(value, (bool, np.bool_, float, np.floating)) or isinstance(value, ir.Type):
         return {}
@@ -165,8 +168,15 @@ def arg_facts(value: Any) -> dict[str, Any]:
         if aligned is None:
             p = _data_ptr(value)
             aligned = p is not None and p % 16 == 0
-        return {"divisibility": 16} if aligned else {}
+        facts = {"divisibility": 16} if aligned else {}
+        if hasattr(value, "shape") and needs_idx64(value):
+            facts["idx64"] = True
+        return facts
     return {}
+
+
+# Facts that `do_not_specialize` keeps, because the kernel is wrong without them.
+_REQUIRED_FACTS = ("idx64",)
 
 
 # ---------------------------------------------------------------------------
@@ -281,9 +291,9 @@ class JITFunction:
         """A SHA-256 over the source and every value that the frontend can read.
 
         The hash covers referenced @enceladus.jit functions, global constants and tuples,
-        module attributes such as `consts.SCALE`, and the source and globals of plain
-        Python helpers that the kernel calls at compile time. Changing any of them
-        changes the key.
+        module attributes such as `consts.SCALE`, the source and globals of plain Python
+        helpers that the kernel calls at compile time, and the source, methods, and
+        class attributes of user classes. Changing any of them changes the key.
         """
         if self._cache_key is None:
             finder = _DependencyFinder()
@@ -359,7 +369,10 @@ class JITFunction:
                 types[p.name] = arg_type(v)
             except TypeError as e:
                 raise TypeError(f"{self.__name__}: argument `{p.name}`: {e}") from None
-            facts[p.name] = {} if p.do_not_specialize else arg_facts(v)
+            f = arg_facts(v)
+            if p.do_not_specialize:
+                f = {k: x for k, x in f.items() if k in _REQUIRED_FACTS}
+            facts[p.name] = f
         return Specialization(types, facts, consts)
 
     def ir(self, *args: Any, num_warps: int = 4, **kwargs: Any) -> ir.Module:
@@ -384,7 +397,9 @@ class JITFunction:
         """
         interpret = self.interpret
         if interpret is None:
-            interpret = _env_flag("ENCELADUS_INTERPRET")
+            # Like `_env_flag`, but through the bound C method: `os.environ.get` costs
+            # about 0.3 µs, a tenth of a launch.
+            interpret = core.env_lookup(b"ENCELADUS_INTERPRET", b"0") not in (b"", b"0")
         if not interpret:
             self._run_compiled(args, kwargs, grid, num_warps, dot_warps, dot_backend)
             return
@@ -704,7 +719,11 @@ def _const_key(v: Any) -> Any:
 
 
 def _spec_key(v: Any, no_facts: bool) -> Any:
-    """Returns the part of the specialization key contributed by one runtime argument."""
+    """Returns the part of the specialization key contributed by one runtime argument.
+
+    An array that needs 64-bit offsets adds `"idx64"` to its part, even when `no_facts`
+    is true, because a kernel with 32-bit offsets can't address it.
+    """
     t = type(v)
     if t is bool:
         return "i1"
@@ -719,17 +738,32 @@ def _spec_key(v: Any, no_facts: bool) -> Any:
     if t is float:
         return "f32"
     if t.__name__ == "Tensor" and t.__module__ == "torch":
-        return interop.torch_spec_key(v, no_facts)
-    from enceladus.runtime.tensor import Tensor
-
+        k = interop.torch_spec_key(v, no_facts)
+        if v.untyped_storage().nbytes() > _INDEX_CHECK_BYTES and needs_idx64(v):
+            return (*k, "idx64")
+        return k
+    if t.__name__ == "array" and t.__module__ == "mlx.core":
+        # A strided MLX view can span past 2^31 elements of a small array's buffer, and MLX
+        # has no cheap contiguity flag, so every MLX array gets the exact span check.
+        k = interop.mlx_spec_key(v, no_facts)
+        return (*k, "idx64") if needs_idx64(v) else k
     if t is Tensor:
-        return (v.np_dtype, True if no_facts else v.data_ptr % 16 == 0)
+        k = (v.np_dtype, True if no_facts else v.data_ptr % 16 == 0)
+        if v.buffer.nbytes > _INDEX_CHECK_BYTES and needs_idx64(v):
+            return (*k, "idx64")
+        return k
     if t is np.ndarray:
-        return (v.dtype, True if no_facts else v.__array_interface__["data"][0] % 16 == 0)
+        k = (v.dtype, True if no_facts else v.__array_interface__["data"][0] % 16 == 0)
+        if (v.nbytes > _INDEX_CHECK_BYTES or not v.flags.c_contiguous) and needs_idx64(v):
+            return (*k, "idx64")
+        return k
     if interop.framework_of(v) == interop.KIND_TORCH:  # a torch.Tensor subclass
-        return interop.torch_spec_key(v, no_facts)
+        k = interop.torch_spec_key(v, no_facts)
+        return (*k, "idx64") if needs_idx64(v) else k
     ty = arg_type(v)
-    facts = {} if no_facts else arg_facts(v)
+    facts = arg_facts(v)
+    if no_facts:
+        facts = {k: x for k, x in facts.items() if k in _REQUIRED_FACTS}
     return (str(ty), tuple(sorted(facts.items())))
 
 
@@ -837,6 +871,8 @@ def is_tracked(v: Any) -> bool:
     if isinstance(v, functools.partial):
         return (is_tracked(v.func) and is_tracked(v.args)
                 and all(is_tracked(x) for x in v.keywords.values()))  # fmt: skip
+    if isinstance(v, types.MethodType):  # for example, a classmethod read from its class
+        return isinstance(v.__self__, type) and is_tracked(v.__self__) and is_tracked(v.__func__)
     if isinstance(v, (types.BuiltinFunctionType, type)):
         if _library_token(v) is not None:
             return True
@@ -863,6 +899,36 @@ def is_content_hashed(v: Any) -> bool:
     return _plain_token(v) is not None or isinstance(v, core.dtype)
 
 
+def untracked_reason(v: Any) -> str | None:
+    """Returns what the dependency hash can't track in a callable, or `None`.
+
+    Unlike `is_tracked`, this follows a plain Python helper, a class, or a bound method
+    transitively: the globals, attribute chains, and closures that their code reads,
+    the methods and attributes of classes, and the helpers that they call in turn. The
+    frontend refuses a call whose callable reaches a value without a deterministic
+    token, because the kernel cache can't detect a change to that value. A bound
+    method's receiver isn't followed, because the frontend checks where it comes from.
+
+    Returns:
+        A description such as "`helper` reads `SETTINGS.scale`, which reaches a
+        Settings object", or `None` if the hash tracks everything that `v` reaches.
+    """
+    v = core.unwrap(v)
+    if isinstance(v, types.MethodType) and not isinstance(v.__self__, type):
+        v = v.__func__
+    finder = _DependencyFinder()
+    finder.token(v)
+    if not finder.untracked:
+        return None
+    where, chain, kind = finder.untracked[0]
+    # Name the longest chain that the same code reads through the value, such as
+    # `SETTINGS.scale` rather than `SETTINGS`.
+    chain = max((c for w, c, k in finder.untracked
+                 if w == where and k == kind and c.startswith(chain + ".")),
+                key=len, default=chain)  # fmt: skip
+    return f"`{where}` reads `{chain}`, which reaches a {kind} object"
+
+
 @functools.cache
 def _library_roots() -> tuple[str, ...]:
     """Returns the directories of installed code: the standard library, site-packages, and
@@ -886,8 +952,31 @@ def _library_token(obj: Any) -> str | None:
     if file is not None and not os.path.realpath(file).startswith(_library_roots()):
         return None
     name = getattr(obj, "__qualname__", None) or getattr(obj, "__name__", "?")
-    top = sys.modules.get(module.split(".")[0])
-    return f"lib:{module}.{name}:{getattr(top, '__version__', '')}"
+    return f"lib:{module}.{name}:{_library_version(module)}"
+
+
+def _library_version(module: str) -> str:
+    return str(getattr(sys.modules.get(module.split(".")[0]), "__version__", ""))
+
+
+def is_library_callable(owner: Any, v: Any) -> bool:
+    """Returns whether `v` is a callable attribute of an installed module, such as
+    `np.log2`, which the dependency hash keys by name and library version.
+
+    Objects such as NumPy ufuncs aren't functions, so they have no source to hash, but
+    the library that defines them doesn't change while it stays installed. Only modules
+    imported from the standard library, site-packages, or Enceladus qualify, not
+    modules that user code creates at run time.
+    """
+    if not isinstance(owner, types.ModuleType) or not callable(v) or isinstance(v, type) \
+            or is_jit_function(v) or isinstance(v, core.Builtin):  # fmt: skip
+        return False
+    if sys.modules.get(owner.__name__) is not owner:
+        return False
+    file = getattr(owner, "__file__", None)
+    if file is None:
+        return owner.__name__ in sys.builtin_module_names
+    return os.path.realpath(file).startswith(_library_roots())
 
 
 def _code_token(code: types.CodeType) -> str:
@@ -952,8 +1041,10 @@ class _DependencyFinder:
     module attributes, tuples, and plain Python functions that run at compile time, so the
     finder resolves attribute chains on modules and classes, hashes tuples by content,
     and hashes the source, defaults, closure, and globals of plain Python helpers,
-    transitively. `deps` collects each binding that the hash read, so that
-    `JITFunction._check_globals` can notice a rebinding without rehashing.
+    transitively. A user class is hashed with its bases, its methods (like helpers), and
+    its class attributes. `deps` collects each binding that the hash read, so that
+    `JITFunction._check_globals` can notice a rebinding without rehashing. `untracked`
+    describes each value that got only a per-process token, which the frontend refuses.
     """
 
     def __init__(self) -> None:
@@ -962,6 +1053,11 @@ class _DependencyFinder:
         self.volatile: list[tuple[Any, str]] = []
         self.jits: list[JITFunction] = []
         self._dep_keys: set[tuple[int, str]] = set()
+        # (function or class, chain, type name) for each value that got a per-process
+        # token; see `untracked_reason`.
+        self.untracked: list[tuple[str, str, str]] = []
+        # The function or class being hashed, and the chain it reads, for descriptions.
+        self._where: tuple[str, str] | None = None
 
     def jit_hash(self, fn: JITFunction) -> str:
         self.seen.add(id(fn))
@@ -970,7 +1066,7 @@ class _DependencyFinder:
         # the generated code.
         # Parameters shadow globals of the same name.
         chains = _chains(fn.source_info().tree.body, fn.arg_names)
-        self._hash_refs(h, fn.fn.__globals__, chains)
+        self._hash_refs(h, fn.fn.__globals__, chains, fn.__qualname__)
         return h.hexdigest()
 
     def _record(self, get: Callable[[str, Any], Any], owner: Any, name: str, value: Any) -> None:
@@ -979,20 +1075,24 @@ class _DependencyFinder:
             self._dep_keys.add(k)
             self.deps.append((get, name, value))
 
-    def _hash_refs(self, h: Any, g: dict[str, Any], chains: Iterable[tuple[str, ...]]) -> None:
+    def _hash_refs(self, h: Any, g: dict[str, Any], chains: Iterable[tuple[str, ...]],
+                   where: str) -> None:  # fmt: skip
         lines = set()
         for chain in chains:
             if chain[0] not in g:
                 continue  # a local, a parameter, or a builtin
+            outer, self._where = self._where, (where, ".".join(chain))
             obj = g[chain[0]]
             if not _is_enceladus_module(obj):
                 # Skipping `tl` and `enceladus` keeps the launch path free of checks for
                 # typical kernels, which depend on nothing else.
                 self._record(g.get, g, chain[0], obj)
             path = chain[0]
+            owner: Any = None
             for attr in chain[1:]:
                 owner = core.unwrap(obj)
                 if not isinstance(owner, (types.ModuleType, type)):
+                    owner = None
                     break  # an attribute of a value, which the value's token covers
                 try:
                     obj = getattr(owner, attr)
@@ -1004,7 +1104,14 @@ class _DependencyFinder:
                     get = d.get if attr in d else functools.partial(getattr, owner)
                     self._record(get, owner, attr, obj)
                 path += "." + attr
-            lines.add(f"{path}={'<missing>' if obj is _MISSING else self.token(obj)}")
+            if obj is _MISSING:
+                tok = "<missing>"
+            elif is_library_callable(owner, obj):
+                tok = f"lib:{owner.__name__}.{chain[-1]}:{_library_version(owner.__name__)}"
+            else:
+                tok = self.token(obj)
+            lines.add(f"{path}={tok}")
+            self._where = outer
         h.update("\n".join(sorted(lines)).encode())
 
     def token(self, v: Any) -> str:
@@ -1031,6 +1138,8 @@ class _DependencyFinder:
         if isinstance(v, functools.partial):
             kw = ",".join(f"{k}={self.token(x)}" for k, x in sorted(v.keywords.items()))
             return f"partial:{self.token(v.func)}:{self.token(v.args)}:{kw}"
+        if isinstance(v, types.MethodType) and isinstance(v.__self__, type):
+            return f"method:{self.token(v.__self__)}:{self.token(v.__func__)}"
         if isinstance(v, (types.BuiltinFunctionType, type)):
             lib = _library_token(v)
             if lib is not None:
@@ -1041,11 +1150,47 @@ class _DependencyFinder:
                 except (OSError, TypeError):
                     pass
                 else:
-                    return f"type:{_type_name(v)}:{hashlib.sha256(src.encode()).hexdigest()}"
+                    return f"type:{_type_name(v)}:{self._class_token(v, src)}"
         wrapped = getattr(v, "__wrapped__", None)
         if isinstance(wrapped, types.FunctionType):  # for example, a functools.cache wrapper
             return f"wrapped:{_type_name(type(v))}:{self.token(wrapped)}"
+        where, chain = self._where or ("?", "?")
+        self.untracked.append((where, chain, type(v).__name__))
         return f"opaque:{_type_name(type(v))}:{id(v)}:{_PROCESS_NONCE}"
+
+    def _class_token(self, cls: type, src: str) -> str:
+        """Hashes a user class: its source, its bases, and every method and class attribute.
+
+        Methods are hashed like plain helpers, so the globals that they read are covered.
+        Each class attribute is recorded as a dependency, so that rebinding one, as in
+        `Config.SCALE = 5`, recompiles the kernels that use the class.
+        """
+        name = _type_name(cls)
+        if id(cls) in self.seen:
+            return f"{name}:seen"
+        self.seen.add(id(cls))
+        h = hashlib.sha256(src.encode())
+        for base in cls.__bases__:
+            h.update(f"base {self.token(base)}".encode())
+        d = vars(cls)
+        for attr in sorted(d):
+            raw = d[attr]
+            if isinstance(raw, (types.MemberDescriptorType, types.GetSetDescriptorType)):
+                continue  # a slot or `__dict__`, which holds instance state only
+            if isinstance(raw, property):
+                values: tuple[Any, ...] = (raw.fget, raw.fset, raw.fdel)
+            elif isinstance(raw, (staticmethod, classmethod)):
+                values = (raw.__func__,)
+            else:
+                values = (raw,)
+            dunder = attr.startswith("__") and attr.endswith("__")
+            if dunder and not any(isinstance(x, types.FunctionType) for x in values):
+                continue  # for example, `__module__`, `__doc__`, or dataclass metadata
+            self._record(d.get, cls, attr, raw)
+            outer, self._where = self._where, (cls.__qualname__, f"{cls.__qualname__}.{attr}")
+            h.update(f"{attr}={','.join(self.token(x) for x in values)}".encode())
+            self._where = outer
+        return h.hexdigest()
 
     def _function_token(self, f: types.FunctionType) -> str:
         name = f"{f.__module__}.{f.__qualname__}"
@@ -1082,8 +1227,10 @@ class _DependencyFinder:
             get = _cell_getter(cell)
             val = get(var, _MISSING)
             self._record(get, cell, var, val)
+            outer, self._where = self._where, (f.__qualname__, var)
             h.update(f"closure {var}={'<empty>' if val is _MISSING else self.token(val)}".encode())
-        self._hash_refs(h, f.__globals__, chains)
+            self._where = outer
+        self._hash_refs(h, f.__globals__, chains, f.__qualname__)
         return h.hexdigest()
 
 

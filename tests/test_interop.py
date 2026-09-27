@@ -22,6 +22,15 @@ except ImportError:
 
 NO_MLX = pytest.mark.skipif(mx is None, reason="MLX isn't installed")
 FRAMEWORKS = ["torch", pytest.param("mlx", marks=NO_MLX)]
+# "mlx-lazy" runs MLX arrays with enceladus.lazy_mlx(True).
+ALL_FRAMEWORKS = [*FRAMEWORKS, pytest.param("mlx-lazy", marks=NO_MLX)]
+
+
+@pytest.fixture
+def lazy_mlx():
+    enceladus.lazy_mlx(True)
+    yield
+    enceladus.lazy_mlx(False)
 
 
 def to_framework(a: np.ndarray, fw: str, pad: int):
@@ -34,7 +43,8 @@ def to_framework(a: np.ndarray, fw: str, pad: int):
     if fw == "torch":
         return torch.from_numpy(big).to("mps")[pad:]
     out = mx.array(big)[pad:]
-    mx.eval(out)
+    if fw == "mlx":
+        mx.eval(out)  # lazy launches take lazy inputs
     return out
 
 
@@ -100,12 +110,14 @@ def _cumsum(fw, pad, rng, dtype):
     return ex.cumsum, ex.reference, (rng.standard_normal((37, 300)).astype(dtype),)
 
 
-@pytest.mark.parametrize("fw", FRAMEWORKS)
+@pytest.mark.parametrize("fw", ALL_FRAMEWORKS)
 @pytest.mark.parametrize("pad", [0, 3])  # 3 rows gives offsets that aren't 16-byte aligned
 @pytest.mark.parametrize("case", [_vector_add, _softmax, _layernorm, _matmul, _matmul_desc,
                                   _fused_gelu, _rmsnorm, _histogram, _cumsum])  # fmt: skip
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
-def test_examples_on_framework_arrays(fw, pad, case, dtype, monkeypatch):
+def test_examples_on_framework_arrays(fw, pad, case, dtype, monkeypatch, request):
+    if fw == "mlx-lazy":
+        request.getfixturevalue("lazy_mlx")
     run, reference, host = case(fw, pad, np.random.default_rng(0), dtype)
     args = [to_framework(a, fw, pad) if isinstance(a, np.ndarray) else a for a in host]
 
@@ -121,7 +133,8 @@ def test_examples_on_framework_arrays(fw, pad, case, dtype, monkeypatch):
     monkeypatch.setattr(launcher, "launch_synced", lambda *a: synced.append(1) or real(*a))
     check_kernel(run_np, args, lambda *a: reference(*[to_numpy(x) for x in a]),
                  atol=5e-2 if dtype == np.float16 else 1e-4, rtol=1e-2)  # fmt: skip
-    # PyTorch launches run on PyTorch's stream; MLX launches are synchronous by design.
+    # PyTorch launches run on PyTorch's stream, and lazy MLX launches in MLX's graph;
+    # other MLX launches are synchronous.
     assert bool(synced) == (fw == "mlx")
 
 
@@ -141,6 +154,119 @@ def test_jit_scalar_types_bind_on_torch_path(a, b, c, flag):
     _scalars_kernel[(1,)](out, fout, a, b, c, flag)
     assert out.cpu().tolist() == [a, b, int(flag)]
     assert fout.item() == c
+
+
+def _transcendental_kernel(math_mode):
+    @enceladus.jit(math_mode=math_mode)
+    def k(x_ptr, o_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        x = tl.load(x_ptr + offs, mask=m, other=1.0)
+        ax = tl.abs(x)
+        a = tl.exp(x) + tl.log(ax + 1.0) + tl.exp2(x * 0.5) + tl.log2(ax + 2.0)
+        b = tl.sqrt(ax) * tl.rsqrt(ax + 1.0) + tl.sin(x) * tl.cos(x)
+        c = tl.tanh(x) + tl.sigmoid(x) + tl.erf(x) + x / (a + 3.0)
+        tl.store(o_ptr + offs, a + b * c, mask=m)
+
+    return k
+
+
+@pytest.mark.parametrize("fw", ["torch", pytest.param("mlx-lazy", marks=NO_MLX)])
+@pytest.mark.parametrize("math_mode", ["relaxed", "fast"])
+def test_math_is_bit_identical_across_launch_paths(fw, math_mode, request):
+    # compile_shader, mx.fast.metal_kernel, and the native path compile with different
+    # default math settings, which differ by up to 18 ULP here.
+    k = _transcendental_kernel(math_mode)
+    n = 1 << 14
+    x = (np.random.default_rng(0).standard_normal(n) * 4).astype(np.float32)
+    native = np.zeros(n, np.float32)
+    k[(n // 1024,)](x, native, n, BLOCK=1024)
+    if fw == "torch":
+        out = torch.zeros(n, device="mps")
+        k[(n // 1024,)](torch.from_numpy(x).to("mps"), out, n, BLOCK=1024)
+        got = out.cpu().numpy()
+    else:
+        request.getfixturevalue("lazy_mlx")
+        xm = mx.array(x)
+        out = enceladus.new_empty(xm)
+        k[(n // 1024,)](xm, out, n, BLOCK=1024)
+        got = np.array(out)
+    np.testing.assert_array_equal(got.view(np.int32), native.view(np.int32))
+
+
+@enceladus.jit
+def _scale_kernel(x_ptr, out_ptr, n, scale, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    acc = tl.load(out_ptr + offs, mask=m) + tl.load(x_ptr + offs, mask=m) * scale
+    tl.store(out_ptr + offs, acc, mask=m)
+
+
+@NO_MLX
+def test_lazy_mlx_writes_only_fresh_outputs(lazy_mlx, monkeypatch, caplog):
+    # The kernel accumulates into its output, so it reads what it writes: a lazy launch
+    # is right only when the output is a fresh zero-filled array.
+    n = 3000
+    x = mx.arange(n, dtype=mx.float32)
+    synced = []
+    real = launcher.launch_synced
+    monkeypatch.setattr(launcher, "launch_synced", lambda *a: synced.append(1) or real(*a))
+    out = enceladus.new_zeros(x)
+    grid = (enceladus.cdiv(n, 1024),)
+    _scale_kernel[grid](x, out, n, 2.0, BLOCK=1024)  # lazy: `out` is fresh
+    assert not synced
+    with caplog.at_level(logging.WARNING, logger="enceladus"):
+        _scale_kernel[grid](x, out, n, 1.0, BLOCK=1024)  # in place: `out` holds 2x now
+        _scale_kernel[grid](out, out, n, 1.0, BLOCK=1024)  # aliased: in place
+    assert len(synced) == 2
+    np.testing.assert_array_equal(np.array(out), np.arange(n, dtype=np.float32) * 6)
+    assert sum("isn't a fresh output" in r.getMessage() for r in caplog.records) == 1
+
+
+@NO_MLX
+def test_lazy_mlx_chain_never_evaluates_its_inputs(lazy_mlx, monkeypatch):
+    # Each launch reads the unevaluated result of the one before. Reading an input's
+    # strides (for the 64-bit offset check or the specialization key) evaluates it and
+    # waits for its work, which made every lazy launch a synchronized round trip.
+    from enceladus.runtime import interop
+
+    n = 3000
+    x = mx.arange(n, dtype=mx.float32)
+    grid = (enceladus.cdiv(n, 1024),)
+    out = enceladus.new_zeros(x)
+    _scale_kernel[grid](x, out, n, 1.0, BLOCK=1024)  # the first launch evaluates once
+    evaluated = []
+    real = interop._mlx_view
+    monkeypatch.setattr(interop, "_mlx_view", lambda a: evaluated.append(1) or real(a))
+    acc = out
+    for _ in range(5):
+        nxt = enceladus.new_zeros(x)
+        _scale_kernel[grid](acc, nxt, n, 2.0, BLOCK=1024)
+        acc = nxt
+    assert not evaluated
+    np.testing.assert_array_equal(np.array(acc), np.arange(n, dtype=np.float32) * 32)
+
+
+@NO_MLX
+def test_lazy_mlx_falls_back_when_mlx_cant_compile(lazy_mlx, monkeypatch, caplog):
+    # MLX compiles a kernel only when it evaluates it, so an MSL error would surface at
+    # some later mx.eval; the first launch must catch it and run the kernel eagerly.
+    from enceladus.runtime import mlx_lazy
+
+    monkeypatch.setattr(mlx_lazy, "PRECISE_FUNCTIONS", ("no_such_function",))
+
+    @enceladus.jit
+    def k(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=offs < n) * 3, mask=offs < n)
+
+    x = mx.arange(100, dtype=mx.float32)
+    with caplog.at_level(logging.WARNING, logger="enceladus"):
+        for _ in range(2):
+            out = enceladus.new_empty(x)
+            k[(1,)](x, out, 100, BLOCK=128)
+            np.testing.assert_array_equal(np.array(out), np.arange(100) * 3.0)
+    assert sum("MLX couldn't run it" in r.getMessage() for r in caplog.records) == 1
 
 
 RAW_SCALARS = """
@@ -250,6 +376,36 @@ def test_mlx_refusals():
         ex.add_kernel[(1,)](mx.ones((4,)), mx.ones((4,)), out, 4, BLOCK=1024)
 
 
+@enceladus.jit
+def _fill_kernel(x_ptr, n, value, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(x_ptr + offs, tl.full((BLOCK,), value, tl.float32), mask=offs < n)
+
+
+@NO_MLX
+def test_mlx_write_waits_for_queued_mlx_readers():
+    # MLX work queued with mx.async_eval reads `a` while the kernel overwrites `a` on
+    # Enceladus's queue; mx.eval(a) alone doesn't wait for that work.
+    n = 1 << 20
+
+    def reader(a):
+        acc = a * 0.5
+        for _ in range(32):
+            acc = acc + a
+        return acc
+
+    for seed in range(4):
+        a = mx.random.normal((n,), key=mx.random.key(seed))
+        expected = reader(a)
+        mx.eval(a, expected)
+        got = reader(a)
+        mx.async_eval(got)
+        _fill_kernel[(n // 1024,)](a, n, 0.0, BLOCK=1024)
+        mx.eval(got)
+        assert mx.array_equal(got, expected).item()
+        assert not mx.any(a).item()  # the fill ran
+
+
 def _matmul_fused(fw, pad, rng, dtype):
     ex = load_example("07_matmul_fused")
     a = rng.standard_normal((100, 64)).astype(dtype)
@@ -263,11 +419,11 @@ def _attention(fw, pad, rng, dtype):
     return ex.attention, ex.reference, (q, k, v)
 
 
-@pytest.mark.parametrize("fw", FRAMEWORKS)
+@pytest.mark.parametrize("fw", ALL_FRAMEWORKS)
 @pytest.mark.parametrize("case", [_matmul_fused, _attention])
-def test_fused_examples_allocate_outputs_in_the_input_framework(fw, case, monkeypatch):
+def test_fused_examples_allocate_outputs_in_the_input_framework(fw, case, monkeypatch, request):
     # The wrappers allocate their outputs themselves; they must not assume NumPy.
-    test_examples_on_framework_arrays(fw, 0, case, np.float16, monkeypatch)
+    test_examples_on_framework_arrays(fw, 0, case, np.float16, monkeypatch, request)
 
 
 def test_torch_launch_refuses_a_grid_that_overflows_thread_positions():

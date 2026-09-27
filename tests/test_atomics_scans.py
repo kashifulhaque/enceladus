@@ -136,27 +136,34 @@ def test_scalar_atomics_hand_out_unique_tickets(mode):
 
 
 @enceladus.jit
-def _u64_max_kernel(mem_ptr, idx_ptr, val_ptr, n, BLOCK: tl.constexpr):
+def _u64_minmax_kernel(mem_ptr, idx_ptr, val_ptr, n, KIND: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = offs < n
-    tl.atomic_max(mem_ptr + tl.load(idx_ptr + offs, mask=m), tl.load(val_ptr + offs, mask=m),
-                  mask=m)  # fmt: skip
+    p = mem_ptr + tl.load(idx_ptr + offs, mask=m)
+    v = tl.load(val_ptr + offs, mask=m)
+    if KIND == "max":
+        tl.atomic_max(p, v, mask=m)
+    else:
+        tl.atomic_min(p, v, mask=m)
 
 
-def test_uint64_max_with_colliding_addresses():
+# uint64 max and min are Metal's only 64-bit atomics.
+@pytest.mark.parametrize("kind", ["max", "min"])
+def test_uint64_max_and_min_with_colliding_addresses(kind):
     rng = np.random.default_rng(4)
     n, slots = 3000, 37
     idx = rng.integers(0, slots, n).astype(np.int32)
     val = rng.integers(0, 2**64 - 1, n, dtype=np.uint64, endpoint=True)
+    init = np.uint64(0) if kind == "max" else np.uint64(2**64 - 1)
 
     def run(idx, val):
-        mem = np.zeros(slots, np.uint64)
-        _u64_max_kernel[(enceladus.cdiv(n, 512),)](mem, idx, val, n, BLOCK=512)
+        mem = np.full(slots, init, np.uint64)
+        _u64_minmax_kernel[(enceladus.cdiv(n, 512),)](mem, idx, val, n, KIND=kind, BLOCK=512)
         return mem
 
     def reference(idx, val):
-        mem = np.zeros(slots, np.uint64)
-        np.maximum.at(mem, idx, val)
+        mem = np.full(slots, init, np.uint64)
+        (np.maximum if kind == "max" else np.minimum).at(mem, idx, val)
         return mem
 
     check_kernel(run, (idx, val), reference)
@@ -173,12 +180,18 @@ def _u64_old_kernel(p, out_ptr):
     tl.store(out_ptr, tl.atomic_max(p, 1))
 
 
-def test_unsupported_atomics_raise_source_located_errors(mode):
-    x = np.zeros(16, np.float16)
+@pytest.mark.parametrize(("dtype", "phrase"), [
+    (np.float16, "Accumulate in a float32 buffer"),
+    # 64-bit atomics other than uint64 max and min: the error names the alternative.
+    (np.int64, "two uint32 buffers"),
+    (np.uint64, "two uint32 buffers"),
+])  # fmt: skip
+def test_unsupported_atomics_raise_source_located_errors(mode, dtype, phrase):
+    x = np.zeros(16, dtype)
     with execution_mode(mode), pytest.raises(enceladus.CompilationError) as e:
         _half_add_kernel[(1,)](x, x, BLOCK=16)
-    assert "float32" in str(e.value) and "tl.atomic_add(p + offs" in str(e.value)
-    if mode == "compiled":
+    assert phrase in str(e.value) and "tl.atomic_add(p + offs" in str(e.value)
+    if dtype == np.float16 and mode == "compiled":
         u = np.zeros(1, np.uint64)
         with pytest.raises(enceladus.CompilationError, match="old value"):
             _u64_old_kernel.warmup(u, u)

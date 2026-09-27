@@ -1,8 +1,8 @@
 """Measures launch overhead: sustained batched launches and synchronous round trips.
 
-The PyTorch rows launch through `torch.mps.compile_shader` on PyTorch's MPS stream, and
-the MLX row measures the synchronous MLX path. Rows for a framework that isn't installed
-are skipped.
+The PyTorch rows launch through `torch.mps.compile_shader` on PyTorch's MPS stream. The
+MLX rows measure the synchronous MLX path, and lazy launches (`enceladus.lazy_mlx`)
+against MLX's own ops. Rows for a framework that isn't installed are skipped.
 
 Run with `uv run python benchmarks/bench_dispatch.py`.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import statistics
 import time
+from typing import Any
 
 import enceladus
 import enceladus.language as tl
@@ -131,7 +132,7 @@ def bench_torch(add_kernel, n: int) -> None:
 
 
 def bench_mlx(add_kernel, n: int) -> None:
-    """Measures the synchronous MLX path."""
+    """Measures the synchronous MLX path, and lazy launches against MLX's own ops."""
     try:
         import mlx.core as mx
     except ImportError:
@@ -144,6 +145,36 @@ def bench_mlx(add_kernel, n: int) -> None:
 
     jit_launch()
     report("@enceladus.jit on MLX arrays, sync round trip", round_trip(jit_launch))
+
+    # Lazy launches: a chain of 1,000 dependent adds, each into a fresh output, then one
+    # evaluation. MLX's own `x + y` chain is the floor.
+    def lazy_chain() -> Any:
+        acc = y
+        for _ in range(1000):
+            out = enceladus.new_empty(x)
+            add_kernel[(1,)](x, acc, out, n, BLOCK=1024)
+            acc = out
+        return acc
+
+    def mlx_chain() -> Any:
+        acc = y
+        for _ in range(1000):
+            acc = x + acc
+        return acc
+
+    enceladus.lazy_mlx(True)
+    try:
+        for name, chain in [("@enceladus.jit on MLX arrays, lazy chain", lazy_chain),
+                            ("MLX x + y chain", mlx_chain)]:  # fmt: skip
+            mx.eval(chain())  # warm up
+            samples = []
+            for _ in range(10):
+                t0 = time.perf_counter()
+                mx.eval(chain())
+                samples.append((time.perf_counter() - t0) / 1000 * 1e6)
+            report(name, samples)
+    finally:
+        enceladus.lazy_mlx(False)
 
 
 if __name__ == "__main__":

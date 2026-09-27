@@ -576,6 +576,23 @@ def _v_trans(op: Op) -> None:
     _check(r == TileType(tuple(a.shape[p] for p in perm), a.elem), "result shape must be permuted")
 
 
+def _v_join(op: Op) -> None:
+    _arity(op, 2, 1)
+    a, b, r = op.operands[0].type, op.operands[1].type, op.result.type
+    _check(isinstance(a, TileType) and a == b, f"operands must be tiles of one type, got {a}, {b}")
+    out = TileType((*a.shape, 2), a.elem)
+    _check(r == out, f"result must be {out}")
+
+
+def _v_split(op: Op) -> None:
+    _arity(op, 1, 2)
+    a = op.operands[0].type
+    _check(isinstance(a, TileType) and len(a.shape) >= 2 and a.shape[-1] == 2,
+           "operand must be a tile of rank 2 or more whose last dimension is 2")
+    out = TileType(a.shape[:-1], a.elem)
+    _check(all(r.type == out for r in op.results), f"results must be {out}")
+
+
 def _v_addptr(op: Op) -> None:
     _arity(op, 2, 1)
     p, o = op.operands[0].type, op.operands[1].type
@@ -661,8 +678,12 @@ def _v_dot(op: Op) -> None:
     _check(all(isinstance(t, TileType) and len(t.shape) == 2 for t in (a, b, c)), "needs 2D tiles")
     _check(a.shape[1] == b.shape[0], f"inner dimensions differ: {a.shape} and {b.shape}")
     _check(c.shape == (a.shape[0], b.shape[1]), f"accumulator must be {a.shape[0]}x{b.shape[1]}")
-    _check(a.elem == b.elem and _is_float(a), "operands must share a floating-point type")
-    _check(_is_float(c) and op.result.type == c, "result must match the float accumulator")
+    _check(a.elem == b.elem, "operands must share an element type")
+    _check(op.result.type == c, "result must match the accumulator")
+    if _is_float(a):
+        _check(_is_float(c), "float operands need a float accumulator")
+    else:
+        _check(c.elem == scalar(core.int32), "integer operands need an int32 accumulator")
 
 
 def _reduced(t: Type, axis: int) -> tuple[int, ...]:
@@ -752,6 +773,18 @@ def _v_barrier(op: Op) -> None:
     _arity(op, 0, 0)
 
 
+def _v_hint(op: Op) -> None:
+    _arity(op, 1, 1)
+    t = op.operands[0].type
+    _check(_is_ptr(t) or _is_int(t), "operand must be an integer or a pointer")
+    _check(op.result.type == t, "result type must match the operand")
+    _check(op.attrs.get("kind") in ("multiple_of", "max_contiguous"), "unknown hint `kind`")
+    vals = op.attrs.get("values")
+    _check(isinstance(vals, tuple) and len(vals) == max(1, len(shape_of(t)))
+           and all(isinstance(v, int) and v > 0 for v in vals),
+           "`values` must hold one positive int per dimension")  # fmt: skip
+
+
 VERIFIERS: dict[str, Callable[[Op], None]] = {
     "const": _v_const,
     "splat": _v_splat,
@@ -770,6 +803,8 @@ VERIFIERS: dict[str, Callable[[Op], None]] = {
     "expand_dims": _v_expand_dims,
     "reshape": _v_reshape,
     "trans": _v_trans,
+    "join": _v_join,
+    "split": _v_split,
     "addptr": _v_addptr,
     "load": _v_load,
     "store": _v_store,
@@ -793,6 +828,7 @@ VERIFIERS: dict[str, Callable[[Op], None]] = {
     "local_store": _v_local_store,
     "local_load": _v_local_load,
     "barrier": _v_barrier,
+    "hint": _v_hint,
 }
 """The verifier rule for every op in the IR."""
 

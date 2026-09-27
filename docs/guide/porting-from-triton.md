@@ -61,19 +61,43 @@ The following behavior differs from Triton.
 
 - Enceladus has no `float64`, no FP8 types, and no TF32. `float32` `tl.dot` computes in
   full `float32`. Passing a `float64` array raises an error that suggests `float32`.
-- `tl.dot` takes `float16`, `bfloat16`, or `float32` operands of the same dtype, and
-  accumulates in `float32` or `float16`. Integer `tl.dot` isn't supported. The K block
-  must be a multiple of 8.
+- `tl.dot` takes operands of the same dtype. Float operands (`float16`, `bfloat16`, or
+  `float32`) accumulate in `float32` or `float16`. Integer operands accumulate in
+  `int32`, as in Triton, and the result is exact. `int8` and `uint8` run on the
+  `simdgroup_matrix` units, at about 85% of the `float16` rate on an M4 Pro. 16-bit
+  and 32-bit integers run as scalar multiply-adds, at about a third of the `int8` rate.
+  Unlike Triton, a float `out_dtype` or accumulator with integer operands is an error.
+  The K block must be a multiple of 8.
 - Tile dimensions are limited to 65,536, and a tile must fit in 256 registers per
   thread.
+
+### Indexing
+
+- An array argument can span more than 2^31 elements without casts in the kernel. For
+  such a launch, Enceladus compiles a variant that computes the signed 32-bit math
+  that feeds pointer offsets, and the comparisons that read it, in 64 bits. Triton
+  needs `pid.to(tl.int64) * BLOCK` for the same kernel. 32-bit offsets that a loop
+  carries from one iteration to the next still wrap, and tensor descriptors refuse such
+  arrays.
+- `tl.multiple_of` and `tl.max_contiguous` work as in Triton: the compiler trusts them
+  and emits vector loads and stores. With `ENCELADUS_DEBUG=1`, the interpreter checks
+  them and raises `enceladus.DeviceAssertionError` for a false promise.
 
 ### Atomics
 
 - Memory ordering is relaxed only. `sem` accepts only `None` and `"relaxed"`, and
   `scope` accepts `None`, `"gpu"`, and `"cta"`.
 - `float16` and `bfloat16` `atomic_add` isn't supported. Accumulate in `float32`.
-- Of the 64-bit atomics, only `uint64` `atomic_max` and `atomic_min` are supported,
-  and only when you don't use the returned value.
+- Of the 64-bit atomics, only `uint64` `atomic_max` and `atomic_min` are supported, on
+  Apple9 GPUs (M3 or later), and only when you don't use the returned value. These are
+  the only 64-bit atomics that Metal has, and Metal has no 64-bit compare-and-swap to
+  build others from. Port 64-bit atomics as follows:
+  - Use 32-bit elements where the values fit.
+  - For a 64-bit sum, keep the low and high halves in two `uint32` buffers. Add to the
+    low half, and add the high half plus the carry to the high half. The pair is exact
+    after the kernel ends.
+  - For `int64` `max` or `min`, store each value as `uint64` with its sign bit flipped,
+    which keeps the order, and flip the bit back afterward.
 - 8-bit and 16-bit atomics, `float32` `max` and `min`, and `atomic_cas` run as
   compare-and-swap loops on the surrounding 32-bit word, which is slower than a native
   atomic.
@@ -100,8 +124,9 @@ The compiler refuses the following Triton features with an `enceladus.Compilatio
 - Block pointers: `tl.make_block_ptr`, `tl.advance`, and the `boundary_check` and
   `padding_option` arguments of `tl.load` and `tl.store`. Use tensor descriptors.
 - `while` loops, `break`, and `continue`.
-- `tl.multiple_of` and `tl.max_contiguous` hints, `tl.join`, `tl.split`,
-  `tl.inline_asm_elementwise`, `tl.dot_scaled`, and the `libdevice` functions.
+- `tl.inline_asm_elementwise`, `tl.dot_scaled`, and the `libdevice` functions.
+- `tl.join` and `tl.split` on tiles of pointers. Join or split the integer offsets
+  instead.
 - Other `tl` functions that aren't in the [Language reference](language-reference.md),
   such as `tl.sort`, `tl.flip`, `tl.gather`, `tl.histogram`, and `tl.rand`.
 - The `**` operator on runtime values. Use `tl.exp2` and `tl.log2`, or multiply.

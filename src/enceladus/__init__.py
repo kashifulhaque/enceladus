@@ -20,6 +20,7 @@ from enceladus.runtime.interop import (
     new_empty,
     new_zeros,
 )
+from enceladus.runtime.mlx_lazy import lazy_mlx
 from enceladus.runtime.raw import metal_kernel
 from enceladus.runtime.stream import synchronize
 from enceladus.runtime.tensor import (

@@ -5,6 +5,13 @@ releases the GIL), times each with GPU timestamps, logs probable register-spill
 cliffs, and remembers the winner per key, in memory and on disk under
 `~/.cache/enceladus/autotune/<kernel-hash>/<architecture>.json`.
 
+Timing takes two phases. The first times every configuration with `do_bench`. The
+second times the fastest few again, in interleaved rounds, so that GPU clock changes
+and other GPU work spread across them, and compares the medians of all their samples.
+Among the configurations within `tolerance` of the fastest, the earliest in the
+candidate list wins, so a list that starts with a known-good default keeps it unless
+another configuration is measurably faster.
+
 Set `ENCELADUS_PRINT_AUTOTUNING=1` to print each winner as a pasteable `enceladus.Config(...)`.
 """
 
@@ -18,6 +25,7 @@ import logging
 import os
 import statistics
 import threading
+import time
 import warnings
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -27,11 +35,19 @@ from typing import Any
 import numpy as np
 
 from enceladus.runtime import cache, interop
-from enceladus.runtime.device import get_device
-from enceladus.runtime.tensor import Tensor, from_numpy
+from enceladus.runtime.device import PAGE_SIZE, get_device
+from enceladus.runtime.tensor import Tensor, empty, from_numpy
 
 log = logging.getLogger("enceladus.autotune")
 SPILL_FACTOR = 3.0  # configs slower than this multiple of the median are logged as spills
+# The second timing phase re-times up to FINALISTS configs whose first-phase time is
+# within FINALIST_BAND of the fastest, in FINAL_ROUNDS interleaved rounds.
+FINALISTS = 3
+FINALIST_BAND = 0.15
+FINAL_ROUNDS = 4
+# Part of the results path: a change to how tuning picks a winner re-tunes saved keys.
+# The file format is unchanged.
+TUNING_VERSION = 2
 
 
 @dataclass
@@ -93,13 +109,49 @@ class Config:
         return json.dumps(self.to_json(), sort_keys=True)
 
 
+def _aligned16(a: Any) -> bool:
+    """Returns whether the launch specializes array `a` as 16-byte aligned."""
+    from enceladus.runtime.jit import arg_facts
+
+    return arg_facts(a).get("divisibility") == 16
+
+
 def _bench_view(a: Any) -> Any:
-    """Returns an `enceladus.Tensor` sharing the memory of a NumPy, PyTorch, or MLX array."""
+    """Returns an `enceladus.Tensor` for benchmarking in place of a launch argument.
+
+    The tensor specializes the kernel as `a` does: it has the same element strides, and
+    its data pointer has the same alignment to 16 bytes, so tuning times the code that
+    the real launch runs. It shares `a`'s memory when it can; otherwise it holds a copy.
+    """
     if isinstance(a, np.ndarray):
-        return from_numpy(a)
+        return _bench_numpy(a)
     if interop.framework_of(a) is not None:
-        return interop.as_tensor(a)
+        t = interop.as_tensor(a)
+        if _aligned16(t) != _aligned16(a):
+            t = _bench_numpy(interop.host_view(a))
+        return t
     return a
+
+
+def _bench_numpy(a: np.ndarray) -> Tensor:
+    ptr = a.__array_interface__["data"][0]
+    item = a.itemsize
+    if a.size == 0 or any(s < 0 or s % item for s in a.strides):
+        return from_numpy(a)  # the launch refuses these arrays, or they hold no data
+    if a.flags.c_contiguous and ptr % PAGE_SIZE == 0:
+        return from_numpy(a)  # shares `a`'s memory
+    # A copy that keeps the strides: the kernel indexes it with the strides of `a`.
+    strides = tuple(s // item for s in a.strides)
+    extent = 1 + sum((n - 1) * s for n, s in zip(a.shape, strides, strict=True))
+    # A new buffer starts on a page, so an element offset reproduces the alignment of
+    # `a`. When `a` isn't aligned to its own element size, any nonzero offset gives the
+    # same specialization, which records only whether the pointer is 16-byte aligned.
+    r = ptr % 16
+    offset = r // item if r % item == 0 else 1
+    base = empty((offset + extent,), a.dtype)
+    t = Tensor(base.buffer, a.shape, a.dtype, strides, offset)
+    t._view()[...] = a
+    return t
 
 
 def _innermost(fn: Any):
@@ -200,9 +252,13 @@ class Autotuner:
         restore_value: Iterable[str] | None = None,
         warmup_ms: float = 50,
         rep: int = 20,
+        tolerance: float = 0.01,
     ) -> None:
         if not configs:
             raise ValueError("@enceladus.autotune needs at least one Config")
+        if not 0 <= tolerance < 1:
+            raise ValueError(f"tolerance must be in [0, 1), but got {tolerance}")
+        self.tolerance = tolerance
         self.fn = fn
         self.jit = _innermost(fn)
         self.configs = list(configs)
@@ -228,7 +284,8 @@ class Autotuner:
         arch = get_device().caps.architecture or "unknown"
         # The compiler hash keeps a winner from surviving a compiler change that alters
         # which configs are fast or valid.
-        kernel = cache.stable_hash(self.jit.cache_key, cache.compiler_hash())[:32]
+        kernel = cache.stable_hash(self.jit.cache_key, cache.compiler_hash(),
+                                   TUNING_VERSION)[:32]  # fmt: skip
         return cache.cache_dir() / "autotune" / kernel / f"{arch}.json"
 
     def _load(self) -> None:
@@ -370,6 +427,7 @@ class Autotuner:
     def _tune(self, key: str, args: tuple, kwargs: dict, grid: Any, named: dict) -> Config:
         from enceladus.testing import do_bench
 
+        start = time.perf_counter()
         configs = self._candidates(named)
         # Benchmark on enceladus.Tensor views so launches run on Enceladus's stream, which
         # do_bench times, and don't synchronize.
@@ -401,32 +459,54 @@ class Autotuner:
         named_bench = _named_args(self.jit, bench_args, bench_kwargs)
         saved = {n: named_bench[n].numpy().copy() for n in self.restore_value
                  if isinstance(named_bench.get(n), Tensor)}  # fmt: skip
-        timings: dict[int, float] = {}
-        for i, cfg in enumerate(configs):
-            if i in errors:
-                continue
+        def launch(cfg: Config) -> None:
+            # do_bench waits for each run's command buffer before it calls this again,
+            # so these host writes can't race the previous run. Restoring before every
+            # run keeps in-place kernels from accumulating across repetitions.
+            for n, v in saved.items():
+                named_bench[n]._view()[...] = v
+            for n in self.reset_to_zero:
+                t = named_bench[n]
+                if isinstance(t, Tensor):
+                    t._view()[...] = 0
+            if cfg.pre_hook is not None:
+                cfg.pre_hook(named_bench)
+            self.fn.run(*bench_args, grid=grid, **bench_kwargs, **cfg.kwargs,
+                        **cfg.launch_options())  # fmt: skip
 
-            def launch(cfg=cfg) -> None:
-                # do_bench waits for each run's command buffer before it calls this again,
-                # so these host writes can't race the previous run. Restoring before every
-                # run keeps in-place kernels from accumulating across repetitions.
-                for n, v in saved.items():
-                    named_bench[n]._view()[...] = v
-                for n in self.reset_to_zero:
-                    t = named_bench[n]
-                    if isinstance(t, Tensor):
-                        t._view()[...] = 0
-                if cfg.pre_hook is not None:
-                    cfg.pre_hook(named_bench)
-                self.fn.run(*bench_args, grid=grid, **bench_kwargs, **cfg.kwargs,
-                            **cfg.launch_options())  # fmt: skip
-
+        def bench(i: int, warmup_ms: float, rep: int, mode: str) -> Any:
             get_device().stream.synchronize()
             try:
-                timings[i] = do_bench(launch, self.warmup_ms, self.rep)
+                return do_bench(lambda: launch(configs[i]), warmup_ms, rep, mode)
             except Exception as e:  # noqa: BLE001 - a config that fails to launch is skipped
                 errors[i] = e
-                warnings.warn(f"{self.jit.__name__}: skipping {cfg}: {e}", stacklevel=4)
+                warnings.warn(f"{self.jit.__name__}: skipping {configs[i]}: {e}", stacklevel=5)
+                return None
+
+        # Phase 1: time every config.
+        timings: dict[int, float] = {}
+        for i in range(len(configs)):
+            if i not in errors and (t := bench(i, self.warmup_ms, self.rep, "median")) is not None:
+                timings[i] = t
+        # Phase 2: time the fastest few again, in interleaved rounds. The GPU is warm from
+        # phase 1, and the first run after each switch is dropped, because it pays for
+        # the switch between pipelines.
+        first = sorted(timings, key=timings.get)
+        finalists = [i for i in first[:FINALISTS]
+                     if timings[i] <= timings[first[0]] * (1 + FINALIST_BAND)]  # fmt: skip
+        if len(finalists) > 1:
+            per_round = max(3, self.rep // 4)
+            samples: dict[int, list[float]] = {i: [] for i in finalists}
+            for _ in range(FINAL_ROUNDS):
+                for i in finalists:
+                    if i not in errors and (s := bench(i, 0, per_round + 1, "all")) is not None:
+                        samples[i] += s[1:]
+            for i in finalists:
+                if i in errors:
+                    del timings[i]
+                else:
+                    timings[i] = statistics.median(samples[i])
+            finalists = [i for i in finalists if i not in errors]
         get_device().stream.synchronize()
         for n, v in saved.items():
             named_bench[n]._view()[...] = v
@@ -447,14 +527,22 @@ class Autotuner:
             if timings[i] > SPILL_FACTOR * med:
                 log.debug("%s: %.3f ms against a median of %.3f ms (likely spilling)",
                           configs[i], timings[i], med)  # fmt: skip
-        best_i = min(timings, key=timings.get)
+        # The earliest config within the tolerance of the fastest wins. Only finalists
+        # compete: their phase-2 medians are comparable with each other, and every other
+        # config was slower in phase 1 by more than the finalist band.
+        pool = finalists if len(finalists) > 1 else list(timings)
+        fastest = min(timings[i] for i in pool)
+        best_i = min(i for i in pool if timings[i] <= fastest * (1 + self.tolerance))
         best = configs[best_i]
         self.best[key] = best
         self.timings[key] = {str(configs[i]): t for i, t in timings.items()}
         self._save()
+        elapsed = time.perf_counter() - start
+        log.debug("%s [%s]: tuned %d configs in %.2f s", self.jit.__name__, key, len(configs),
+                  elapsed)  # fmt: skip
         if os.environ.get("ENCELADUS_PRINT_AUTOTUNING", "0") not in ("", "0"):
             print(f"enceladus: autotuning {self.jit.__name__} [{key}] chose {best} "
-                  f"({timings[best_i]:.3f} ms)")  # fmt: skip
+                  f"({timings[best_i]:.3f} ms, tuned in {elapsed:.1f} s)")  # fmt: skip
         return best
 
 
@@ -466,11 +554,16 @@ def autotune(
     restore_value: Iterable[str] | None = None,
     warmup_ms: float = 50,
     rep: int = 20,
+    tolerance: float = 0.01,
 ):
     """Decorates a kernel so that each launch uses the fastest of `configs`.
 
+    Tuning times every configuration, and then times the fastest few again in
+    interleaved rounds to average out GPU clock changes and other GPU work.
+
     Args:
-        configs: The candidate configurations.
+        configs: The candidate configurations. Put a known-good default first: among
+            the configurations within `tolerance` of the fastest, the earliest wins.
         key: Argument names whose values select a tuning result. A new combination
             (together with the argument dtypes) triggers tuning.
         prune_configs_by: Optional `{"early_config_prune": fn(configs, named_args)}`, and
@@ -479,11 +572,14 @@ def autotune(
         restore_value: Arguments restored to their original values before each
             benchmark run and after tuning.
         warmup_ms: GPU warm-up time before measuring each config.
-        rep: Timed repetitions per config.
+        rep: Timed repetitions per config in the first phase. The second phase times
+            `max(3, rep // 4)` repetitions per round, in 4 rounds.
+        tolerance: The fraction of the fastest time within which a configuration
+            counts as equally fast. The default of 0.01 is 1%.
     """
 
     def deco(fn: Any) -> Autotuner:
         return Autotuner(fn, configs, key, prune_configs_by, reset_to_zero, restore_value,
-                         warmup_ms, rep)  # fmt: skip
+                         warmup_ms, rep, tolerance)  # fmt: skip
 
     return deco

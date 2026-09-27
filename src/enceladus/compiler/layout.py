@@ -350,6 +350,78 @@ def reshape(layout: BitLayout, shape: tuple[int, ...]) -> BitLayout:
     )
 
 
+def join(layout: BitLayout) -> BitLayout:
+    """Returns the layout of `tl.join(a, b)` for operands `a` and `b` in `layout`.
+
+    The new trailing dimension of size 2 maps to a new lowest register bit, so each
+    thread holds its elements of `a` in the even registers and the matching elements of
+    `b` in the odd ones. The join moves no data between threads.
+    """
+
+    def ext(b: Basis) -> Basis:
+        return (*b, 0)
+
+    return BitLayout(
+        (*layout.shape, 2),
+        (_unit(layout.rank + 1, layout.rank, 0), *(ext(b) for b in layout.reg)),
+        tuple(ext(b) for b in layout.lane),
+        tuple(ext(b) for b in layout.warp),
+    )
+
+
+def split_source(layout: BitLayout) -> BitLayout:
+    """Returns a layout of the same tile whose trailing size-2 dimension is a register bit.
+
+    `tl.split` separates the two halves of the trailing dimension without moving data
+    only when each thread holds both halves, that is, when a register bit selects the
+    trailing coordinate. If `layout` already has that property, this returns it
+    unchanged. Otherwise the lane or SIMD-group bit that selects the trailing coordinate
+    trades places with the highest register bit, or becomes a broadcast bit when the
+    layout has no register bits, and converting to the result moves data.
+    """
+    last = _unit(layout.rank, layout.rank - 1, 0)
+    if layout.shape[-1] != 2:
+        raise ValueError(f"the last dimension of {layout.shape} isn't 2")
+    if last in layout.reg:
+        return layout
+    lane, warp, reg = list(layout.lane), list(layout.warp), list(layout.reg)
+    bases = lane if last in lane else warp
+    i = bases.index(last)
+    if reg:
+        bases[i] = reg.pop()
+    else:
+        bases[i] = _zero(layout.rank)
+    reg.append(last)
+    return BitLayout(layout.shape, tuple(reg), tuple(lane), tuple(warp))
+
+
+def split(layout: BitLayout) -> tuple[BitLayout, int]:
+    """Returns the layout of both results of `tl.split`, and the register bit it removes.
+
+    `layout` must hold the trailing size-2 dimension in a register bit `k` (see
+    `split_source`). Register `j` of the first result is the source register whose bit
+    `k` is 0 and whose other bits are the bits of `j`; the second result sets bit `k`.
+    """
+    last = _unit(layout.rank, layout.rank - 1, 0)
+    k = layout.reg.index(last)
+
+    def drop(b: Basis) -> Basis:
+        return b[:-1]
+
+    return BitLayout(
+        layout.shape[:-1],
+        tuple(drop(b) for b in layout.reg if b != last),
+        tuple(drop(b) for b in layout.lane),
+        tuple(drop(b) for b in layout.warp),
+    ), k
+
+
+def insert_bit(j: int, k: int, value: int) -> int:
+    """Returns `j` with `value` (0 or 1) inserted as bit `k` and the higher bits shifted up."""
+    low = j & ((1 << k) - 1)
+    return low | (value << k) | ((j >> k) << (k + 1))
+
+
 def simd_acc(bm: int, bn: int, wm: int, wn: int) -> BitLayout:
     """Returns the `simdgroup_matrix` accumulator layout for a BM x BN tile.
 

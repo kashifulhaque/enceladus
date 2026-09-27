@@ -60,6 +60,7 @@ You can also call the following functions as methods of a tile, for example
 - `x.exp2(...)`: `tl.exp2`
 - `x.expand_dims(...)`: `tl.expand_dims`
 - `x.floor(...)`: `tl.floor`
+- `x.join(...)`: `tl.join`
 - `x.log(...)`: `tl.log`
 - `x.log2(...)`: `tl.log2`
 - `x.max(...)`: `tl.max`
@@ -70,6 +71,7 @@ You can also call the following functions as methods of a tile, for example
 - `x.rsqrt(...)`: `tl.rsqrt`
 - `x.sigmoid(...)`: `tl.sigmoid`
 - `x.sin(...)`: `tl.sin`
+- `x.split(...)`: `tl.split`
 - `x.sqrt(...)`: `tl.sqrt`
 - `x.sum(...)`: `tl.sum`
 - `x.tanh(...)`: `tl.tanh`
@@ -369,8 +371,13 @@ This function converts or reinterprets element types.
 Converts `x` to `dtype`, or reinterprets its bits when `bitcast=True`.
 
 The tile method `x.to(dtype)` does the same. Float-to-integer conversion truncates
-toward zero. Conversion to `int1` is `x != 0`. A bitcast needs types of the same
-width. `fp_downcast_rounding` accepts only `None` and `"rtne"`.
+toward zero. For a value out of the integer type's range, both execution modes give
+what Metal gives on Apple GPUs: NaN becomes 0; `int64` wraps the truncated value
+modulo 2**64 and turns infinities into 0; and every other integer type saturates to
+its minimum or maximum. For example, -2.5 converts to 0 as `uint8` and to -2 as
+`int8`, and 300.0 converts to 255 as `uint8`. Conversion to `int1` is `x != 0`. A
+bitcast needs types of the same width. `fp_downcast_rounding` accepts only `None`
+and `"rtne"`.
 
 You can also call it as a tile method: `x.cast(...)`.
 
@@ -420,6 +427,32 @@ You can also call it as a tile method: `x.trans(...)`.
 Permutes the dimensions of `input` into the order `dims`.
 
 You can also call it as a tile method: `x.permute(...)`.
+
+### `tl.join`
+
+**Signature:** `tl.join(a, b)`
+
+Joins `a` and `b` along a new last dimension of size 2.
+
+`a` and `b` broadcast to one shape `S`, and the result has shape `(*S, 2)`: element
+`[..., 0]` comes from `a` and element `[..., 1]` from `b`. The operands must have the
+same dtype, except that a Python number takes the other operand's dtype. Joining
+two scalars gives a tile of shape `(2,)`. To interleave two tiles, reshape the result,
+as in `tl.reshape(tl.join(a, b), (M, 2 * N))`.
+
+You can also call it as a tile method: `x.join(...)`.
+
+### `tl.split`
+
+**Signature:** `tl.split(a)`
+
+Splits `a` along its last dimension, which must be 2, into two tiles.
+
+Returns `(a[..., 0], a[..., 1])`, the inverse of `tl.join`. Splitting a tile of
+shape `(2,)` gives two scalars. To separate the even and odd columns of an `M x 2N`
+tile, reshape it first, as in `tl.split(tl.reshape(x, (M, N, 2)))`.
+
+You can also call it as a tile method: `x.split(...)`.
 
 ## Reductions
 
@@ -526,20 +559,28 @@ This function multiplies two 2D tiles.
 
 ### `tl.dot`
 
-**Signature:** `tl.dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=tl.float32)`
+**Signature:** `tl.dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=None)`
 
 Returns `input @ other + acc` for 2D tiles.
 
-Operands are `float16`, `bfloat16`, or `float32` tiles of the same dtype. The result
-accumulates in `out_dtype` (`float32` by default) or in the dtype of `acc`, which must
-be `float32` or `float16`. `float32` operands compute in full `float32`; Apple GPUs
-have no TF32, so `input_precision`, `allow_tf32`, and `max_num_imprecise_acc` have no
-effect. Integer operands aren't supported.
+Operands are tiles of the same dtype: `float16`, `bfloat16`, `float32`, or an 8-, 16-,
+or 32-bit integer type.
+
+- Float operands accumulate in `out_dtype` (`float32` by default) or in the dtype of
+  `acc`, which must be `float32` or `float16`. `float32` operands compute in full
+  `float32`; Apple GPUs have no TF32, so `input_precision`, `allow_tf32`, and
+  `max_num_imprecise_acc` have no effect.
+- Integer operands accumulate in `int32`, as in Triton, and the result is exact:
+  products and sums wrap modulo 2^32. `int8` and `uint8` operands run on the
+  `simdgroup_matrix` units, at about 85% of the `float16` rate on an M4 Pro.
+  16-bit and 32-bit integer operands run as scalar multiply-adds, at about a third
+  of the `int8` rate.
 
 The K dimension must be a multiple of 8. The launch option `dot_warps=(WM, WN)`
 splits the M x N result over the kernel's SIMD groups, and each SIMD group's strip
 must be a multiple of 8 in both dimensions. The launch option `dot_backend` selects
-the lowering: `simdgroup_matrix` code, or Metal 4 `matmul2d` for eligible loops.
+the lowering: `simdgroup_matrix` code, or Metal 4 `matmul2d` for eligible float
+loops.
 
 ## Atomics
 
@@ -551,7 +592,7 @@ These functions update device memory atomically and return the previous values.
 
 Atomically adds `val` to each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. `float16` and `bfloat16` addition isn't supported; accumulate in a `float32` buffer instead.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. `float16` and `bfloat16` addition isn't supported; accumulate in a `float32` buffer instead.
 
 ### `tl.atomic_max`
 
@@ -559,7 +600,7 @@ Atomically adds `val` to each element that `pointer` points to, where `mask` is 
 
 Atomically stores the maximum of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. For floats, a NaN operand is ignored, as in `tl.maximum`. `uint64` is supported only when you don't use the result.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. For floats, a NaN operand is ignored, as in `tl.maximum`. `uint64` needs an Apple9 GPU (M3 or later), and you can't use its result.
 
 ### `tl.atomic_min`
 
@@ -567,7 +608,7 @@ Atomically stores the maximum of `val` and each element that `pointer` points to
 
 Atomically stores the minimum of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. For floats, a NaN operand is ignored, as in `tl.minimum`. `uint64` is supported only when you don't use the result.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. For floats, a NaN operand is ignored, as in `tl.minimum`. `uint64` needs an Apple9 GPU (M3 or later), and you can't use its result.
 
 ### `tl.atomic_xchg`
 
@@ -575,7 +616,7 @@ Atomically stores the minimum of `val` and each element that `pointer` points to
 
 Atomically stores `val` in each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported.
 
 ### `tl.atomic_and`
 
@@ -583,7 +624,7 @@ Atomically stores `val` in each element that `pointer` points to, where `mask` i
 
 Atomically stores the bitwise AND of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. The elements must be integers.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. The elements must be integers.
 
 ### `tl.atomic_or`
 
@@ -591,7 +632,7 @@ Atomically stores the bitwise AND of `val` and each element that `pointer` point
 
 Atomically stores the bitwise OR of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. The elements must be integers.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. The elements must be integers.
 
 ### `tl.atomic_xor`
 
@@ -599,7 +640,7 @@ Atomically stores the bitwise OR of `val` and each element that `pointer` points
 
 Atomically stores the bitwise XOR of `val` and each element that `pointer` points to, where `mask` is true.
 
-`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. 64-bit elements other than `uint64` `max` and `min` aren't supported. The elements must be integers.
+`pointer` is a pointer or a tile of pointers, and `val` broadcasts to its shape. Returns the values that memory held before the operation, or 0 where `mask` is false. Memory ordering is relaxed: `sem` accepts only `None` and `"relaxed"`, and `scope` accepts `None`, `"gpu"`, and `"cta"`. Metal has no 64-bit atomics other than `uint64` `max` and `min`, so other 64-bit elements aren't supported. The elements must be integers.
 
 ### `tl.atomic_cas`
 
@@ -609,6 +650,43 @@ Atomically stores `val` where memory equals `cmp`, and returns the old values.
 
 The comparison is bitwise, so for floats `-0.0` doesn't match `0.0`, and a NaN matches
 a NaN with the same bits. Memory ordering is relaxed.
+
+## Compiler hints
+
+These functions return their input unchanged and promise facts about its values, which let the compiler emit vector loads and stores.
+
+### `tl.multiple_of`
+
+**Signature:** `tl.multiple_of(input, values)`
+
+Promises the compiler that `input` holds multiples of `values`, and returns `input`.
+
+Along each dimension, the promise covers the first value of every run of consecutive
+values that the compiler proves or that `tl.max_contiguous` promises. With no such
+runs, it covers every value. For example, after
+`offs = tl.multiple_of(start + tl.arange(0, BLOCK), BLOCK)`, the compiler treats
+`start` as a multiple of `BLOCK`. Pointer values count bytes, as in Triton.
+
+Pass an int for a scalar or a 1D tile, and a tuple with one int per dimension
+otherwise. The compiler uses the promise to emit vector loads and stores. A false
+promise gives wrong results. With `ENCELADUS_DEBUG=1`, the interpreter checks the
+promise and raises `enceladus.DeviceAssertionError` when it doesn't hold.
+
+### `tl.max_contiguous`
+
+**Signature:** `tl.max_contiguous(input, values)`
+
+Promises the compiler that `input` holds runs of consecutive values, and returns it.
+
+`tl.max_contiguous(x, c)` promises that along each dimension, every aligned group of
+`c` elements (the elements at indices `k * c` to `k * c + c - 1`) holds consecutive
+values, such as `7, 8, 9, 10`. The compiler uses the largest power of two that divides
+`c`, capped at the dimension's size.
+
+Pass an int for a 1D tile, and a tuple with one int per dimension otherwise. The
+compiler uses the promise to emit vector loads and stores. A false promise gives wrong
+results. With `ENCELADUS_DEBUG=1`, the interpreter checks the promise and raises
+`enceladus.DeviceAssertionError` when it doesn't hold.
 
 ## Loops and compile-time helpers
 

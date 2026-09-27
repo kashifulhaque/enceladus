@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 
 from enceladus import _C
+from enceladus.runtime import mlx_lazy
 from enceladus.runtime.device import PAGE_SIZE, get_device
 from enceladus.runtime.tensor import Tensor, to_np_dtype
 
@@ -136,7 +137,10 @@ def torch_spec_key(t: Any, no_facts: bool) -> tuple[np.dtype, bool]:
     d = _torch_dtypes.get(t.dtype) if t.is_mps else None
     if d is None:
         d = torch_np_dtype(t)  # raises with the reason
-    return (d, True if no_facts else t.storage_offset() * t.element_size() % 16 == 0)
+    if no_facts:
+        return (d, True)
+    off = t.storage_offset()
+    return (d, off == 0 or off * t.element_size() % 16 == 0)
 
 
 def torch_aligned16(t: Any) -> bool:
@@ -171,6 +175,19 @@ def torch_synchronize() -> None:
 
 # ---- MLX ----
 
+
+def mlx_synchronize() -> None:
+    """Waits for the GPU work queued on MLX's default stream, if MLX is imported.
+
+    `mx.eval(a)` waits only for the work that computes `a`. Work queued earlier that
+    reads `a`, for example through `mx.async_eval`, can still be running, and a kernel
+    that writes to `a` on Enceladus's queue would race with it.
+    """
+    mx = sys.modules.get("mlx.core")
+    if mx is not None:
+        mx.synchronize()
+
+
 _MLX_DTYPES = {
     "float32": np.dtype(np.float32), "float16": np.dtype(np.float16),
     "bool": np.dtype(np.bool_), "int8": np.dtype(np.int8), "int16": np.dtype(np.int16),
@@ -180,12 +197,31 @@ _MLX_DTYPES = {
 }  # fmt: skip
 
 
+_mlx_dtypes: dict[Any, np.dtype] = {}  # mx.Dtype -> NumPy dtype, filled on first use
+
+
 def mlx_np_dtype(a: Any) -> np.dtype:
     """Returns the element type of MLX array `a` as a NumPy dtype.
 
     Raises:
         TypeError: The dtype is `float64` or another type that Enceladus doesn't support.
     """
+    d = _mlx_dtypes.get(a.dtype)
+    if d is None:
+        d = _mlx_dtypes[a.dtype] = _mlx_np_dtype(a)
+    return d
+
+
+def mlx_spec_key(a: Any, no_facts: bool) -> tuple[np.dtype, bool]:
+    """Returns the (dtype, 16-byte aligned) specialization key of MLX array `a`.
+
+    Raises:
+        TypeError: `a` can't be a kernel argument; see `mlx_np_dtype`.
+    """
+    return (mlx_np_dtype(a), True if no_facts else mlx_aligned16(a))
+
+
+def _mlx_np_dtype(a: Any) -> np.dtype:
     name = str(a.dtype).rsplit(".", 1)[-1]
     d = _MLX_DTYPES.get(name)
     if d is not None:
@@ -232,7 +268,13 @@ def _mlx_view(a: Any) -> _MlxView:
 
 
 def mlx_aligned16(a: Any) -> bool:
-    """Returns whether the first element of MLX array `a` is 16-byte aligned."""
+    """Returns whether the first element of MLX array `a` is known to be 16-byte aligned.
+
+    With `lazy_mlx(True)`, only fresh outputs count as aligned, because the offset of
+    any other array is known only after evaluating it, which would wait for its work.
+    """
+    if mlx_lazy.enabled():
+        return mlx_lazy.is_fresh(a)
     return _mlx_view(a).byte_offset % 16 == 0
 
 
@@ -292,6 +334,8 @@ def element_strides(obj: Any) -> tuple[int, ...]:
     if fw == KIND_TORCH:
         return tuple(obj.stride())
     if fw == KIND_MLX:
+        if mlx_lazy.is_fresh(obj):  # contiguous, and evaluating it would wait
+            return _contiguous(tuple(obj.shape))
         return _mlx_view(obj).strides
     raise TypeError(
         f"{type(obj).__name__} isn't a supported array type. Pass an enceladus.Tensor, a "
@@ -353,7 +397,8 @@ def new_empty(like: Any, shape: Any = None, dtype: Any = None) -> Any:
     array, so a host wrapper can allocate its outputs without knowing the framework.
     NumPy, `enceladus.Tensor`, and PyTorch results are uninitialized. MLX results are
     zero-filled and evaluated, because Enceladus writes to MLX arrays in place and
-    each output needs a buffer of its own.
+    each output needs a buffer of its own. With `enceladus.lazy_mlx(True)`, MLX results
+    are lazy fresh outputs instead, which a lazy launch can write.
 
     Args:
         like: The array whose kind, device, and (by default) shape and dtype to use.
@@ -389,6 +434,8 @@ def _new_array(like: Any, shape: Any, dtype: Any, zero: bool) -> Any:
     if fw == KIND_MLX:
         import mlx.core as mx
 
+        if mlx_lazy.enabled():
+            return mlx_lazy.new_output(shape, dtype)
         out = mx.zeros(shape, dtype=dtype)
         mx.eval(out)
         return out
@@ -414,6 +461,8 @@ def as_tensor(obj: Any) -> Tensor:
         ba = _from_torch(obj)
     elif fw == KIND_MLX:
         ba = _from_mlx(obj)
+        mlx_synchronize()  # the tensor can write to the array's memory
+        mlx_lazy.consume(obj)
     else:
         raise TypeError(f"expected a torch MPS tensor or an MLX array, not {type(obj).__name__}")
     if ba.byte_offset % ba.dtype.itemsize:

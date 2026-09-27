@@ -23,7 +23,7 @@ import { HOME, NOT_FOUND, PAGES, SECTIONS } from "./pages.js";
 const SITE = "Enceladus";
 const REPO = "https://github.com/kashifulhaque/enceladus";
 const ROOT = resolve(import.meta.dirname, "..");
-export const RESULTS_FILE = "benchmarks/results/2026-09-26-applegpu_g16s-m9.md";
+export const RESULTS_FILE = "benchmarks/results/2026-09-27-applegpu_g16s-2.md";
 const FONTS =
   "https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,650;12..96,800" +
   "&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap";

@@ -45,7 +45,9 @@ export const REFERENCE = [
     ["expand_dims(input, axis)", "Inserts size-1 dimensions at axis, an int or a tuple of ints."],
     ["reshape(input, *shape, can_reorder=False)", "Reshapes in row-major order. Every dimension must be a power of two."],
     ["trans(input, *dims)", "Permutes dimensions, or reverses them when no dims are given. Same as x.T."],
-    ["permute(input, *dims)", "Permutes dimensions into the order dims."]]],
+    ["permute(input, *dims)", "Permutes dimensions into the order dims."],
+    ["join(a, b)", "Stacks a and b along a new last dimension of size 2. Same as a.join(b)."],
+    ["split(a)", "Splits a along its last dimension, which must be 2, into (a[..., 0], a[..., 1]). Same as a.split()."]]],
   ["tl", "Reductions", "", [
     ["sum(input, axis=None, keep_dims=False, dtype=None)", "Sums along axis, or over all elements. 16-bit floats accumulate in float32."],
     ["max(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False)", "Returns the maximum, and optionally the int32 index of the first maximum. NaNs are ignored."],
@@ -67,6 +69,9 @@ export const REFERENCE = [
     ["atomic_or(pointer, val, mask=None, sem=None, scope=None)", "Applies a bitwise OR atomically. Integers only."],
     ["atomic_xor(pointer, val, mask=None, sem=None, scope=None)", "Applies a bitwise XOR atomically. Integers only."],
     ["atomic_cas(pointer, cmp, val, sem=None, scope=None)", "Stores val where memory equals cmp bitwise, and returns the old values. Takes no mask."]]],
+  ["tl", "Compiler hints", "Each returns its input unchanged. A false promise gives wrong results; ENCELADUS_DEBUG=1 checks it in the interpreter.", [
+    ["multiple_of(input, values)", "Promises that input holds multiples of values, or runs of consecutive values that start at one. Pointers count bytes."],
+    ["max_contiguous(input, values)", "Promises that every aligned group of values elements holds consecutive values."]]],
   ["tl", "Loops and compile time", "", [
     ["range(start, end=None, step=None, num_stages=None, ...)", "A runtime for-loop range. Triton pipelining hints are accepted and ignored."],
     ["static_range(start, end=None, step=None)", "A loop range that the compiler unrolls. The bounds must be compile-time values."],
