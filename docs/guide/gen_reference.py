@@ -55,6 +55,10 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
      "These functions update device memory atomically and return the previous values.",
      ["atomic_add", "atomic_max", "atomic_min", "atomic_xchg", "atomic_and", "atomic_or",
       "atomic_xor", "atomic_cas"]),
+    ("Compiler hints",
+     "These functions return their input unchanged and promise facts about its values, "
+     "which let the compiler emit vector loads and stores.",
+     ["multiple_of", "max_contiguous"]),
     ("Loops and compile-time helpers",
      "These functions control loops and run checks while the kernel compiles.",
      ["range", "static_range", "static_assert", "static_print"]),

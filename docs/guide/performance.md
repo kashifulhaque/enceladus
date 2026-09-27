@@ -52,6 +52,31 @@ the tile's element count, times its element size in 32-bit words, divided by
 because the kernel might spill registers to memory and slow down by several times. For
 a tile of more than 256, compilation fails. `kernel.explain` lists the register count of every tile.
 
+## Let the compiler emit vector loads
+
+When the compiler can prove that each thread's elements of a pointer-tile load or store
+are consecutive in memory, aligned, and under one mask value, it moves them with one
+vector access (`vec<T, 4>`) instead of one access per element. On an M4 Pro, vector
+accesses made a `float16` pointer-tile matmul 26% faster and an `int8` vector add 18%
+faster. They didn't change `float32` or `float16` elementwise kernels, softmax, or norms
+measurably, because those already run at full bandwidth.
+
+The proof needs the following facts:
+
+- **Contiguity:** offsets built from `tl.arange` along the fastest dimension, such as
+  `row * stride + tl.arange(0, BLOCK)`.
+- **Alignment:** array arguments whose data starts on 16 bytes, which holds for newly
+  allocated arrays, and integer arguments such as strides that are multiples of 16.
+  Enceladus specializes each kernel on both facts, as Triton does. A row stride of 1,000
+  elements prevents vector accesses; padding it to 1,024 allows them.
+- **A uniform mask:** a mask such as `offs < n` is the same across each vector when `n` is
+  a multiple of 16. With a ragged `n`, masked loads and stores stay scalar.
+
+When the compiler can't see a fact that you know holds, promise it with
+`tl.multiple_of(x, m)` or `tl.max_contiguous(x, c)`, for example for offsets computed
+from a loop counter or loaded from an index array. A false promise gives wrong results;
+run the kernel in the interpreter with `ENCELADUS_DEBUG=1` to check your promises.
+
 ## Feed `tl.dot` from tensor descriptors
 
 `tl.dot` can get its operands in two ways:

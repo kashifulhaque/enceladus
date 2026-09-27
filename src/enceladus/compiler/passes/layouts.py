@@ -29,7 +29,9 @@ from enceladus.compiler.passes.axis_info import AxisAnalysis, contiguous_order
 
 CHEAP_SOURCES = frozenset(["const", "splat", "arange", "full"])
 ELEMENTWISE = frozenset(["binary", "cmp", "unary", "fma", "select", "cast", "bitcast", "addptr"])
-VIEWS = frozenset(["expand_dims", "broadcast", "reshape", "trans"])
+# `hint` (`tl.multiple_of` and `tl.max_contiguous`) is an identity that only carries
+# facts for `axis_info`, so it's a view whose layout is its input's.
+VIEWS = frozenset(["expand_dims", "broadcast", "reshape", "trans", "hint"])
 
 CHEAP, VIEW, ANCHORED = "cheap", "view", "anchored"
 
@@ -83,6 +85,8 @@ class LayoutPlan:
 def view_layout(op: ir.Op, src: L.BitLayout) -> L.BitLayout:
     """Returns the layout of a shape op's result given its input layout."""
     t = op.result.type
+    if op.name == "hint":
+        return src
     if op.name == "expand_dims":
         return L.expand(src, op.attrs["axis"])
     if op.name == "reshape":
@@ -101,6 +105,8 @@ def view_layout(op: ir.Op, src: L.BitLayout) -> L.BitLayout:
 def view_source_layout(op: ir.Op, dst: L.BitLayout) -> L.BitLayout:
     """Returns the input layout that makes a shape op produce `dst` without moving data."""
     src_t = op.operands[0].type
+    if op.name == "hint":
+        return dst
     if op.name == "expand_dims":
         ax = op.attrs["axis"]
         return L.BitLayout(

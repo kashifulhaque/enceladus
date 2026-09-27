@@ -10,6 +10,8 @@ import statistics
 import time
 from pathlib import Path
 
+import numpy as np
+
 import enceladus
 from enceladus.compiler.frontend import build_ir
 from enceladus.compiler.pipeline import compile_module
@@ -60,11 +62,15 @@ def compile_time_ms(kernel, args, consts, reps: int = 50) -> float:
 
 def main() -> None:
     ex = load("01_vector_add")
-    n = 1 << 26  # 256 MB per float32 array
     print(f"Device: {enceladus.get_device().caps.name}")
     print(f"{'kernel':<34}{'min ms':>9}{'GB/s':>9}{'MLX GB/s':>10}")
-    for dtype, np_name in (("float32", "float32"), ("float16", "float16")):
-        x, y = enceladus.randn(n, dtype=np_name), enceladus.randn(n, dtype=np_name)
+    # 256 MB per float32 and int8 array. int8 shows the effect of vector loads most.
+    for dtype, n in (("float32", 1 << 26), ("float16", 1 << 26), ("int8", 1 << 28)):
+        if dtype == "int8":
+            x = enceladus.from_numpy(np.ones(n, np.int8))
+            y = enceladus.from_numpy(np.ones(n, np.int8))
+        else:
+            x, y = enceladus.randn(n, dtype=dtype), enceladus.randn(n, dtype=dtype)
         out = enceladus.empty_like(x)
         nbytes = 3 * n * x.itemsize
         for block in (1024, 4096):
