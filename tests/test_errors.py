@@ -168,6 +168,33 @@ def _callable_instance_attribute(x_ptr):
     tl.store(x_ptr, _cfg.scale(1.0))  # error
 
 
+class _Settings:
+    def __init__(self):
+        self.scale = 2.0
+
+
+_SETTINGS = _Settings()
+
+
+def _read_settings():  # a Python helper that reads an attribute of an object instance
+    return _SETTINGS.scale
+
+
+class _UsesSettings:
+    def scale(self):
+        return _read_settings()
+
+
+@enceladus.jit
+def _helper_reads_instance_attribute(x_ptr):
+    tl.store(x_ptr, _read_settings())  # error
+
+
+@enceladus.jit
+def _method_reads_instance_attribute(x_ptr):
+    tl.store(x_ptr, _UsesSettings().scale())  # error
+
+
 def _tg_overflow_launch():
     x = np.zeros((128, 128), np.float32)
     _tg_overflow.warmup(x, x, x, M=128, N=128)
@@ -214,6 +241,10 @@ KERNEL_CASES = [
      "Use a plain function"),
     (_callable_instance_attribute, lambda: _callable_instance_attribute[(1,)](X),
      ("compiled",), "Use a plain function"),
+    (_helper_reads_instance_attribute, lambda: _helper_reads_instance_attribute[(1,)](X),
+     ("compiled",), "`_read_settings` reads `_SETTINGS.scale`, which reaches a _Settings"),
+    (_method_reads_instance_attribute, lambda: _method_reads_instance_attribute[(1,)](X),
+     ("compiled",), "`_read_settings` reads `_SETTINGS.scale`"),
 ]
 
 

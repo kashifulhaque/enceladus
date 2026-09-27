@@ -376,7 +376,23 @@ _consts.BIAS = 1.0
 
 
 def _py_factor():  # a plain Python helper that the kernel calls at compile time
-    return FACTOR * 2.0
+    return FACTOR * float(np.exp2(1.0))  # a NumPy ufunc is keyed by the NumPy version
+
+
+CLASS_GLOBAL = 2.0
+BASE_GLOBAL = 0.25
+
+
+class _CfgBase:
+    def bias(self):
+        return BASE_GLOBAL  # a global read by an inherited method
+
+
+class _Cfg(_CfgBase):
+    K = 3.0
+
+    def factor(self):
+        return self.K * CLASS_GLOBAL  # a class attribute and a global read by a method
 
 
 @enceladus.jit
@@ -397,6 +413,8 @@ def _scale_by_globals(x_ptr, out_ptr):
     offs = tl.arange(0, 16)
     x = tl.load(x_ptr + offs)
     y = _consts.add_offset(x * SCALE) + TUP[1] * _py_factor() + _consts.BIAS
+    cfg = _Cfg()  # an instance that the kernel builds at compile time
+    y = y + cfg.factor() + cfg.bias()
     tl.store(out_ptr + offs, y)
     tl.store(out_ptr + 16 + offs, 1.0 / ((x + 1.0) * ZERO))
 
@@ -404,6 +422,7 @@ def _scale_by_globals(x_ptr, out_ptr):
 def _scale_by_globals_reference(x):
     offset = OFFSET if _consts.add_offset is _add_offset else -OFFSET
     y = x * SCALE + offset + TUP[1] * FACTOR * 2.0 + _consts.BIAS
+    y = y + _Cfg.K * CLASS_GLOBAL + BASE_GLOBAL
     with np.errstate(divide="ignore"):
         return np.concatenate([y, np.float32(1.0) / ((x + 1) * np.float32(ZERO))])
 
@@ -426,9 +445,12 @@ def _start_new_process(kernel):
         (None, "ZERO", -0.0),  # equal to 0.0, but 1 / -0.0 is -inf
         (_consts, "BIAS", 5.0),
         (_consts, "add_offset", _sub_offset),
+        (None, "CLASS_GLOBAL", 5.0),  # read by a method of a class that the kernel uses
+        (None, "BASE_GLOBAL", 5.0),  # read by a method of a base class
+        (_Cfg, "K", 5.0),  # a class attribute, read through `self`
     ],
     ids=["global", "helper_global", "tuple", "python_helper", "signed_zero", "module_attr",
-         "module_jit_helper"],
+         "module_jit_helper", "method_global", "base_method_global", "class_attr"],
 )  # fmt: skip
 def test_changed_dependency_recompiles(monkeypatch, tmp_path, owner, name, value, new_process):
     monkeypatch.setenv("ENCELADUS_CACHE_DIR", str(tmp_path))

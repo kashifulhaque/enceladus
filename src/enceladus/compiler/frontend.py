@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import inspect
 import operator
 import textwrap
@@ -221,6 +222,9 @@ class CodeGenerator(ast.NodeVisitor):
         self.scoped_out: dict[str, str] = {}
         self.truth_context = False
         self.debug = False  # keep tl.device_assert checks (ENCELADUS_DEBUG)
+        # Python callables that `_check_helper` accepted, by id, holding a reference so
+        # that the ids stay unique.
+        self._tracked_helpers: dict[int, Any] = {}
 
     # ---- infrastructure ----
 
@@ -731,7 +735,7 @@ class CodeGenerator(ast.NodeVisitor):
                 f"methods of {type(obj).__name__} aren't supported in kernels. Use a "
                 "compile-time tuple instead."
             )
-        from enceladus.runtime.jit import is_content_hashed
+        from enceladus.runtime.jit import is_content_hashed, is_library_callable
 
         owner_tracked = isinstance(obj, (types.ModuleType, type))
         if not owner_tracked and self._global_rooted(node.value) and not is_content_hashed(obj):
@@ -753,7 +757,7 @@ class CodeGenerator(ast.NodeVisitor):
             raise CompilationError(
                 f"{semantic.describe(obj)} has no attribute `{attr}`{hint}"
             ) from None
-        if owner_tracked:
+        if owner_tracked and not is_library_callable(obj, v):
             _check_tracked(v, f"`{ast.unparse(node)}`")
         return v
 
@@ -849,8 +853,39 @@ class CodeGenerator(ast.NodeVisitor):
             raise CompilationError(
                 f"{semantic.describe(func)} isn't a function, so you can't call it"
             )
+        self._check_helper(func, name)
         return core.unwrap(func(*[core.unwrap(a) for a in args],
                                 **{k: core.unwrap(v) for k, v in kwargs.items()}))  # fmt: skip
+
+    def _check_helper(self, func: Any, name: str) -> None:
+        """Refuses a call to Python code that reads a value the kernel cache can't track.
+
+        The frontend doesn't see inside a plain Python helper, a class, or a method that
+        runs at compile time, so the dependency hash follows them instead. If one of them
+        reaches a value that the hash can't track, such as an attribute of an object
+        instance, a change to that value wouldn't recompile the kernel.
+
+        Raises:
+            CompilationError: `func` reaches a value that the dependency hash can't track.
+        """
+        target = func.__func__ if isinstance(func, types.MethodType) else func
+        wrapped = getattr(target, "__wrapped__", None)
+        if not isinstance(target, (types.FunctionType, functools.partial, type)) and \
+                not isinstance(wrapped, types.FunctionType):  # fmt: skip
+            return
+        if id(target) in self._tracked_helpers:
+            return
+        from enceladus.runtime.jit import untracked_reason
+
+        reason = untracked_reason(func)
+        if reason is not None:
+            raise CompilationError(
+                f"the call to `{name}` runs Python code at compile time, and {reason}. The "
+                "kernel cache can't detect a change to that object. In helpers, read only "
+                "modules, classes, functions, and constant values such as tuples, or pass "
+                "the value as a tl.constexpr argument."
+            )
+        self._tracked_helpers[id(target)] = target
 
     def binop(self, op: ast.operator, x: Any, y: Any) -> Any:
         x, y = core.unwrap(x), core.unwrap(y)
