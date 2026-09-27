@@ -136,7 +136,10 @@ def torch_spec_key(t: Any, no_facts: bool) -> tuple[np.dtype, bool]:
     d = _torch_dtypes.get(t.dtype) if t.is_mps else None
     if d is None:
         d = torch_np_dtype(t)  # raises with the reason
-    return (d, True if no_facts else t.storage_offset() * t.element_size() % 16 == 0)
+    if no_facts:
+        return (d, True)
+    off = t.storage_offset()
+    return (d, off == 0 or off * t.element_size() % 16 == 0)
 
 
 def torch_aligned16(t: Any) -> bool:

@@ -384,7 +384,9 @@ class JITFunction:
         """
         interpret = self.interpret
         if interpret is None:
-            interpret = _env_flag("ENCELADUS_INTERPRET")
+            # Like `_env_flag`, but through the bound C method: `os.environ.get` costs
+            # about 0.3 µs, a tenth of a launch.
+            interpret = core.env_lookup(b"ENCELADUS_INTERPRET", b"0") not in (b"", b"0")
         if not interpret:
             self._run_compiled(args, kwargs, grid, num_warps, dot_warps, dot_backend)
             return
