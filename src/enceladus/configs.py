@@ -29,10 +29,14 @@ _HALF_ONLY = [
     (128, 64, 32, 8, (4, 2)),  # 32x32
 ]
 # (BM, BN, BK, num_warps) for the Metal 4 `matmul2d` backend, measured on M4 Pro. 64x64
-# is the fastest at 4096^3 in FP16 and BF16 (3-6% over `simdgroup`); the smaller tiles
-# run ragged and small shapes, such as 513^3, about 2x faster than `simdgroup` in every
-# dtype. FP32 `matmul2d` measured 20-30% slower than `simdgroup` at 4096^3, and tuning
-# rejects it there. `dot_warps` applies if a kernel falls back to `simdgroup`.
+# is the fastest at 4096^3 in FP16 and BF16 (4-6% over `simdgroup`); 64x32 and 32x32 run
+# ragged and small shapes, such as 2000^3 and 513^3, up to 2.4x faster than `simdgroup`
+# in every dtype. 32x64, 128x64, 64x128, 128x128, and 64x64 over 2 or 8 SIMD groups
+# measured no faster than these three at 4096^3, 2000^3, and 1024x4096x1024. FP32
+# `matmul2d` at 4096^3 is up to 4% faster than `simdgroup` in its best runs, but its
+# speed swings by 20% or more between runs while `simdgroup` holds steady, in Apple's own
+# kernel too, so tuning picks either backend there. `dot_warps` applies if a kernel falls
+# back to `simdgroup`.
 _MPP = [
     (64, 64, 32, 4),
     (64, 32, 32, 4),
