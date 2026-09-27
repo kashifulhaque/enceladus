@@ -12,10 +12,11 @@ from enceladus.compiler.passes.simplify import simplify
 def compile_module(module: ir.Module, max_threadgroup_memory: int = 32768) -> GeneratedKernel:
     """Lowers a verified module to MSL.
 
-    The passes are: `simplify` (constant folding, algebraic identities, CSE, and DCE),
-    `axis_info` and `assign_layouts`, then MSL codegen, which also lowers layout
-    conversions and reductions, allocates threadgroup memory, and places barriers. The
-    module is modified in place.
+    The passes are: `simplify` (constant folding, algebraic identities, loop-invariant
+    hoisting, CSE, and DCE), `axis_info` and `assign_layouts`, then MSL codegen, which
+    also lowers layout conversions and reductions, allocates threadgroup memory, places
+    barriers, and versions `tl.dot` loops (`edge_versioning`). The module is modified in
+    place.
 
     Raises:
         CompilationError: The kernel uses something the MSL backend can't lower.

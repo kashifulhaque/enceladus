@@ -249,6 +249,14 @@ class _Codegen:
             from enceladus.compiler.codegen.mpp import plan_mpp
 
             self.mpp = plan_mpp(module)
+        from enceladus.compiler.passes.edge_versioning import plan_edge_versioning
+
+        self.versioning = plan_edge_versioning(
+            module, self.direct, self.mpp.handled if self.mpp is not None else frozenset()
+        )
+        # How each covered `dot` loads direct operands in the loop version being emitted:
+        # "fast" (unmasked) or "checked". A `dot` missing here branches on its own bounds.
+        self.dot_modes: dict[int, str] = {}
 
     # ---- helpers ----
 
@@ -1039,18 +1047,81 @@ class _Codegen:
         for arg, c in zip(body.args[1:], carried, strict=True):
             self._bind(arg, c)
         iv = body.args[0]
-        ivn = self.fresh(iv.name_hint or "i")
-        self.sv[id(iv)] = ivn
-        header, iv_def = self.for_header(op, ivn)
-        with self.e.block(header):
-            if iv_def:
-                self.e.line(iv_def)
-            self.push_scope()
-            self.block(_body_ops(body))
-            self._yield_into(carried, body.ops[-1].operands)
-            self.pop_scope()
+        plan = self.versioning.get(id(op))
+        if plan is not None:
+            self._versioned_for(op, plan, carried)
+        else:
+            ivn = self.fresh(iv.name_hint or "i")
+            self.sv[id(iv)] = ivn
+            header, iv_def = self.for_header(op, ivn)
+            with self.e.block(header):
+                if iv_def:
+                    self.e.line(iv_def)
+                self._loop_body(body, carried)
         for r, c in zip(op.results, carried, strict=True):
             self._bind(r, c)
+
+    def _loop_body(self, body: ir.Block, carried: list[Tile | str]) -> None:
+        self.push_scope()
+        self.block(_body_ops(body))
+        self._yield_into(carried, body.ops[-1].operands)
+        self.pop_scope()
+
+    def _versioned_for(self, op: ir.Op, plan, carried: list[Tile | str]) -> None:
+        """Emits a `tl.dot` loop as interior and edge versions (see `passes.edge_versioning`)."""
+        body = op.regions[0].block
+        iv = body.args[0]
+        lb, ub = self.s(op.operands[0]), self.s(op.operands[1])
+        step = op.operands[2].defining_op.attrs["value"]
+        conds: list[str] = []
+        ends: list[str] = []
+        wide = False
+        for b in plan.bounds:
+            desc = self.descs[id(b.desc)]
+            shape = desc.shape[b.dim]
+            ext = desc.block[b.dim]
+            wide |= b.desc.defining_op.operands[1 + b.dim].type != ir.i32
+            off = self.s(b.offset) if b.offset is not None else None
+            if b.offset is not None:
+                wide |= b.offset.type != ir.i32
+            if not b.uses_counter:
+                conds.append(f"{off} >= 0 && {off} + {ext} <= {shape}")
+                continue
+            if off is not None or not lb.lstrip("-").isdigit() or int(lb) < 0:
+                conds.append(f"{lb if off is None else f'{lb} + {off}'} >= 0")
+            # Iteration i reads [i + off, i + off + ext), in bounds while i < shape - off - ext + 1.
+            end = shape if off is None else f"{shape} - {off}"
+            ends.append(f"{end} - {ext - 1}" if ext > 1 else end)
+        ity = "long" if wide else "int"
+        k_end = f"{ity}({ub})"
+        for e in sorted(set(ends)):
+            k_end = f"min({k_end}, {ity}({e}))"
+        interior = self.fresh("interior")
+        k_name = self.fresh("k_end")
+        self.e.line(f"const bool {interior} = {' && '.join(sorted(set(conds))) or 'true'};")
+        self.e.line(f"const {ity} {k_name} = {k_end};")
+        saved = dict(self.dot_modes)
+
+        def version(mode: str, header: str, ivn: str) -> None:
+            self.dot_modes = {**saved, **dict.fromkeys(plan.dots, mode)}
+            self.sv[id(iv)] = ivn
+            with self.e.block(header):
+                self._loop_body(body, carried)
+
+        with self.e.block(f"if ({interior})"):
+            ivn = self.fresh(iv.name_hint or "i")
+            self.e.line(f"int {ivn} = {lb};")
+            version("fast", f"for (; {ivn} < {k_name}; {ivn} += {step})", ivn)
+            # The later versions repeat the body's conversions and threadgroup requests;
+            # report each only once.
+            first = {k: len(v) for k, v in self.report.items()}
+            version("checked", f"for (; {ivn} < {ub}; {ivn} += {step})", ivn)
+        with self.e.block("else"):
+            ivn = self.fresh(iv.name_hint or "i")
+            version("checked", f"for (int {ivn} = {lb}; {ivn} < {ub}; {ivn} += {step})", ivn)
+        for k, n in first.items():
+            del self.report[k][n:]
+        self.dot_modes = saved
 
     def op_if(self, op: ir.Op) -> None:
         cond = self.s(op.operands[0])
