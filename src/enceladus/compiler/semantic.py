@@ -152,6 +152,28 @@ def computation_dtype(op: str, a: core.dtype | Literal, b: core.dtype | Literal)
     return t
 
 
+def join_dtype(a: core.dtype | Literal, b: core.dtype | Literal) -> core.dtype:
+    """Returns the element dtype of `tl.join(a, b)`.
+
+    A Python literal adopts the other operand's dtype, as in `tl.where`. Two runtime
+    operands must already share a dtype, as in Triton.
+
+    Raises:
+        CompilationError: The operands have different dtypes, or a literal doesn't fit the
+            other operand's dtype.
+    """
+    dt = computation_dtype("select", a, b)
+    for x in (a, b):
+        if isinstance(x, core.dtype) and x is not dt:
+            other = b if x is a else a
+            what = f"the literal {other!r}" if is_literal(other) else f"{other}"
+            raise CompilationError(
+                f"tl.join needs two operands of one dtype, but got {x} and {what}. Convert "
+                "one operand with `.to(dtype)` first."
+            )
+    return dt
+
+
 def broadcast_shapes(a: Sequence[int], b: Sequence[int]) -> tuple[int, ...]:
     """Returns the broadcast of two shapes, aligning trailing dimensions like NumPy."""
     a, b = tuple(a), tuple(b)

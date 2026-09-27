@@ -52,6 +52,13 @@ def _fp16_atomic_add(p, BLOCK: tl.constexpr):
 
 
 @enceladus.jit
+def _join_mixed_dtypes(x_ptr, BLOCK: tl.constexpr):
+    x = tl.load(x_ptr + tl.arange(0, BLOCK))
+    j = tl.join(x, x.to(tl.float16))  # error
+    tl.store(x_ptr + tl.arange(0, BLOCK), tl.sum(j, axis=1))
+
+
+@enceladus.jit
 def _pow_on_tile(x_ptr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + tl.arange(0, BLOCK))
     tl.store(x_ptr + tl.arange(0, BLOCK), x**2)  # error
@@ -223,6 +230,8 @@ KERNEL_CASES = [
      ("interpret", "compiled"), "Accumulate in a float32 buffer"),
     (_pow_on_tile, lambda: _pow_on_tile[(1,)](X, BLOCK=16), ("interpret", "compiled"),
      "Multiply explicitly"),
+    (_join_mixed_dtypes, lambda: _join_mixed_dtypes[(1,)](X, BLOCK=16), ("interpret", "compiled"),
+     "Convert one operand with `.to(dtype)`"),
     (_print_runtime, lambda: _print_runtime[(1,)](X, BLOCK=16), ("compiled",),
      "Use tl.device_print"),
     (_small_dot_k, lambda: _small_dot_k[(1,)](np.zeros((16, 16), np.float32), M=16, K=4),

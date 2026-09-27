@@ -45,7 +45,9 @@ export const REFERENCE = [
     ["expand_dims(input, axis)", "Inserts size-1 dimensions at axis, an int or a tuple of ints."],
     ["reshape(input, *shape, can_reorder=False)", "Reshapes in row-major order. Every dimension must be a power of two."],
     ["trans(input, *dims)", "Permutes dimensions, or reverses them when no dims are given. Same as x.T."],
-    ["permute(input, *dims)", "Permutes dimensions into the order dims."]]],
+    ["permute(input, *dims)", "Permutes dimensions into the order dims."],
+    ["join(a, b)", "Stacks a and b along a new last dimension of size 2. Same as a.join(b)."],
+    ["split(a)", "Splits a along its last dimension, which must be 2, into (a[..., 0], a[..., 1]). Same as a.split()."]]],
   ["tl", "Reductions", "", [
     ["sum(input, axis=None, keep_dims=False, dtype=None)", "Sums along axis, or over all elements. 16-bit floats accumulate in float32."],
     ["max(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False)", "Returns the maximum, and optionally the int32 index of the first maximum. NaNs are ignored."],

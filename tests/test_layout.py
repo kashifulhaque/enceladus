@@ -114,3 +114,25 @@ def test_invalid_layouts_are_rejected():
         L.blocked((100,), 4, 4)
     with pytest.raises(ValueError, match="more than once"):
         L.BitLayout((4,), ((1,), (1,)), ((0,),) * 5, ())
+
+
+@pytest.mark.parametrize("lay", [
+    L.blocked((16, 64), 4, 4), L.simd_acc(64, 32, 4, 1), L.blocked((32,), 4, 4),
+    L.permute(L.blocked((2, 64), 4, 4), (1, 0)), L.blocked((16, 2), 4, 4),
+])  # fmt: skip
+def test_join_and_split_keep_each_element_in_its_thread(lay):
+    if lay.shape[-1] != 2:
+        j = L.join(lay)
+        cj, c = L.materialize(j), L.materialize(lay)
+        for r in range(j.num_regs):
+            np.testing.assert_array_equal(cj[:, :, r, :-1], c[:, :, r >> 1])
+            assert (cj[:, :, r, -1] == r & 1).all()
+        assert L.split_source(j) == j
+        lay = j
+    src = L.split_source(lay)
+    res, k = L.split(src)
+    cs, cr = L.materialize(src), L.materialize(res)
+    for r in range(res.num_regs):
+        for i in (0, 1):
+            np.testing.assert_array_equal(cs[:, :, L.insert_bit(r, k, i), :-1], cr[:, :, r])
+            assert (cs[:, :, L.insert_bit(r, k, i), -1] == i).all()

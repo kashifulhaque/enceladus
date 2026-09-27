@@ -45,7 +45,7 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
       "floor", "ceil"]),
     ("Type conversion", "This function converts or reinterprets element types.", ["cast"]),
     ("Shape manipulation", "These functions change the shape of a tile without computing.",
-     ["broadcast_to", "expand_dims", "reshape", "trans", "permute"]),
+     ["broadcast_to", "expand_dims", "reshape", "trans", "permute", "join", "split"]),
     ("Reductions", "These functions reduce a tile along an axis.",
      ["sum", "max", "min", "argmax", "argmin", "reduce"]),
     ("Scans", "These functions compute inclusive prefix scans along an axis.",

@@ -21,6 +21,8 @@ Operands come from one of three sources:
 Direct loads take an unmasked fast path when the whole block is in bounds, chosen by a
 threadgroup-uniform branch per `dot`. Otherwise each fragment tests its own bounds
 (uniform across the SIMD group) and only straddling fragments use masked per-lane loads.
+In a loop that `passes.edge_versioning` covers, the loop version decides instead, and
+each `dot` emits only the path that its version needs.
 """
 
 from __future__ import annotations
@@ -292,8 +294,11 @@ def emit_dot(cg: _Codegen, op: ir.Op, lay: L.BitLayout) -> Tile:
             mma_step(checked, None)
 
     conds = [x for x in (_in_bounds(da, bm, bk), _in_bounds(db, bk, bn)) if x]
-    if not conds:
+    mode = cg.dot_modes.get(id(op))  # set by an edge-versioned loop
+    if not conds or mode == "fast":
         mma_loop(False)
+    elif mode == "checked":
+        mma_loop(True)
     else:
         with cg.e.block(f"if ({' && '.join(conds)})"):
             mma_loop(False)

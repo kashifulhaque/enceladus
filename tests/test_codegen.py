@@ -226,6 +226,75 @@ def test_descriptor_accesses_outside_the_tensor_are_masked(rng_np, kind, offsets
 
 
 @enceladus.jit
+def _versioned_dot(a_ptr, b_ptr, out_ptr, M, N, K, lo, hi, koff, STEP: tl.constexpr,
+                   TRANS_B: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                   BK: tl.constexpr):  # fmt: skip
+    pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+    da = tl.make_tensor_descriptor(a_ptr, [M, K], [K, 1], [BM, BK])
+    do = tl.make_tensor_descriptor(out_ptr, [M, N], [N, 1], [BM, BN])
+    acc = tl.zeros((BM, BN), tl.float32)
+    if TRANS_B:
+        db = tl.make_tensor_descriptor(b_ptr, [N, K], [K, 1], [BN, BK])
+        for k in range(lo, hi, STEP):
+            acc = tl.dot(da.load([pid_m * BM, k + koff]), tl.trans(db.load([pid_n * BN, k])), acc)
+    else:
+        db = tl.make_tensor_descriptor(b_ptr, [K, N], [N, 1], [BK, BN])
+        for k in range(lo, hi, STEP):
+            acc = tl.dot(da.load([pid_m * BM, koff + k]), db.load([k, pid_n * BN]), acc)
+    do.store([pid_m * BM, pid_n * BN], acc)
+
+
+def _tile(x, o0, o1, r, c):
+    """Returns the r x c block of `x` at (o0, o1), zero outside `x`."""
+    out = np.zeros((r, c), x.dtype)
+    rows, cols = np.arange(o0, o0 + r), np.arange(o1, o1 + c)
+    rm, cm = (rows >= 0) & (rows < x.shape[0]), (cols >= 0) & (cols < x.shape[1])
+    out[np.ix_(rm, cm)] = x[np.ix_(rows[rm], cols[cm])]
+    return out
+
+
+# (M, N, K, lo, hi, koff, STEP, TRANS_B): aligned; ragged M, N, and K; a shifted K offset
+# that makes the last block ragged; negative offsets in early iterations; a step smaller
+# than the block; and K smaller than one block.
+VERSIONED_CASES = [
+    (64, 64, 64, 0, 64, 0, 16, False), (40, 48, 47, 0, 47, 0, 16, True),
+    (64, 32, 64, 0, 64, 1, 16, False), (32, 64, 40, -16, 40, 3, 16, True),
+    (32, 32, 48, 0, 48, 0, 8, True), (40, 32, 5, 0, 5, 0, 16, False),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("case", VERSIONED_CASES, ids=str)
+def test_edge_versioned_dot_loops(rng_np, case):
+    m, n, k, lo, hi, koff, step, trans_b = case
+    bm, bn, bk = 32, 32, 16
+    a = rng_np.integers(-3, 4, (m, k)).astype(np.float32)
+    b = rng_np.integers(-3, 4, (n, k) if trans_b else (k, n)).astype(np.float32)
+    grid = (-(-n // bn), -(-m // bm))
+
+    def run(a, b):
+        out = np.zeros((m, n), np.float32)
+        _versioned_dot[grid](a, b, out, m, n, k, lo, hi, koff, STEP=step, TRANS_B=trans_b,
+                             BM=bm, BN=bn, BK=bk)  # fmt: skip
+        return out
+
+    def reference(a, b):
+        out = np.zeros((grid[1] * bm, grid[0] * bn), np.float32)
+        bt = b.T if trans_b else b
+        for pm in range(grid[1]):
+            for pn in range(grid[0]):
+                for kk in range(lo, hi, step):
+                    out[pm * bm:(pm + 1) * bm, pn * bn:(pn + 1) * bn] += \
+                        _tile(a, pm * bm, kk + koff, bm, bk) @ _tile(bt, kk, pn * bn, bk, bn)
+        return out[:m, :n]
+
+    check_kernel(run, (a, b), reference, atol=0, rtol=0)
+    # The loop runs as an unmasked main loop, a checked K tail, and a checked edge version.
+    ck = _versioned_dot.warmup(a, b, np.zeros((m, n), np.float32), m, n, k, lo, hi, koff,
+                               STEP=step, TRANS_B=trans_b, BM=bm, BN=bn, BK=bk)  # fmt: skip
+    assert ck.msl.count("simdgroup_multiply_accumulate") == 3
+
+
+@enceladus.jit
 def _dot_after_write(a_ptr, b_ptr, out_ptr, iters, N: tl.constexpr, CASE: tl.constexpr):
     da = tl.make_tensor_descriptor(a_ptr, [N, N], [N, 1], [N, N])
     db = tl.make_tensor_descriptor(b_ptr, [N, N], [N, 1], [N, N])
