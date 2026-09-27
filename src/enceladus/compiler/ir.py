@@ -661,8 +661,12 @@ def _v_dot(op: Op) -> None:
     _check(all(isinstance(t, TileType) and len(t.shape) == 2 for t in (a, b, c)), "needs 2D tiles")
     _check(a.shape[1] == b.shape[0], f"inner dimensions differ: {a.shape} and {b.shape}")
     _check(c.shape == (a.shape[0], b.shape[1]), f"accumulator must be {a.shape[0]}x{b.shape[1]}")
-    _check(a.elem == b.elem and _is_float(a), "operands must share a floating-point type")
-    _check(_is_float(c) and op.result.type == c, "result must match the float accumulator")
+    _check(a.elem == b.elem, "operands must share an element type")
+    _check(op.result.type == c, "result must match the accumulator")
+    if _is_float(a):
+        _check(_is_float(c), "float operands need a float accumulator")
+    else:
+        _check(c.elem == scalar(core.int32), "integer operands need an int32 accumulator")
 
 
 def _reduced(t: Type, axis: int) -> tuple[int, ...]:

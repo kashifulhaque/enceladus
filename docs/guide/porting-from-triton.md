@@ -61,9 +61,13 @@ The following behavior differs from Triton.
 
 - Enceladus has no `float64`, no FP8 types, and no TF32. `float32` `tl.dot` computes in
   full `float32`. Passing a `float64` array raises an error that suggests `float32`.
-- `tl.dot` takes `float16`, `bfloat16`, or `float32` operands of the same dtype, and
-  accumulates in `float32` or `float16`. Integer `tl.dot` isn't supported. The K block
-  must be a multiple of 8.
+- `tl.dot` takes operands of the same dtype. Float operands (`float16`, `bfloat16`, or
+  `float32`) accumulate in `float32` or `float16`. Integer operands accumulate in
+  `int32`, as in Triton, and the result is exact. `int8` and `uint8` run on the
+  `simdgroup_matrix` units, at about 85% of the `float16` rate on an M4 Pro. 16-bit
+  and 32-bit integers run as scalar multiply-adds, at about a third of the `int8` rate.
+  Unlike Triton, a float `out_dtype` or accumulator with integer operands is an error.
+  The K block must be a multiple of 8.
 - Tile dimensions are limited to 65,536, and a tile must fit in 256 registers per
   thread.
 

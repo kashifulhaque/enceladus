@@ -526,20 +526,28 @@ This function multiplies two 2D tiles.
 
 ### `tl.dot`
 
-**Signature:** `tl.dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=tl.float32)`
+**Signature:** `tl.dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=None)`
 
 Returns `input @ other + acc` for 2D tiles.
 
-Operands are `float16`, `bfloat16`, or `float32` tiles of the same dtype. The result
-accumulates in `out_dtype` (`float32` by default) or in the dtype of `acc`, which must
-be `float32` or `float16`. `float32` operands compute in full `float32`; Apple GPUs
-have no TF32, so `input_precision`, `allow_tf32`, and `max_num_imprecise_acc` have no
-effect. Integer operands aren't supported.
+Operands are tiles of the same dtype: `float16`, `bfloat16`, `float32`, or an 8-, 16-,
+or 32-bit integer type.
+
+- Float operands accumulate in `out_dtype` (`float32` by default) or in the dtype of
+  `acc`, which must be `float32` or `float16`. `float32` operands compute in full
+  `float32`; Apple GPUs have no TF32, so `input_precision`, `allow_tf32`, and
+  `max_num_imprecise_acc` have no effect.
+- Integer operands accumulate in `int32`, as in Triton, and the result is exact:
+  products and sums wrap modulo 2^32. `int8` and `uint8` operands run on the
+  `simdgroup_matrix` units, at about 85% of the `float16` rate on an M4 Pro.
+  16-bit and 32-bit integer operands run as scalar multiply-adds, at about a third
+  of the `int8` rate.
 
 The K dimension must be a multiple of 8. The launch option `dot_warps=(WM, WN)`
 splits the M x N result over the kernel's SIMD groups, and each SIMD group's strip
 must be a multiple of 8 in both dimensions. The launch option `dot_backend` selects
-the lowering: `simdgroup_matrix` code, or Metal 4 `matmul2d` for eligible loops.
+the lowering: `simdgroup_matrix` code, or Metal 4 `matmul2d` for eligible float
+loops.
 
 ## Atomics
 

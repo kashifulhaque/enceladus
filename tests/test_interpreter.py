@@ -709,6 +709,76 @@ def test_descriptor_matmul(mode, rng, dtype, mkn, trans_b):
                  modes=(mode,), atol=1e-4 if dtype is F32 else None)  # fmt: skip
 
 
+@enceladus.jit
+def _int_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr,
+                       BK: tl.constexpr, VARIANT: tl.constexpr):  # fmt: skip
+    pid_n, pid_m = tl.program_id(0), tl.program_id(1)
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.int32)
+    if VARIANT == "desc":
+        a = tl.make_tensor_descriptor(a_ptr, [M, K], [K, 1], [BM, BK])
+        b = tl.make_tensor_descriptor(b_ptr, [K, N], [N, 1], [BK, BN])
+        for k in range(0, K, BK):
+            acc = tl.dot(a.load([pid_m * BM, k]), b.load([k, pid_n * BN]), acc)
+    else:
+        # "hoist" loads A (K <= BK) once, so the dot reads it from registers.
+        a = tl.load(a_ptr + rm[:, None] * K + rk[None, :],
+                    mask=(rm[:, None] < M) & (rk[None, :] < K), other=0)  # fmt: skip
+        for k in range(0, K, BK):
+            if VARIANT == "pointer":
+                a = tl.load(a_ptr + rm[:, None] * K + (k + rk)[None, :],
+                            mask=(rm[:, None] < M) & ((k + rk)[None, :] < K), other=0)  # fmt: skip
+            b = tl.load(b_ptr + (k + rk)[:, None] * N + rn[None, :],
+                        mask=((k + rk)[:, None] < K) & (rn[None, :] < N), other=0)  # fmt: skip
+            acc = tl.dot(a, b, acc)
+    tl.store(c_ptr + rm[:, None] * N + rn[None, :], acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+def _int_matmul(a, b, variant="desc", bm=32, bn=32, bk=32, num_warps=4):
+    (m, k), n = a.shape, b.shape[1]
+    c = np.zeros((m, n), np.int32)
+    grid = (enceladus.cdiv(n, bn), enceladus.cdiv(m, bm))
+    _int_matmul_kernel[grid](a, b, c, m, n, k, BM=bm, BN=bn, BK=bk, VARIANT=variant,
+                             num_warps=num_warps)  # fmt: skip
+    return c
+
+
+def _int_matmul_ref(a, b, **_):
+    return (a.astype(np.int64) @ b.astype(np.int64)).astype(np.int32)  # wraps like int32
+
+
+@pytest.mark.parametrize("variant", ["desc", "pointer", "hoist"])
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8, np.int16, np.int32])
+@pytest.mark.parametrize("mkn", [(64, 64, 64), (50, 100, 33)])
+def test_integer_dot(mode, rng, dtype, mkn, variant):
+    # Full-range values: 16-bit and 32-bit products and sums wrap modulo 2^32.
+    m, k, n = mkn
+    info = np.iinfo(dtype)
+    a = rng.integers(info.min, info.max, (m, k), dtype, endpoint=True)
+    b = rng.integers(info.min, info.max, (k, n), dtype, endpoint=True)
+    blocks = {"bm": 16, "bk": enceladus.next_power_of_2(k)} if variant == "hoist" else {}
+    check_kernel(_int_matmul, (a, b), _int_matmul_ref, kwargs={"variant": variant, **blocks},
+                 modes=(mode,))  # fmt: skip
+
+
+@pytest.mark.parametrize("dtype, k, bk, variant", [
+    (np.int8, 2048, 32, "desc"),
+    # One block of K = 512 needs two float32 partial sums of 256 steps each.
+    (np.uint8, 512, 512, "desc"),
+    (np.uint8, 512, 512, "hoist"),
+])  # fmt: skip
+def test_integer_dot_is_exact_past_float32_precision(mode, dtype, k, bk, variant):
+    # Every sum exceeds 2^24 and is odd, so float32 accumulation would round it.
+    extreme = np.iinfo(dtype).min if dtype == np.int8 else np.iinfo(dtype).max
+    a = np.full((8, k), extreme, dtype)
+    b = np.full((k, 8), extreme, dtype)
+    a[:, 0] = 1
+    check_kernel(_int_matmul, (a, b), _int_matmul_ref, modes=(mode,),
+                 kwargs={"variant": variant, "bm": 8, "bn": 8, "bk": bk, "num_warps": 1})
+
+
 # Argument names that generated code also uses: the register loop index `r`, the MMA
 # loop's `i`, `j`, `kk`, `fa`, and `fb`, the exchange buffer `buf`, the argmax tie flag
 # `tk`, and the kernel parameters `lane`, `warp`, and `pid`. The rest mean something to

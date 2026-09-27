@@ -1063,7 +1063,25 @@ def reduce(ctx, input, axis, combine_fn, keep_dims=False):
 # Matmul
 # ---------------------------------------------------------------------------
 
-_DOT_DTYPES = (core.float16, core.bfloat16, core.float32)
+_DOT_FLOAT = (core.float16, core.bfloat16, core.float32)
+_DOT_INT = (core.int8, core.uint8, core.int16, core.uint16, core.int32, core.uint32)
+
+
+def _dot_out_dtype(a_dt: core.dtype, out_dtype: Any) -> core.dtype:
+    """Returns the accumulator dtype of a `tl.dot` without an accumulator.
+
+    Float operands accumulate in `out_dtype`, `float32` by default. Integer operands
+    accumulate in `int32`, as in Triton, so `out_dtype` must be `None` or `int32`.
+    """
+    if not a_dt.is_int():
+        return core.float32 if out_dtype is None else _dtype(out_dtype, "out_dtype")
+    out_dt = core.int32 if out_dtype is None else _dtype(out_dtype, "out_dtype")
+    if out_dt is not core.int32:
+        raise CompilationError(
+            f"tl.dot accumulates {a_dt} operands in int32, not {out_dt}. Omit `out_dtype`, "
+            "or pass `out_dtype=tl.int32`, and convert the result afterward."
+        )
+    return out_dt
 
 
 def _dot_check(a_shape, b_shape, a_dt, b_dt, out_dt, input_precision):
@@ -1077,19 +1095,27 @@ def _dot_check(a_shape, b_shape, a_dt, b_dt, out_dt, input_precision):
             f"tl.dot inner dimensions differ: {a_shape} @ {b_shape}. The first operand's "
             "columns must match the second operand's rows."
         )
-    if a_dt not in _DOT_DTYPES or b_dt not in _DOT_DTYPES:
+    supported = (*_DOT_FLOAT, *_DOT_INT)
+    if a_dt not in supported or b_dt not in supported:
         raise CompilationError(
-            f"tl.dot supports float16, bfloat16, and float32 operands, but got {a_dt} and "
-            f"{b_dt}. Convert the operands with `.to(tl.float16)` or `.to(tl.float32)`."
+            f"tl.dot supports float16, bfloat16, float32, and 8-, 16-, and 32-bit integer "
+            f"operands, but got {a_dt} and {b_dt}. Convert the operands with "
+            "`.to(tl.float32)` or `.to(tl.int32)`."
         )
     if a_dt is not b_dt:
         raise CompilationError(
             f"tl.dot needs operands of the same dtype, but got {a_dt} and {b_dt}. Convert one "
             "with `.to(...)`."
         )
-    if out_dt not in (core.float32, core.float16):
+    if a_dt.is_int():
+        if out_dt is not core.int32:
+            raise CompilationError(
+                f"tl.dot accumulates {a_dt} operands in int32, not {out_dt}. Create the "
+                "accumulator with `tl.zeros(..., dtype=tl.int32)`, or omit it."
+            )
+    elif out_dt not in (core.float32, core.float16):
         raise CompilationError(
-            f"tl.dot accumulates in float32 or float16, not {out_dt}. Pass "
+            f"tl.dot accumulates float operands in float32 or float16, not {out_dt}. Pass "
             "`out_dtype=tl.float32`, or an accumulator of one of those types."
         )
     if input_precision not in (None, "ieee", "tf32", "tf32x3"):
@@ -1099,41 +1125,53 @@ def _dot_check(a_shape, b_shape, a_dt, b_dt, out_dt, input_precision):
 
 
 def _i_dot(input, other, acc=None, input_precision=None, allow_tf32=None,
-           max_num_imprecise_acc=None, out_dtype=core.float32):  # fmt: skip
+           max_num_imprecise_acc=None, out_dtype=None):  # fmt: skip
     a, bt = _itile(input), _itile(other)
-    out_dt = _dtype(out_dtype, "out_dtype") if acc is None else _itile(acc).dtype
+    out_dt = _dot_out_dtype(a.dtype, out_dtype) if acc is None else _itile(acc).dtype
     _dot_check(a.shape, bt.shape, a.dtype, bt.dtype, out_dt, input_precision)
     m, n = a.shape[0], bt.shape[1]
-    c = np.zeros((m, n), np.float32) if acc is None else I.as_compute(acc, out_dt)
-    if c.shape != (m, n):
+    if acc is not None and _itile(acc).shape != (m, n):
         raise CompilationError(
-            f"the tl.dot accumulator must be {m}x{n}, but got {c.shape}. Create it with "
-            f"`tl.zeros(({m}, {n}), dtype=tl.float32)`."
+            f"the tl.dot accumulator must be {m}x{n}, but got {_itile(acc).shape}. Create it "
+            f"with `tl.zeros(({m}, {n}), dtype={out_dt!r})`."
         )
+    if out_dt.is_int():
+        # Exact products and sums, wrapped to int32 as the GPU wraps them.
+        c = np.zeros((m, n), np.int64) if acc is None else _itile(acc).data.astype(np.int64)
+        r = a.data.astype(np.int64) @ bt.data.astype(np.int64) + c
+        return I.wrap(r, out_dt)
+    c = np.zeros((m, n), np.float32) if acc is None else I.as_compute(acc, out_dt)
     r = a.data.astype(np.float32) @ bt.data.astype(np.float32) + c
     return I.wrap(r, out_dt)
 
 
 @builtin(interp=_i_dot)
 def dot(ctx, input, other, acc=None, input_precision=None, allow_tf32=None,
-        max_num_imprecise_acc=None, out_dtype=core.float32):  # fmt: skip
+        max_num_imprecise_acc=None, out_dtype=None):  # fmt: skip
     """Returns `input @ other + acc` for 2D tiles.
 
-    Operands are `float16`, `bfloat16`, or `float32` tiles of the same dtype. The result
-    accumulates in `out_dtype` (`float32` by default) or in the dtype of `acc`, which must
-    be `float32` or `float16`. `float32` operands compute in full `float32`; Apple GPUs
-    have no TF32, so `input_precision`, `allow_tf32`, and `max_num_imprecise_acc` have no
-    effect. Integer operands aren't supported.
+    Operands are tiles of the same dtype: `float16`, `bfloat16`, `float32`, or an 8-, 16-,
+    or 32-bit integer type.
+
+    - Float operands accumulate in `out_dtype` (`float32` by default) or in the dtype of
+      `acc`, which must be `float32` or `float16`. `float32` operands compute in full
+      `float32`; Apple GPUs have no TF32, so `input_precision`, `allow_tf32`, and
+      `max_num_imprecise_acc` have no effect.
+    - Integer operands accumulate in `int32`, as in Triton, and the result is exact:
+      products and sums wrap modulo 2^32. `int8` and `uint8` operands run on the
+      `simdgroup_matrix` units, at about 85% of the `float16` rate on an M4 Pro.
+      16-bit and 32-bit integer operands run as scalar multiply-adds, at about a third
+      of the `int8` rate.
 
     The K dimension must be a multiple of 8. The launch option `dot_warps=(WM, WN)`
     splits the M x N result over the kernel's SIMD groups, and each SIMD group's strip
     must be a multiple of 8 in both dimensions. The launch option `dot_backend` selects
-    the lowering: `simdgroup_matrix` code, or Metal 4 `matmul2d` for eligible loops.
+    the lowering: `simdgroup_matrix` code, or Metal 4 `matmul2d` for eligible float
+    loops.
     """
     b = ctx.b
     av, bv = _value(ctx, input), _value(ctx, other)
     acc = core.unwrap(acc)
-    out_dt = _dtype(out_dtype, "out_dtype")
     if acc is not None:
         if not isinstance(acc, ir.Value):
             raise CompilationError(
@@ -1141,15 +1179,19 @@ def dot(ctx, input, other, acc=None, input_precision=None, allow_tf32=None,
                 "with tl.zeros."
             )
         out_dt = semantic.dtype_of(acc)
+    else:
+        out_dt = _dot_out_dtype(semantic.dtype_of(av), core.unwrap(out_dtype))
     _dot_check(ir.shape_of(av.type), ir.shape_of(bv.type), semantic.dtype_of(av),
                semantic.dtype_of(bv), out_dt, input_precision)  # fmt: skip
     m, n = av.type.shape[0], bv.type.shape[1]
     if acc is None:
-        acc = b.create("full", [], [ir.TileType((m, n), ir.scalar(out_dt))], {"value": 0.0}).result
+        zero = 0 if out_dt.is_int() else 0.0
+        tt = ir.TileType((m, n), ir.scalar(out_dt))
+        acc = b.create("full", [], [tt], {"value": zero}).result
     elif ir.shape_of(acc.type) != (m, n):
         raise CompilationError(
             f"the tl.dot accumulator must be {m}x{n}, but got {describe(acc)}. Create it with "
-            f"`tl.zeros(({m}, {n}), dtype=tl.float32)`."
+            f"`tl.zeros(({m}, {n}), dtype={out_dt!r})`."
         )
     return b.create("dot", [av, bv, acc], [acc.type]).result
 
