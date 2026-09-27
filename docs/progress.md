@@ -1568,3 +1568,133 @@ without it, except where the known gaps say otherwise.
   helper.
 - Converting an out-of-range runtime float to an integer type differs between modes:
   the GPU saturates and the interpreter wraps. Both are undefined in C.
+
+## Join, split, constant folding, and edge versioning
+
+This pass adds three planned features that the bug-fix pass listed as gaps: `tl.join`
+and `tl.split` (M1, P1), constant folding and algebraic identities in `simplify` (M2),
+and edge versioning of `tl.dot` loops (M4).
+
+### What was built
+
+- **`tl.join(a, b)` and `tl.split(a)`**, with Triton's semantics, also as tile methods.
+  `join` stacks two tiles along a new last dimension of size 2, and `split` separates a
+  last dimension of size 2. Operands broadcast to one shape, and a Python number takes
+  the other operand's dtype. Joining two scalars gives a `(2,)` tile, and splitting a
+  `(2,)` tile gives two scalars.
+  - IR: new `join` and `split` ops, with verifier rules.
+  - Layouts: `layout.join` maps the new dimension to a new lowest register bit, so a
+    join never moves data. A split is free when a register bit selects the last
+    coordinate, as it does after a join, a contiguous load, or a reshape of a `dot`
+    accumulator (the element bit of a fragment). Otherwise `layout.split_source`
+    trades the lane or SIMD-group bit that selects it for a register bit, and codegen
+    converts through threadgroup memory.
+  - Codegen lowers `join` in any result layout. When a lane bit selects the operand,
+    each thread picks it by its coordinate. Both ops over cheap values are rebuilt in
+    each consumer's layout.
+- **Constant folding** (`passes/simplify.py`, `fold`), which runs before CSE and DCE:
+  - Arithmetic, comparisons, and casts on constants (`const`, `full`, and shape ops or
+    `splat` over them) become constants. The results come from the interpreter's own
+    functions, so compiled and interpreted runs agree bit for bit.
+  - Undefined operations stay unfolded: integer division or remainder by zero,
+    `INT_MIN / -1`, shifts out of range, negation and `abs` of the most negative
+    integer, and float-to-integer conversions of NaN, infinity, or out-of-range values.
+    16-bit float constants that `float32` can't hold exactly stay unfolded, because the
+    GPU rounds their literals twice.
+  - Identities that hold for every value: `x + 0`, `x * 1`, `x * 0`, `x - x`, and the
+    bitwise ones for integers; `x * 1.0`, `x / 1.0`, `x + (-0.0)`, and `x - 0.0` for
+    floats; `tl.where` on a constant condition or equal values; double negation; and
+    lossless round-trip casts such as `float16` to `float32` and back.
+  - An `if` on a condition that folds to a constant keeps only the taken branch.
+- **Loop-invariant hoisting** (`simplify.hoist`): pure scalar ops and `make_desc` whose
+  operands are all defined outside a `for` loop move before it, innermost loops first.
+- **Edge versioning** (`passes/edge_versioning.py` and `_versioned_for` in
+  `codegen/msl.py`). A loop qualifies when its dots read direct operands from
+  descriptors defined before the loop, at offsets that are loop-invariant or the loop
+  counter plus an invariant, and the loop counts up by a constant step with a 32-bit
+  counter. Codegen emits an unmasked main loop over the K blocks that fit, a checked
+  loop for the ragged K tail, and a checked loop for programs whose M or N block
+  crosses an edge. The tail is empty when K is a multiple of the block size.
+
+### Benchmarks
+
+Other agents used the GPU throughout, so absolute numbers ran 5-60% below the idle
+numbers of M4, and whole rounds sometimes ran at half speed. Each comparison ran the
+64 x 64 x 32, 4-SIMD-group descriptor matmul compiled twice in one process, without
+(A) and with (B) edge versioning and hoisting, timed in alternating rounds of 10 GPU-timed
+runs. The table shows B/A for the median time over all rounds, and for the best single
+run, from the three quietest of six runs (20-40 rounds each):
+
+| Shape | FP32 median | FP32 best | FP16 median | FP16 best |
+|---|---|---|---|---|
+| 4096³ | 1.06 | 1.00 | 1.00 | 1.00 |
+| 2000³ | 1.00-1.03 | 1.00-1.01 | 1.01 | 1.00-1.01 |
+| 1000³ | 1.01-1.05 | 1.00-1.05 | 1.04-1.05 | 1.04-1.06 |
+| 513³ | 0.99-1.01 | 1.01 | 1.01 | 1.01-1.02 |
+| 1000 x 777 x 300 | 0.89 (a slow round) | 1.02 | 1.01 | 0.98 |
+
+- Edge versioning is neutral within noise at 4096³, 2000³, and 513³. At 1000³, FP16
+  ran 2-6% faster in all six runs, and FP32 1-5% faster in the quieter runs. The best
+  single runs at 4096³ reached 5.34 TFLOPS in FP32 and 5.05 in FP16 with versioning.
+- The flash attention kernels never qualify, because they stage K and V through
+  threadgroup memory, so `bench_attention.py` needs no A/B: its generated MSL is
+  byte-identical with and without versioning and hoisting, for all seven shapes in
+  `attention_configs` at head dimensions 64 and 128, causal and not.
+- Constant folding doesn't change the MSL of the attention kernels. Hoisting moves the
+  program-offset math of both matmul examples out of the K loop.
+- `tl.join` and `tl.split` have no benchmark. In the tests, joins after loads, dots,
+  and reductions use no threadgroup memory; only a split whose last dimension sits on
+  a lane bit does.
+
+### Tests
+
+- `uv run pytest -q`: 954 passed, 20 skipped, and 1 deselected in about 9 s. With
+  `ENCELADUS_DEBUG=1`: the same counts. `uv run ruff check src tests examples
+  benchmarks`: clean. Every example runs compiled and interpreted.
+- `tests/test_join_split.py`: a differential test over eight producers (interleave and
+  deinterleave of loads, a transposed load whose split crosses lanes, a tile with
+  fewer elements than threads, reductions, a loop, aranges, and scalars) in `float32`,
+  `float16`, and `int32`, and join and split of `dot` results in three dtypes and two
+  SIMD-group counts.
+- `tests/test_layout.py`: `layout.join`, `layout.split_source`, and `layout.split` keep
+  every element in its thread.
+- `tests/test_simplify.py`: compiled against interpreted results on NaN, infinity,
+  `-0.0`, `INT_MIN`, and overflowing values; constant expressions and branches fold
+  away; identities keep narrow and unsigned dtypes; and invariant scalars leave nested
+  loops while loop-dependent ones stay.
+- `tests/test_codegen.py`: versioned dot loops at aligned and ragged shapes, a K
+  offset whose last block overhangs by one element, negative offsets in early
+  iterations, a step smaller than the block, and K smaller than one block. The
+  overhang case fails when `k_end` is off by one.
+- `tests/test_errors.py`: `tl.join` on mixed dtypes, in both modes.
+
+### Deviations from the plan
+
+- Edge versioning runs in codegen, from a plan that `passes/edge_versioning.py`
+  computes, rather than as an IR rewrite, because the loop versions differ only in how
+  each `dot` loads fragments. The checked versions test each fragment's bounds, as the
+  per-dot branch did.
+- The K tail is a loop over the remaining iterations rather than one peeled
+  iteration, so steps smaller than the block and invariant K offsets need no special
+  case. The specialization fact `K % 16 == 0` isn't used; the tail loop runs no
+  iterations when K is a multiple of the block.
+- The `desc_store` epilogue keeps its per-element masks; M4 measured `vec<T, 2>` stores
+  within noise.
+- `tl.join` and `tl.split` refuse tiles of pointers.
+- Constant folding follows the interpreter where the GPU is less precise: a folded
+  float division or `fmod` is correctly rounded, while the GPU's fast versions may
+  differ in the last place.
+
+### Known gaps
+
+- In the default relaxed math mode, Metal assumes that no zero is signed, so a runtime
+  `x + 0.0` returns `-0.0` for `x = -0.0`, where the interpreter returns `0.0`. This
+  predates this pass; folding doesn't change it.
+- Edge versioning needs a constant positive step, a 32-bit counter, descriptors defined
+  before the loop, and offsets of the form `k + invariant`. Other dot loops keep the
+  per-dot branch. It skips loops that contain `tl.device_print` or `tl.device_assert`,
+  so their output doesn't repeat.
+- Folding doesn't evaluate math functions other than `floor` and `ceil`, `fma`, or
+  bitcasts, and doesn't fold `tl.minimum` and `tl.maximum` of two zeros.
+- `multiple_of`, `max_contiguous`, vector loads, 64-bit offsets, integer `tl.dot`, and
+  most 64-bit atomics remain open, as the bug-fix pass lists.
