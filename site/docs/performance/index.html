@@ -17,7 +17,7 @@
   </ul>
 
   <h2>Feed <code>tl.dot</code> from descriptors</h2>
-  <p>When a <code>tl.dot</code> operand is a descriptor load that nothing else uses, <code>tl.dot</code> reads fragments straight from device memory, with no threadgroup memory and no barriers. This path ran 7-15% faster than staging. Epilogues on the accumulator cost little: a fused bias and GELU runs within about 2-3% of a plain matmul.</p>
+  <p>When a <code>tl.dot</code> operand is a descriptor load that nothing else uses, <code>tl.dot</code> reads fragments straight from device memory, with no threadgroup memory and no barriers. This path ran 7-15% faster than staging. Epilogues on the accumulator cost little: a fused bias and GELU runs within about 1% of a plain matmul.</p>
 
   <h2>Choose a <code>tl.dot</code> backend</h2>
   <p>Set <code>dot_backend</code> as a launch option, a <code>Config</code> field, or an argument to <code>warmup</code> and <code>explain</code>:</p>

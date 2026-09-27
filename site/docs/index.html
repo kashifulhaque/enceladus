@@ -31,7 +31,7 @@
   <ul class="tight">
     <li>All published performance numbers come from one M4 Pro. Wheels target macOS 15 but have been tested only on later releases.</li>
     <li>The interpreter runs some kernels that the compiler refuses, such as a <code>tl.dot</code> whose K isn't a multiple of 8. It warns about them unless <code>ENCELADUS_VERIFY=0</code>, and raises the compiler's error when <code>ENCELADUS_VERIFY=1</code>.</li>
-    <li>MLX launches are always synchronous, at about 130 µs each.</li>
+    <li>MLX launches synchronize, at about 125 µs each, unless you turn on lazy launches with <code>enceladus.lazy_mlx(True)</code>. A lazy launch applies only when every array the kernel writes is a fresh output.</li>
     <li><code>atomic_add</code> doesn't support <code>float16</code> or <code>bfloat16</code>.</li>
   </ul>
   <p>To report a problem, <a href="https://github.com/kashifulhaque/enceladus/issues">open an issue on GitHub</a>.</p>

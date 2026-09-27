@@ -95,7 +95,7 @@ as "read by tl.dot straight from device memory; 0 registers."
 
 Epilogues fuse for free. Operations on the accumulator after the loop, such as adding a
 bias, applying an activation, or casting, work on the accumulator's registers in place.
-A matmul with a fused bias and GELU runs within about 2-3% of a plain matmul.
+A matmul with a fused bias and GELU runs within about 1% of a plain matmul.
 
 ## Autotune kernels
 
