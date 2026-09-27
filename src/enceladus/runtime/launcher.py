@@ -90,9 +90,14 @@ def _float_tensor_converter(dtype_name: str) -> Callable[[Any], Any]:
 
 
 def torch_source(source: str, math_mode: str) -> str:
-    """Returns `source` as the PyTorch path compiles it.
+    """Returns `source` as the PyTorch path compiles it, with the native path's math.
 
-    `compile_shader` compiles with safe math; the pragma sets Enceladus's math mode.
+    `compile_shader` takes no compile options: it compiles with the safe math mode and
+    precise math functions. The pragma sets `math_mode` instead. The native path also
+    compiles with precise math functions (`raw.MATH_FP32_FUNCTIONS`), so both paths
+    give bit-identical results. MSL has no pragma for fast math functions, and the
+    `__METAL_MATH_FP32_FUNCTIONS_FAST__` macro that selects them has no effect in
+    source, because Metal includes its standard library before the source.
     """
     return f"#pragma METAL fp math_mode({math_mode})\n{source}"
 

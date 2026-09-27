@@ -15,6 +15,14 @@ from enceladus.runtime.interop import as_kernel_arg, is_array_like
 from enceladus.runtime.tensor import Tensor
 
 MATH_MODES = {"safe": 0, "relaxed": 1, "fast": 2}
+MATH_FP32_FUNCTIONS = "precise"
+"""The variant of unqualified fp32 math functions, such as `exp`, that kernels compile
+with: "precise" or "fast".
+
+It's "precise" because `torch.mps.compile_shader` compiles only with precise functions,
+and a kernel must give the same results on PyTorch tensors as on other arrays. The fast
+variants differ by up to 46 ULP (`tanh`); `exp`, `log`, and `sqrt` differ by 14, 4, and
+2 ULP. Code can still call a fast variant explicitly, such as `fast::exp`."""
 
 # MTLDataType raw value -> struct format for scalar arguments.
 _SCALAR_FORMATS = {
@@ -56,7 +64,7 @@ def compile_pipeline(
     name: str,
     language_version: Any = None,
     math_mode: str = "relaxed",
-    math_fp32_functions: str = "fast",
+    math_fp32_functions: str = MATH_FP32_FUNCTIONS,
     enable_logging: bool = False,
 ) -> _C.Pipeline:
     """Compiles MSL source at run time and returns the pipeline for kernel `name`.
@@ -66,6 +74,10 @@ def compile_pipeline(
     """
     if math_mode not in MATH_MODES:
         raise ValueError(f"math_mode must be one of {sorted(MATH_MODES)}, not {math_mode!r}")
+    if math_fp32_functions not in ("fast", "precise"):
+        raise ValueError(
+            f'math_fp32_functions must be "fast" or "precise", not {math_fp32_functions!r}'
+        )
     dev = get_device()
     lib, _warnings = _C.compile(
         dev.native,

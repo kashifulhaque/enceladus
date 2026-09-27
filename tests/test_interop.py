@@ -143,6 +143,35 @@ def test_jit_scalar_types_bind_on_torch_path(a, b, c, flag):
     assert fout.item() == c
 
 
+def _transcendental_kernel(math_mode):
+    @enceladus.jit(math_mode=math_mode)
+    def k(x_ptr, o_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        x = tl.load(x_ptr + offs, mask=m, other=1.0)
+        ax = tl.abs(x)
+        a = tl.exp(x) + tl.log(ax + 1.0) + tl.exp2(x * 0.5) + tl.log2(ax + 2.0)
+        b = tl.sqrt(ax) * tl.rsqrt(ax + 1.0) + tl.sin(x) * tl.cos(x)
+        c = tl.tanh(x) + tl.sigmoid(x) + tl.erf(x) + x / (a + 3.0)
+        tl.store(o_ptr + offs, a + b * c, mask=m)
+
+    return k
+
+
+@pytest.mark.parametrize("math_mode", ["relaxed", "fast"])
+def test_math_is_bit_identical_on_numpy_and_torch(math_mode):
+    # The PyTorch path compiles through compile_shader, and the native path through
+    # newLibraryWithSource; different math settings differ by up to 18 ULP here.
+    k = _transcendental_kernel(math_mode)
+    n = 1 << 14
+    x = (np.random.default_rng(0).standard_normal(n) * 4).astype(np.float32)
+    native = np.zeros(n, np.float32)
+    k[(n // 1024,)](x, native, n, BLOCK=1024)
+    out = torch.zeros(n, device="mps")
+    k[(n // 1024,)](torch.from_numpy(x).to("mps"), out, n, BLOCK=1024)
+    np.testing.assert_array_equal(out.cpu().numpy().view(np.int32), native.view(np.int32))
+
+
 RAW_SCALARS = """
 #include <metal_stdlib>
 using namespace metal;
